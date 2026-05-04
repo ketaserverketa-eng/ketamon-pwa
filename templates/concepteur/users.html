@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block title %}— Utilisateurs{% endblock %}
+{% block page_title %}Gestion des Utilisateurs{% endblock %}
+
+{% block content %}
+<div class="concepteur-banner"><i class="fa fa-shield"></i> Mode Concepteur</div>
+
+{% if is_local %}
+<div class="flash flash-warning" style="margin-top:12px">
+  <i class="fa fa-database"></i>
+  <strong>Données locales</strong> — KetaServer Cloud non connecté.
+  Comptes locaux KetaMon affichés.
+  <a href="{{ url_for('concepteur_credentials') }}" style="color:#fbbf24">Connecter KetaServer Cloud →</a>
+</div>
+{% endif %}
+
+<div class="card" style="margin-top:16px">
+  <div class="card-header">
+    <h3>
+      <i class="fa fa-users"></i>
+      {% if is_local %}Utilisateurs Locaux{% else %}Utilisateurs Cloud{% endif %}
+      ({{ users_data|length }})
+    </h3>
+    <input type="text" id="search-users" class="form-control form-control-sm"
+           placeholder="Rechercher..." style="max-width:200px">
+  </div>
+  <div class="table-responsive">
+    <table class="data-table" id="users-table">
+      <thead>
+        <tr>
+          <th>Email / Identifiant</th>
+          <th>Nom affiché</th>
+          {% if not is_local %}
+          <th>Routeurs</th>
+          <th>Connexions</th>
+          <th>Dernière connexion</th>
+          {% endif %}
+          <th>Rôle</th>
+          <th>Inscription</th>
+          <th>Statut</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in users_data %}
+        <tr id="row-{{ u.id }}">
+          <td><code>{{ u.email }}</code></td>
+          <td>{{ u.displayName or '—' }}</td>
+          {% if not is_local %}
+          <td><span class="badge badge-blue">{{ u.routerCount or 0 }}</span></td>
+          <td>{{ u.loginCount or 0 }}</td>
+          <td>{{ u.lastLoginAt[:10] if u.lastLoginAt else '—' }}</td>
+          {% endif %}
+          <td>
+            {% set role = u.role or 'user' %}
+            {% if role in ('concepteur','admin') %}
+            <span class="badge badge-purple">{{ role }}</span>
+            {% else %}
+            <span class="badge">{{ role }}</span>
+            {% endif %}
+          </td>
+          <td>{{ u.createdAt[:10] if u.createdAt else '—' }}</td>
+          <td>
+            {% if u.active %}
+            <span class="badge badge-green">Actif</span>
+            {% else %}
+            <span class="badge badge-red">Inactif</span>
+            {% endif %}
+          </td>
+          <td>
+            <div style="display:flex;gap:4px;flex-wrap:wrap">
+              {% if u.active %}
+              <button onclick="basculerUser('{{ u.id }}', this)"
+                style="background:#78350f;color:#fcd34d;border:none;border-radius:5px;padding:3px 9px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-toggle-on"></i> Désactiver
+              </button>
+              {% else %}
+              <button onclick="basculerUser('{{ u.id }}', this)"
+                style="background:#166534;color:#86efac;border:none;border-radius:5px;padding:3px 9px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-toggle-off"></i> Activer
+              </button>
+              {% endif %}
+              <button onclick="supprimerUser('{{ u.id }}','{{ u.email }}')"
+                style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 9px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-trash"></i> Supprimer
+              </button>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="{% if is_local %}6{% else %}9{% endif %}" class="text-center text-muted">
+            Aucun utilisateur trouvé.
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const _CSRF = window._KETAMON_CSRF || '';
+
+document.getElementById("search-users").addEventListener("input", function(){
+  const q = this.value.toLowerCase();
+  document.querySelectorAll("#users-table tbody tr").forEach(tr => {
+    tr.style.display = tr.textContent.toLowerCase().includes(q) ? "" : "none";
+  });
+});
+
+function basculerUser(id, btn){
+  fetch(`/concepteur/utilisateurs/${id}/basculer`, {
+    method: "POST",
+    headers: {"Content-Type":"application/json","X-CSRF-Token":_CSRF},
+    body: "{}"
+  }).then(r => r.json()).then(d => {
+    if(d.ok){
+      const row  = document.getElementById("row-" + id);
+      const badge = row ? row.querySelector(".badge") : null;
+      const isNowActive = d.active !== undefined ? d.active : btn.style.background.includes("166534");
+      if(isNowActive){
+        btn.innerHTML = '<i class="fa fa-toggle-on"></i> Désactiver';
+        btn.style.background = '#78350f'; btn.style.color = '#fcd34d';
+        if(badge){ badge.className="badge badge-green"; badge.textContent="Actif"; }
+      } else {
+        btn.innerHTML = '<i class="fa fa-toggle-off"></i> Activer';
+        btn.style.background = '#166534'; btn.style.color = '#86efac';
+        if(badge){ badge.className="badge badge-red"; badge.textContent="Inactif"; }
+      }
+      afficherNotif("Statut mis à jour.", "success");
+    } else {
+      afficherNotif(d.msg || d.message || "Erreur", "danger");
+    }
+  }).catch(() => afficherNotif("Erreur réseau.", "danger"));
+}
+
+function supprimerUser(id, email){
+  ouvrirModal(
+    `Supprimer l'utilisateur ${email} ?`,
+    "Cette action est irréversible.",
+    () => {
+      fetch(`/concepteur/utilisateurs/${id}/supprimer`, {
+        method: "POST",
+        headers: {"Content-Type":"application/json","X-CSRF-Token":_CSRF},
+        body: "{}"
+      }).then(r => r.json()).then(d => {
+        if(d.ok){
+          const row = document.getElementById("row-" + id);
+          if(row) row.remove();
+          afficherNotif("Utilisateur supprimé.", "success");
+        } else {
+          afficherNotif(d.msg || d.message || "Erreur", "danger");
+        }
+      }).catch(() => afficherNotif("Erreur réseau.", "danger"));
+    }
+  );
+}
+</script>
+{% endblock %}

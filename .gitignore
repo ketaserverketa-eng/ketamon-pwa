@@ -1,0 +1,26 @@
+# Données sensibles et générées
+data/
+*.log
+*.key
+
+# Environnements Python
+backend/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+test_tmp/
+
+# Windows
+*.bat
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.cursor/
+*.code-workspace
+
+# Variables d'environnement
+.env
+.env.*

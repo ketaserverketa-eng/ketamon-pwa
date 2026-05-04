@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}- Profils Reseau{% endblock %}
+{% block page_title %}Profils Reseau{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-pie-chart"></i> Liste des Profils ({{ profiles|length }})</h3>
+    <a href="{{ url_for('reseau_ajouter_profil') }}" class="btn btn-primary btn-sm">
+      <i class="fa fa-plus"></i> Ajouter un profil
+    </a>
+  </div>
+  <div class="card-body" style="padding-bottom:0">
+    <p class="text-muted">La duree ticket et le verrou 1 ticket = 1 appareil sont appliques en direct sur MikroTik a la premiere connexion.</p>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Nom</th>
+          <th>Sessions partagees</th>
+          <th>Debit max</th>
+          <th>Duree Ticket</th>
+          <th>Expiration</th>
+          <th>1 Ticket = 1 Appareil</th>
+          <th>Pool IP</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in profiles %}
+        <tr>
+          <td><strong>{{ p.get('name','') }}</strong></td>
+          <td>{{ p.get('shared-users','1') }}</td>
+          <td>{{ p.get('rate-limit','-') or '-' }}</td>
+          <td>{{ p.get('time-limit','0') or '0' }}</td>
+          <td>{{ p.get('expire-mode','none') }}</td>
+          <td>
+            {% if p.get('add-mac-cookie','yes') == 'yes' %}
+            <span class="badge badge-green">Active</span>
+            {% else %}
+            <span class="badge badge-red">Desactive</span>
+            {% endif %}
+          </td>
+          <td>{{ p.get('address-pool','-') or '-' }}</td>
+          <td class="actions">
+            <button onclick="supprimerProfil('{{ p.get('id','') }}','{{ p.get('name','') }}')"
+              style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer">
+              <i class="fa fa-trash"></i> Supprimer
+            </button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="text-center text-muted">Aucun profil trouve.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function supprimerProfil(id, nom){
+  ouvrirModal(
+    `Supprimer le profil "${nom}" ?`,
+    "Tous les clients de ce profil seront affectes.",
+    () => {
+      fetch("{{ url_for('reseau_supprimer_profil') }}", {
+        method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})
+      }).then(r=>r.json()).then(d=>{
+        if(d.ok) location.reload();
+        else afficherNotif(d.msg,"danger");
+      });
+    }
+  );
+}
+</script>
+{% endblock %}

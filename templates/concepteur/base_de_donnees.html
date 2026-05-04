@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}— Base de données{% endblock %}
+{% block page_title %}Base de données MongoDB{% endblock %}
+{% block content %}
+<div class="concepteur-banner"><i class="fa fa-shield"></i> Mode Concepteur</div>
+
+{% if is_local %}
+<div class="flash flash-warning" style="margin-top:12px">
+  <i class="fa fa-database"></i>
+  <strong>Base de données locale</strong> — KetaServer Cloud non connecté. Affichage de la base SQLite locale.
+</div>
+{% endif %}
+
+<div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:16px">
+
+  <!-- Statut connexion -->
+  <div class="card" style="flex:1;min-width:260px">
+    <div class="card-header"><h3><i class="fa fa-circle" style="color:{{ '#22c55e' if status.get('connected') else '#ef4444' }}"></i> Connexion MongoDB</h3></div>
+    <div class="card-body">
+      <table class="data-table">
+        <tr><td>Statut</td><td><b>{{ 'Connecté' if status.get('connected') else 'Déconnecté' }}</b></td></tr>
+        <tr><td>URI</td><td><code>{{ status.get('uri','—') }}</code></td></tr>
+        <tr><td>Base</td><td>{{ status.get('dbName','—') }}</td></tr>
+        <tr><td>Ping</td><td>{{ status.get('pingMs','—') }} ms</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="card" style="flex:2;min-width:300px">
+    <div class="card-header">
+      <h3><i class="fa fa-bar-chart"></i> Collections</h3>
+      <button class="btn btn-sm btn-primary" onclick="bootstrap()"><i class="fa fa-database"></i> Initialiser</button>
+    </div>
+    <div class="card-body">
+      {% if stats.get('collections') %}
+      <table class="data-table">
+        <thead><tr><th>Collection</th><th>Documents</th><th>Taille</th></tr></thead>
+        <tbody>
+          {% for col in stats.get('collections',[]) %}
+          <tr>
+            <td><i class="fa fa-table"></i> {{ col.get('name','—') }}</td>
+            <td>{{ col.get('count',0) }}</td>
+            <td>{{ col.get('size','—') }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="text-muted text-center" style="padding:20px">Stats non disponibles (MongoDB déconnecté ?)</p>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+
+<script>
+const _CSRF = window._KETAMON_CSRF || '';
+
+function bootstrap(){
+  ouvrirModal("Initialiser les collections MongoDB ?",
+    "Opération safe — ne supprime aucune donnée existante. Crée les collections manquantes.",
+    () => {
+      afficherNotif("Initialisation…","info");
+      fetch("/concepteur/base-de-donnees/bootstrap", {
+        method:"POST",
+        headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF}
+      }).then(r=>r.json()).then(d=>{
+        afficherNotif(d.ok ? "Collections initialisées." : (d.msg || d.message || "Erreur"), d.ok?"success":"danger");
+        if(d.ok) setTimeout(()=>location.reload(),1500);
+      }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+    }
+  );
+}
+</script>
+{% endblock %}

@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}— Jetons de Session{% endblock %}
+{% block page_title %}Jetons de Session{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-hourglass"></i> Jetons ({{ cookies|length }})</h3>
+    <a href="{{ url_for('reseau_jetons') }}" class="btn btn-outline btn-sm"><i class="fa fa-refresh"></i> Actualiser</a>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Client</th>
+          <th>Adresse MAC</th>
+          <th>Adresse IP</th>
+          <th>Expiration</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in cookies %}
+        <tr>
+          <td><strong>{{ c.get('user','—') }}</strong></td>
+          <td><code>{{ c.get('mac-address','—') }}</code></td>
+          <td>{{ c.get('address','—') }}</td>
+          <td>{{ c.get('expires-in','—') }}</td>
+          <td class="actions">
+            <button onclick="supprimerJeton('{{ c.get('id','') }}')"
+              style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer">
+              <i class="fa fa-trash"></i> Supprimer
+            </button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-center text-muted">Aucun jeton trouvé.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function supprimerJeton(id){
+  ouvrirModal("Supprimer ce jeton ?","",()=>{
+    fetch("{{ url_for('reseau_supprimer_jeton') }}", {
+      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})
+    }).then(r=>r.json()).then(d=>{ if(d.ok) location.reload(); else afficherNotif(d.msg,"danger"); });
+  });
+}
+</script>
+{% endblock %}

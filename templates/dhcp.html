@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block title %}— Baux DHCP{% endblock %}
+{% block page_title %}Baux DHCP{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-sitemap"></i> Baux DHCP <span id="dhcp-count">({{ leases|length }})</span></h3>
+    <div class="card-actions">
+      <input type="text" id="search-dhcp" class="form-control form-control-sm"
+             placeholder="Rechercher IP, MAC, hôte..." style="width:200px">
+      <button class="btn btn-outline btn-sm" onclick="chargerBaux()">
+        <i class="fa fa-refresh"></i> Actualiser
+      </button>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table" id="dhcp-table">
+      <thead>
+        <tr>
+          <th>Adresse IP</th>
+          <th>Adresse MAC</th>
+          <th>Nom d'hôte</th>
+          <th>Serveur DHCP</th>
+          <th>Expire dans</th>
+          <th>Type</th>
+          <th>État</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="dhcp-tbody">
+        {% for l in leases %}
+        <tr>
+          <td><strong>{{ l.get('address','—') }}</strong></td>
+          <td><code>{{ l.get('mac-address','—') }}</code></td>
+          <td>{{ l.get('host-name','—') }}</td>
+          <td>{{ l.get('server','—') }}</td>
+          <td>{{ l.get('expires-after','—') }}</td>
+          <td>
+            {% if l.get('dynamic','true') == 'false' %}
+            <span class="badge badge-blue">Statique</span>
+            {% else %}
+            <span class="badge">Dynamique</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if l.get('status','') == 'bound' %}
+            <span class="badge badge-green">Attribué</span>
+            {% elif l.get('status','') == 'waiting' %}
+            <span class="badge badge-orange">En attente</span>
+            {% elif l.get('status','') == 'offered' %}
+            <span class="badge badge-blue">Offert</span>
+            {% else %}
+            <span class="badge">{{ l.get('status','—') }}</span>
+            {% endif %}
+          </td>
+          <td class="actions">
+            <div style="display:flex;gap:4px;flex-wrap:wrap">
+              {% if l.get('dynamic','true') != 'false' %}
+              <button onclick="rendreStatique('{{ l.get('id','') }}','{{ l.get('address','') }}')"
+                style="background:#1e3a5f;color:#7dd3fc;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-thumb-tack"></i> Statique
+              </button>
+              {% endif %}
+              <button onclick="libererBail('{{ l.get('id','') }}','{{ l.get('address','') }}')"
+                style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-times-circle"></i> Libérer
+              </button>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="text-center text-muted">Aucun bail DHCP.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+document.getElementById('search-dhcp').addEventListener('input', function(){
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('#dhcp-table tbody tr').forEach(tr => {
+    tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+
+function libererBail(id, ip){
+  ouvrirModal(
+    `Libérer le bail de ${ip} ?`,
+    "L'adresse sera libérée et réassignée dynamiquement.",
+    () => {
+      fetch("{{ url_for('dhcp_liberer') }}", {
+        method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':(window._KETAMON_CSRF||'')},
+        body:JSON.stringify({id})
+      }).then(r=>r.json()).then(d=>{
+        if(d.ok){ afficherNotif('Bail libéré.','success'); chargerBaux(); }
+        else afficherNotif(d.msg||'Erreur.','danger');
+      }).catch(()=>afficherNotif('Erreur réseau.','danger'));
+    }
+  );
+}
+
+function rendreStatique(id, ip){
+  ouvrirModal(
+    `Rendre statique le bail de ${ip} ?`,
+    "L'adresse sera toujours attribuée à cette machine.",
+    () => {
+      fetch("{{ url_for('dhcp_rendre_statique') }}", {
+        method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':(window._KETAMON_CSRF||'')},
+        body:JSON.stringify({id})
+      }).then(r=>r.json()).then(d=>{
+        if(d.ok){ afficherNotif('Bail rendu statique.','success'); chargerBaux(); }
+        else afficherNotif(d.msg||'Erreur.','danger');
+      }).catch(()=>afficherNotif('Erreur réseau.','danger'));
+    }
+  );
+}
+
+function chargerBaux(){
+  fetch("{{ url_for('dhcp_leases') }}", {headers:{'X-Requested-With':'XMLHttpRequest'}})
+    .then(r=>r.text())
+    .then(html=>{
+      const doc = new DOMParser().parseFromString(html,'text/html');
+      const newB = doc.getElementById('dhcp-tbody');
+      const curB = document.getElementById('dhcp-tbody');
+      const cnt  = doc.getElementById('dhcp-count');
+      if(newB && curB) curB.innerHTML = newB.innerHTML;
+      if(cnt) document.getElementById('dhcp-count').textContent = cnt.textContent;
+    }).catch(()=>{});
+}
+
+// Rafraîchissement automatique toutes les 20s
+setInterval(chargerBaux, 20000);
+</script>
+{% endblock %}

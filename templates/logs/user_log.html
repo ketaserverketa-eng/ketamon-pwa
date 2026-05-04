@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}— Journal Système{% endblock %}
+{% block page_title %}Journal Système & Comptes{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-list-alt"></i> Journal Système <span id="log-count">({{ logs|length }})</span></h3>
+    <div class="card-actions">
+      <select id="topic-filter" class="form-control form-control-sm" style="width:150px" onchange="filtrerLogs()">
+        <option value="">Tous les topics</option>
+        <option value="hotspot">hotspot</option>
+        <option value="account">account</option>
+        <option value="system">system</option>
+        <option value="wireless">wireless</option>
+        <option value="error">error</option>
+        <option value="warning">warning</option>
+      </select>
+      <input type="text" id="log-filter" class="form-control form-control-sm"
+             placeholder="Filtrer..." style="width:160px" oninput="filtrerLogs()">
+      <button class="btn btn-outline btn-sm" onclick="chargerLogs()">
+        <i class="fa fa-refresh"></i> Actualiser
+      </button>
+    </div>
+  </div>
+
+  <div id="log-container" class="log-container" style="max-height:72vh;overflow-y:auto">
+    {% for entry in logs %}
+    {% set topics = entry.get('topics','') %}
+    <div class="log-entry {% if 'error' in topics %}log-error{% elif 'warning' in topics %}log-warn{% else %}log-info{% endif %}"
+         data-topics="{{ topics }}">
+      <span class="log-time">{{ entry.get('time','') }}</span>
+      <span class="log-topics">{{ topics }}</span>
+      <span class="log-message">{{ entry.get('message','') }}</span>
+    </div>
+    {% else %}
+    <div class="text-center text-muted" style="padding:32px">Aucune entrée de journal.</div>
+    {% endfor %}
+  </div>
+</div>
+
+<style>
+.log-entry{padding:5px 14px;border-bottom:1px solid rgba(255,255,255,.05);display:flex;gap:12px;font-size:12px;font-family:monospace;align-items:baseline;}
+.log-entry.log-error{background:rgba(239,68,68,.08);border-left:3px solid #ef4444;}
+.log-entry.log-warn{background:rgba(245,158,11,.07);border-left:3px solid #f59e0b;}
+.log-entry.log-info{border-left:3px solid transparent;}
+.log-time{color:#64748b;white-space:nowrap;min-width:70px;}
+.log-topics{color:#3b82f6;white-space:nowrap;min-width:130px;}
+.log-message{color:#e2e8f0;flex:1;word-break:break-word;}
+.log-entry.hidden{display:none!important;}
+</style>
+
+<script>
+function filtrerLogs(){
+  const q      = document.getElementById('log-filter').value.toLowerCase();
+  const topic  = document.getElementById('topic-filter').value.toLowerCase();
+  document.querySelectorAll('#log-container .log-entry').forEach(el => {
+    const t = (el.dataset.topics || '').toLowerCase();
+    const txt = el.textContent.toLowerCase();
+    const matchTopic = !topic || t.includes(topic);
+    const matchText  = !q || txt.includes(q);
+    el.classList.toggle('hidden', !(matchTopic && matchText));
+  });
+}
+
+function chargerLogs(){
+  fetch("{{ url_for('log_users') }}", {headers:{"X-Requested-With":"XMLHttpRequest"}})
+    .then(r => r.text())
+    .then(html => {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const newC = doc.getElementById('log-container');
+      const curC = document.getElementById('log-container');
+      const cnt  = doc.getElementById('log-count');
+      if(newC && curC){ curC.innerHTML = newC.innerHTML; }
+      if(cnt) document.getElementById('log-count').textContent = cnt.textContent;
+      filtrerLogs();
+      curC.scrollTop = curC.scrollHeight;
+    }).catch(()=>{});
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  const c = document.getElementById('log-container');
+  if(c) c.scrollTop = c.scrollHeight;
+});
+setInterval(chargerLogs, 15000);
+</script>
+{% endblock %}

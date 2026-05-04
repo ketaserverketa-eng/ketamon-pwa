@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+{% block title %}— Mise à jour{% endblock %}
+{% block page_title %}Mise à jour de l'application{% endblock %}
+{% block content %}
+<div class="concepteur-banner"><i class="fa fa-shield"></i> Mode Concepteur</div>
+
+<div class="stats-grid" style="margin-top:16px">
+  <div class="stat-card accent-blue">
+    <div class="stat-icon"><i class="fa fa-tag"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Version actuelle</div>
+      <div class="stat-value" id="version-display">{{ version }}</div>
+    </div>
+  </div>
+  <div class="stat-card accent-green">
+    <div class="stat-icon"><i class="fa fa-code-fork"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Branche Git</div>
+      <div class="stat-value">{{ git_branch or '—' }}</div>
+    </div>
+  </div>
+  <div class="stat-card accent-teal">
+    <div class="stat-icon"><i class="fa fa-history"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Dernier commit</div>
+      <div class="stat-value" style="font-size:13px">{{ git_last_commit or '—' }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="row-2col" style="margin-top:16px">
+
+<!-- Actions principales -->
+<div class="card card-form">
+  <div class="card-header"><h3><i class="fa fa-refresh"></i> Actions de mise à jour</h3></div>
+  <div class="card-body">
+
+    <!-- Git Pull -->
+    <div class="form-group" style="border-bottom:1px solid #334;padding-bottom:16px;margin-bottom:16px">
+      <label style="font-weight:600"><i class="fa fa-cloud-download"></i> Récupérer les mises à jour (git pull)</label>
+      <p style="font-size:12px;color:#94a3b8;margin:4px 0 10px">
+        Télécharge et applique les dernières modifications depuis le dépôt.
+        Les utilisateurs connectés ne seront pas interrompus.
+      </p>
+      <button class="btn btn-primary" onclick="gitPull()">
+        <i class="fa fa-cloud-download"></i> Lancer git pull
+      </button>
+    </div>
+
+    <!-- Version manuelle -->
+    <div class="form-group" style="border-bottom:1px solid #334;padding-bottom:16px;margin-bottom:16px">
+      <label style="font-weight:600"><i class="fa fa-tag"></i> Définir la version manuellement</label>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <input type="text" id="version-input" class="form-control" placeholder="ex: 1.2.0" style="flex:1">
+        <button class="btn btn-secondary" onclick="setVersion()"><i class="fa fa-save"></i> Définir</button>
+      </div>
+    </div>
+
+    <!-- Redémarrage -->
+    <div class="form-group">
+      <label style="font-weight:600"><i class="fa fa-power-off"></i> Redémarrer l'application</label>
+      <p style="font-size:12px;color:#94a3b8;margin:4px 0 10px">
+        Redémarre le serveur Flask dans 3 secondes. Les utilisateurs seront automatiquement
+        reconnectés après le redémarrage (sessions conservées).
+      </p>
+      <button class="btn btn-danger" onclick="redemarrer()">
+        <i class="fa fa-power-off"></i> Redémarrer maintenant
+      </button>
+    </div>
+
+  </div>
+</div>
+
+<!-- Statut Git -->
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-git"></i> Statut Git</h3>
+    <button class="btn btn-sm btn-outline" onclick="chargerGitStatus()"><i class="fa fa-refresh"></i></button>
+  </div>
+  <div class="card-body">
+    <pre id="git-status-output" style="font-size:11px;color:#94a3b8;background:#0f172a;padding:12px;border-radius:6px;overflow:auto;max-height:300px;white-space:pre-wrap">Chargement…</pre>
+  </div>
+</div>
+
+</div>
+
+<!-- Log de sortie -->
+<div class="card" style="margin-top:16px">
+  <div class="card-header">
+    <h3><i class="fa fa-terminal"></i> Journal d'opération</h3>
+    <button class="btn btn-sm btn-outline" onclick="document.getElementById('output-log').textContent=''">
+      <i class="fa fa-trash"></i> Effacer
+    </button>
+  </div>
+  <div class="card-body">
+    <pre id="output-log" style="font-size:11px;color:#4ade80;background:#0f172a;padding:12px;border-radius:6px;overflow:auto;max-height:350px;min-height:80px;white-space:pre-wrap">En attente…</pre>
+  </div>
+</div>
+
+<script>
+const CSRF = "{{ csrf_token }}";
+
+function log(msg, color){
+  const el = document.getElementById("output-log");
+  const ts = new Date().toLocaleTimeString();
+  el.textContent += `[${ts}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function gitPull(){
+  ouvrirModal("Lancer git pull ?", "Télécharge et applique les dernières modifications depuis le dépôt.", () => {
+  log("Démarrage git pull…");
+  fetch("{{ url_for('concepteur_git_pull') }}", {
+    method:"POST",
+    headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF}
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok){
+      log("✓ git pull terminé :\n" + (d.output||""));
+      afficherNotif("Git pull réussi !", "success");
+    } else {
+      log("✗ Erreur : " + (d.msg||d.error||"inconnue"));
+      afficherNotif("Erreur git pull : " + (d.msg||""), "danger");
+    }
+  }).catch(e => { log("✗ Erreur réseau : " + e); });
+  }); // fin ouvrirModal
+}
+
+function setVersion(){
+  const v = document.getElementById("version-input").value.trim();
+  if(!v){ afficherNotif("Entrez un numéro de version.", "warning"); return; }
+  fetch("{{ url_for('concepteur_set_version') }}", {
+    method:"POST",
+    headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF},
+    body: JSON.stringify({version: v})
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok){
+      document.getElementById("version-display").textContent = v;
+      log("✓ Version définie à " + v);
+      afficherNotif("Version mise à jour : " + v, "success");
+    } else {
+      log("✗ Erreur : " + (d.msg||""));
+      afficherNotif("Erreur : " + (d.msg||""), "danger");
+    }
+  });
+}
+
+function redemarrer(){
+  ouvrirModal("Redémarrer l'application ?",
+    "Le serveur Flask sera redémarré dans 3 secondes. Les utilisateurs seront reconnectés automatiquement.",
+    () => {
+      log("Redémarrage dans 3 secondes…");
+      fetch("{{ url_for('concepteur_redemarrer') }}", {
+        method:"POST",
+        headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF}
+      }).then(r=>r.json()).then(d=>{
+        if(d.ok){
+          log("✓ Signal envoyé. Reconnexion automatique dans 8 secondes…");
+          afficherNotif("Redémarrage en cours…", "warning");
+          setTimeout(()=>{ location.reload(); }, 8000);
+        } else {
+          log("✗ Erreur : " + (d.msg||""));
+          afficherNotif("Erreur : " + (d.msg||""), "danger");
+        }
+      }).catch(()=>{
+        log("Service en cours de redémarrage…");
+        setTimeout(()=>{ location.reload(); }, 8000);
+      });
+    }
+  );
+}
+
+function chargerGitStatus(){
+  fetch("{{ url_for('concepteur_git_status') }}")
+    .then(r=>r.json())
+    .then(d=>{
+      document.getElementById("git-status-output").textContent =
+        (d.output || d.msg || "Aucune information disponible.");
+    })
+    .catch(()=>{
+      document.getElementById("git-status-output").textContent = "Impossible de récupérer le statut.";
+    });
+}
+
+window.addEventListener("DOMContentLoaded", chargerGitStatus);
+</script>
+{% endblock %}

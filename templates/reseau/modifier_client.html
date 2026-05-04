@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}— Modifier Client{% endblock %}
+{% block page_title %}Modifier le Client{% endblock %}
+
+{% block content %}
+<div class="card card-form">
+  <div class="card-header">
+    <h3><i class="fa fa-edit"></i> Modifier : {{ user.get('name','') }}</h3>
+  </div>
+  <div class="card-body">
+    <form method="POST">
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Identifiant *</label>
+          <input type="text" name="name" class="form-control" value="{{ user.get('name','') }}" required>
+        </div>
+        <div class="form-group col-6">
+          <label>Mot de passe</label>
+          <input type="text" name="password" class="form-control" value="{{ user.get('password','') }}">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Profil</label>
+          <select name="profile" class="form-control">
+            {% for p in profiles %}
+            <option value="{{ p.name }}" {% if p.name == user.get('profile','') %}selected{% endif %}>
+              {{ p.name }}
+            </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group col-6">
+          <label>Point d'accès</label>
+          <select name="server" class="form-control">
+            <option value="">— Tous —</option>
+            {% for s in servers %}
+            <option value="{{ s.name }}" {% if s.name == user.get('server','') %}selected{% endif %}>
+              {{ s.name }}
+            </option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Limite de temps <small class="text-muted">(ex: 1h30m, 3600s)</small></label>
+          <input type="text" name="time_limit" class="form-control" value="{{ user.get('limit-uptime','0') }}" placeholder="0 = illimité">
+        </div>
+        <div class="form-group col-6">
+          <label>Limite de données (Mo, 0=illimité)</label>
+          {% set bytes_val = user.get('limit-bytes-total','0')|string|replace(' ','') %}
+          {% set mo_val = (bytes_val|int / 1048576)|round(1) if bytes_val|int > 0 else 0 %}
+          <input type="number" name="data_limit" class="form-control" value="{{ mo_val }}" min="0" step="0.1">
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Commentaire</label>
+        {% set raw_c = user.get('comment','') %}
+        {% set display_c = raw_c[3:] if (raw_c.startswith('vc-') or raw_c.startswith('up-')) else raw_c %}
+        <input type="text" name="comment" class="form-control" value="{{ display_c }}" placeholder="Optionnel">
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary"><i class="fa fa-save"></i> Enregistrer</button>
+        <a href="{{ url_for('reseau_clients') }}" class="btn btn-secondary">Annuler</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

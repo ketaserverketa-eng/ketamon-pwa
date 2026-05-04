@@ -1,0 +1,247 @@
+{% extends "base.html" %}
+{% block title %}- Sessions Actives{% endblock %}
+{% block page_title %}Sessions Actives Hotspot{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-wifi"></i> Sessions Actives ({{ actifs|length }})</h3>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <form method="get" class="filter-form">
+        <select name="serveur" class="form-control form-control-sm" onchange="this.form.submit()">
+          <option value="">Tous les serveurs</option>
+          {% for s in servers %}
+          <option value="{{ s.name }}" {% if server_filter==s.name %}selected{% endif %}>{{ s.name }}</option>
+          {% endfor %}
+        </select>
+      </form>
+      <a href="{{ url_for('hotspot_active') }}" class="btn btn-outline btn-sm" title="Rafraîchir">
+        <i class="fa fa-refresh"></i>
+      </a>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Utilisateur</th>
+          <th>Profil</th>
+          <th>Adresse IP</th>
+          <th>MAC</th>
+          <th>Serveur</th>
+          <th>Durée</th>
+          <th>Restant</th>
+          <th>↓ / ↑</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in actifs %}
+        <tr id="row-active-{{ loop.index0 }}" class="{% if a.get('user_disabled') %}row-disabled{% endif %}">
+          <td><strong>{{ a.get('user','-') }}</strong></td>
+          <td><span class="badge badge-blue">{{ a.get('profile','-') }}</span></td>
+          <td>{{ a.get('address','-') }}</td>
+          <td><code style="font-size:11px">{{ a.get('mac-address','-') }}</code></td>
+          <td>{{ a.get('server','-') }}</td>
+          <td>{{ a.get('uptime','-') }}</td>
+          <td>{{ a.get('temps-restant','∞') }}</td>
+          <td style="font-size:11px;white-space:nowrap">
+            {{ a.get('debit-down','-') }} / {{ a.get('debit-up','-') }}
+          </td>
+          <td>
+            <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+              <button onclick="voirDetails({{ loop.index0 }})"
+                style="background:#1e40af;color:#fff;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-info-circle"></i> Détails
+              </button>
+              {% if a.get('user_hotspot_id') %}
+                {% if a.get('user_disabled') %}
+                <button onclick="basculerUser({{ loop.index0 }}, 'no')"
+                  style="background:#166534;color:#86efac;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                  <i class="fa fa-toggle-off"></i> Activer
+                </button>
+                {% else %}
+                <button onclick="basculerUser({{ loop.index0 }}, 'yes')"
+                  style="background:#78350f;color:#fcd34d;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                  <i class="fa fa-toggle-on"></i> Désact.
+                </button>
+                {% endif %}
+              {% else %}
+              <button disabled style="background:#1e293b;color:#475569;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:not-allowed;white-space:nowrap">
+                <i class="fa fa-toggle-on"></i> —
+              </button>
+              {% endif %}
+              <button onclick="couperSession({{ loop.index0 }})"
+                style="background:#92400e;color:#fcd34d;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-ban"></i> Couper
+              </button>
+              {% if a.get('user_hotspot_id') %}
+              <button onclick="supprimerCompte({{ loop.index0 }})"
+                style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-trash"></i> Suppr.
+              </button>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="text-center text-muted" style="padding:30px">
+          <i class="fa fa-wifi" style="font-size:32px;color:#334155;display:block;margin-bottom:10px"></i>
+          Aucune session active.
+        </td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Modal Détails -->
+<div id="modal-details" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.65);align-items:center;justify-content:center">
+  <div style="background:#1e293b;border-radius:12px;padding:24px;min-width:320px;max-width:460px;width:90%;border:1px solid #334155;max-height:90vh;overflow-y:auto">
+    <h4 style="margin:0 0 14px;color:#f8fafc"><i class="fa fa-user-circle"></i> <span id="det-user"></span>
+      <span id="det-disabled-badge" style="display:none;margin-left:8px;font-size:11px;padding:2px 7px;border-radius:8px;background:rgba(239,68,68,.2);color:#f87171;font-weight:500">Désactivé</span>
+    </h4>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px">
+      <div><span style="color:#64748b">Profil</span><br><strong id="det-profile" style="color:#38bdf8"></strong></div>
+      <div><span style="color:#64748b">Serveur</span><br><strong id="det-server"></strong></div>
+      <div><span style="color:#64748b">Adresse IP</span><br><code id="det-ip"></code></div>
+      <div><span style="color:#64748b">MAC</span><br><code id="det-mac" style="font-size:11px"></code></div>
+      <div><span style="color:#64748b">Connecté depuis</span><br><strong id="det-uptime"></strong></div>
+      <div><span style="color:#64748b">Temps restant</span><br><strong id="det-left" style="color:#22c55e"></strong></div>
+      <div><span style="color:#64748b">↓ Reçu</span><br><strong id="det-down"></strong></div>
+      <div><span style="color:#64748b">↑ Envoyé</span><br><strong id="det-up"></strong></div>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+      <button id="det-btn-toggle" class="btn btn-sm btn-warning"
+        onclick="basculerUserDepuisModal()"></button>
+      <button class="btn btn-sm" style="background:#f59e0b;color:#000;border:none;border-radius:6px;padding:5px 12px;cursor:pointer;font-weight:700"
+        onclick="couperDepuisModal()"><i class="fa fa-ban"></i> Couper</button>
+      <button id="det-btn-supp" class="btn btn-sm btn-danger"
+        onclick="supprimerDepuisModal()"><i class="fa fa-user-times"></i> Supprimer</button>
+      <button class="btn btn-secondary btn-sm" onclick="fermerDetails()">Fermer</button>
+    </div>
+  </div>
+</div>
+
+<script>
+var _sessions = {{ actifs|tojson }};
+var _detIdx = -1;
+
+function voirDetails(idx){
+  _detIdx = idx;
+  var s = _sessions[idx];
+  document.getElementById('det-user').textContent    = s['user']         || '-';
+  document.getElementById('det-profile').textContent = s['profile']      || '-';
+  document.getElementById('det-server').textContent  = s['server']       || '-';
+  document.getElementById('det-ip').textContent      = s['address']      || '-';
+  document.getElementById('det-mac').textContent     = s['mac-address']  || '-';
+  document.getElementById('det-uptime').textContent  = s['uptime']       || '-';
+  document.getElementById('det-left').textContent    = s['temps-restant']|| '∞';
+  document.getElementById('det-down').textContent    = s['debit-down']   || '-';
+  document.getElementById('det-up').textContent      = s['debit-up']     || '-';
+  var badge = document.getElementById('det-disabled-badge');
+  badge.style.display = s['user_disabled'] ? '' : 'none';
+  var btnToggle = document.getElementById('det-btn-toggle');
+  if(s['user_hotspot_id']){
+    btnToggle.style.display = '';
+    if(s['user_disabled']){
+      btnToggle.innerHTML = '<i class="fa fa-toggle-off"></i> Activer';
+      btnToggle.style.background = '#22c55e'; btnToggle.style.color = '#fff';
+    } else {
+      btnToggle.innerHTML = '<i class="fa fa-toggle-on"></i> Désactiver';
+      btnToggle.style.background = '#f59e0b'; btnToggle.style.color = '#000';
+    }
+  } else {
+    btnToggle.style.display = 'none';
+  }
+  document.getElementById('det-btn-supp').style.display = s['user_hotspot_id'] ? '' : 'none';
+  document.getElementById('modal-details').style.display = 'flex';
+}
+
+function fermerDetails(){
+  document.getElementById('modal-details').style.display = 'none';
+}
+document.getElementById('modal-details').addEventListener('click', function(e){
+  if(e.target === this) fermerDetails();
+});
+
+function basculerUserDepuisModal(){
+  if(_detIdx < 0) return;
+  fermerDetails();
+  var s = _sessions[_detIdx];
+  basculerUser(_detIdx, s['user_disabled'] ? 'no' : 'yes');
+}
+function couperDepuisModal(){
+  if(_detIdx < 0) return;
+  fermerDetails();
+  couperSession(_detIdx);
+}
+function supprimerDepuisModal(){
+  if(_detIdx < 0) return;
+  fermerDetails();
+  supprimerCompte(_detIdx);
+}
+
+function basculerUser(idx, disabled){
+  var s = _sessions[idx];
+  if(!s['user_hotspot_id']) return;
+  var label = disabled === 'yes' ? 'Désactiver' : 'Activer';
+  ouvrirModal(
+    label + ' le compte "' + s['user'] + '" ?',
+    disabled === 'yes'
+      ? "Le compte sera désactivé. La session active sera coupée."
+      : "Le compte sera réactivé.",
+    function(){
+      fetch("{{ url_for('hotspot_toggle_user') }}", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({id: s['user_hotspot_id'], disabled: disabled})
+      }).then(function(r){ return r.json(); }).then(function(d){
+        if(d.ok){
+          afficherNotif(disabled === 'yes' ? "Compte désactivé." : "Compte activé.", disabled === 'yes' ? "warning" : "success");
+          setTimeout(function(){ location.reload(); }, 600);
+        } else {
+          afficherNotif(d.msg || "Erreur.", "danger");
+        }
+      }).catch(function(){ afficherNotif("Erreur réseau.", "danger"); });
+    }
+  );
+}
+
+function couperSession(idx){
+  var s = _sessions[idx];
+  ouvrirModal(
+    'Couper la session de "' + s['user'] + '" ?',
+    "La session sera coupée. L'utilisateur peut se reconnecter avec son ticket.",
+    function(){
+      fetch("{{ url_for('hotspot_remove_active') }}", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({id: s['id'], user: s['user'], mac: s['mac-address']})
+      }).then(function(r){ return r.json(); }).then(function(d){
+        if(d.ok){ afficherNotif("Session coupée.", "success"); setTimeout(function(){ location.reload(); }, 600); }
+        else afficherNotif(d.msg || "Impossible.", "danger");
+      }).catch(function(){ afficherNotif("Erreur réseau.", "danger"); });
+    }
+  );
+}
+
+function supprimerCompte(idx){
+  var s = _sessions[idx];
+  if(!s['user_hotspot_id']) return;
+  ouvrirModal(
+    'Supprimer définitivement "' + s['user'] + '" ?',
+    "Le compte est effacé du MikroTik. L'utilisateur ne peut plus se connecter.",
+    function(){
+      fetch("{{ url_for('hotspot_delete_user') }}", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({id: s['user_hotspot_id']})
+      }).then(function(r){ return r.json(); }).then(function(d){
+        if(d.ok){ afficherNotif("Compte supprimé.", "success"); setTimeout(function(){ location.reload(); }, 600); }
+        else afficherNotif(d.msg || "Impossible.", "danger");
+      }).catch(function(){ afficherNotif("Erreur réseau.", "danger"); });
+    }
+  );
+}
+
+setInterval(function(){ location.reload(); }, 30000);
+</script>
+{% endblock %}

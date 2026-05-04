@@ -1,0 +1,377 @@
+{% extends "base.html" %}
+{% block title %}— Rapport de Ventes{% endblock %}
+{% block page_title %}Rapport de Ventes{% endblock %}
+
+{% block content %}
+<style>
+.sync-badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 10px;
+  border-radius:20px;font-weight:600;cursor:default;}
+.sync-ok{background:rgba(34,197,94,.15);color:#22c55e;}
+.sync-off{background:rgba(239,68,68,.12);color:#ef4444;}
+.sync-unk{background:rgba(148,163,184,.12);color:#94a3b8;}
+.bar-wrap{flex:1;height:6px;background:#1e293b;border-radius:3px;min-width:60px;}
+.bar-fill{height:100%;background:#3b82f6;border-radius:3px;transition:width .3s;}
+@media print {
+  #sidenav,#navbar,.filter-bar,.card-header .card-actions,.no-print{display:none!important;}
+  .card{box-shadow:none!important;border:none!important;}
+}
+</style>
+
+<!-- ── Cartes résumé ── -->
+<div class="stats-grid" style="margin-bottom:16px">
+  <div class="stat-card accent-green">
+    <div class="stat-icon"><i class="fa fa-sun-o"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Aujourd'hui</div>
+      <div class="stat-value">{{ today_total|int }} {{ currency }}</div>
+      <div class="stat-sub">{{ today_count }} ticket(s)</div>
+    </div>
+  </div>
+  <div class="stat-card accent-blue">
+    <div class="stat-icon"><i class="fa fa-calendar"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Ce mois ({{ month_str }})</div>
+      <div class="stat-value">{{ month_total|int }} {{ currency }}</div>
+      <div class="stat-sub">{{ month_count }} ticket(s)</div>
+    </div>
+  </div>
+  <div class="stat-card accent-teal">
+    <div class="stat-icon"><i class="fa fa-database"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Total général</div>
+      <div class="stat-value">{{ total_global|int }} {{ currency }}</div>
+      <div class="stat-sub">{{ total_global_count }} ticket(s)</div>
+    </div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-icon"><i class="fa fa-filter"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Filtrés</div>
+      <div class="stat-value">{{ total }}</div>
+      <div class="stat-sub">ticket(s) affichés</div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Carte principale ── -->
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-money"></i> Ventes
+      {% if request.args.get('mois') or request.args.get('annee') %}
+      — {{ request.args.get('annee','') }}
+      {% set _mois_noms = ['','Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc'] %}
+      {% if request.args.get('mois') %}{{ _mois_noms[request.args.get('mois')|int] }}{% endif %}
+      {% endif %}
+    </h3>
+    <div class="card-actions no-print" style="gap:6px;flex-wrap:wrap;align-items:center">
+      <span id="sync-badge" class="sync-badge sync-unk" title="Chargement du statut sync...">
+        <i class="fa fa-circle" style="font-size:8px"></i> Sync...
+      </span>
+      <button class="btn btn-sm btn-success" id="sync-btn" onclick="syncMaintenant(this)">
+        <i class="fa fa-refresh"></i> Synchroniser
+      </button>
+      <a href="{{ url_for('report') }}" class="btn btn-sm btn-outline"><i class="fa fa-list"></i> Tout</a>
+      <button class="btn btn-sm btn-secondary" onclick="afficherResume()">
+        <i class="fa fa-bar-chart"></i> Résumé
+      </button>
+      <button class="btn btn-sm btn-outline" onclick="window.print()">
+        <i class="fa fa-print"></i> Imprimer
+      </button>
+      <button class="btn btn-sm btn-outline" onclick="exporterCSV()">
+        <i class="fa fa-download"></i> CSV
+      </button>
+      <button class="btn btn-sm btn-danger" onclick="supprimerMois()">
+        <i class="fa fa-trash"></i> Supprimer {{ mois_filtre }}
+      </button>
+    </div>
+  </div>
+
+  <!-- Filtres -->
+  <div class="filter-bar no-print">
+    <form method="get" class="filter-form" id="filter-form">
+      <select name="jour" class="form-control form-control-sm">
+        <option value="">Jour</option>
+        {% for d in range(1,32) %}
+        <option value="{{ '%02d'|format(d) }}"
+                {% if request.args.get('jour','') == '%02d'|format(d) %}selected{% endif %}>
+          {{ '%02d'|format(d) }}
+        </option>
+        {% endfor %}
+      </select>
+      <select name="mois" class="form-control form-control-sm">
+        <option value="">Mois</option>
+        {% for m,nom in [('01','Janvier'),('02','Février'),('03','Mars'),('04','Avril'),
+                         ('05','Mai'),('06','Juin'),('07','Juillet'),('08','Août'),
+                         ('09','Septembre'),('10','Octobre'),('11','Novembre'),('12','Décembre')] %}
+        <option value="{{ m }}" {% if request.args.get('mois','') == m %}selected{% endif %}>{{ nom }}</option>
+        {% endfor %}
+      </select>
+      <select name="annee" class="form-control form-control-sm">
+        <option value="">Année</option>
+        {% for y in range(2024, 2031) %}
+        <option value="{{ y }}" {% if request.args.get('annee','') == y|string %}selected{% endif %}>{{ y }}</option>
+        {% endfor %}
+      </select>
+      {% if profils_disponibles %}
+      <select name="profil" class="form-control form-control-sm">
+        <option value="">Tous les profils</option>
+        {% for p in profils_disponibles %}
+        <option value="{{ p }}" {% if request.args.get('profil','') == p %}selected{% endif %}>{{ p }}</option>
+        {% endfor %}
+      </select>
+      {% endif %}
+      <input type="text" name="q" class="form-control form-control-sm"
+             placeholder="Rechercher..." value="{{ request.args.get('q','') }}">
+      <button type="submit" class="btn btn-secondary btn-sm"><i class="fa fa-filter"></i> Filtrer</button>
+    </form>
+    <input type="text" id="search-live" class="form-control form-control-sm no-print"
+           placeholder="Recherche rapide..." style="max-width:180px"
+           title="Filtre local instantané (sans rechargement)">
+  </div>
+
+  <!-- Tableau -->
+  <div class="table-responsive">
+    <table class="data-table" id="report-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Date</th>
+          <th>Heure</th>
+          <th>Identifiant</th>
+          <th>Profil</th>
+          <th>Réseau</th>
+          <th>Prix</th>
+          <th class="no-print">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="report-tbody">
+        {% for s in sales %}
+        <tr id="row-{{ s.id }}">
+          <td>{{ loop.index }}</td>
+          <td>{{ s.date }}</td>
+          <td>{{ s.heure }}</td>
+          <td><strong>{{ s.user }}</strong></td>
+          <td><span class="badge badge-blue">{{ s.profil }}</span></td>
+          <td>{{ s.reseau or '—' }}</td>
+          <td><strong>{{ s.prix|int }} {{ s.devise }}</strong></td>
+          <td class="no-print">
+            <button onclick="supprimerVente('{{ s.id }}')"
+              style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer">
+              <i class="fa fa-trash"></i> Suppr.
+            </button>
+          </td>
+        </tr>
+        {% else %}
+        <tr id="row-empty">
+          <td colspan="8" class="text-center text-muted" style="padding:36px">
+            <i class="fa fa-money" style="font-size:36px;opacity:.25;display:block;margin-bottom:10px"></i>
+            Aucune vente enregistrée pour cette période.
+            <div style="margin-top:10px">
+              <button class="btn btn-sm btn-success" onclick="syncMaintenant(this)">
+                <i class="fa fa-refresh"></i> Synchroniser maintenant
+              </button>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Résumé par profil -->
+  <div id="resume-section" style="display:none;padding:16px" class="no-print">
+    <h4 style="margin-bottom:12px;color:#e2e8f0">
+      <i class="fa fa-bar-chart"></i> Résumé par profil (tickets filtrés)
+    </h4>
+    <div id="resume-content"></div>
+  </div>
+</div>
+
+<script>
+const CSRF        = "{{ csrf_token }}";
+const CURRENCY    = "{{ currency }}";
+const MOIS_FILTRE = "{{ mois_filtre }}";
+
+// ── Recherche rapide locale (sans rechargement) ──
+document.getElementById('search-live').addEventListener('input', function(){
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('#report-tbody tr').forEach(tr => {
+    tr.style.display = (q && !tr.textContent.toLowerCase().includes(q)) ? 'none' : '';
+  });
+});
+
+// ── Synchronisation manuelle ──
+function syncMaintenant(btn){
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fa fa-spinner fa-spin"></i> En cours...';
+  fetch("{{ url_for('api_sync_ventes') }}", {
+    method:'POST',
+    headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+    body:JSON.stringify({})
+  }).then(r=>r.json()).then(d=>{
+    btn.disabled = false;
+    btn.innerHTML = orig;
+    if(d.ok){
+      if(d.new > 0){
+        afficherNotif(`${d.new} nouveau(x) ticket(s) capturé(s) !`, 'success');
+        setTimeout(() => location.reload(), 1500);
+      } else {
+        afficherNotif('Déjà à jour — aucun nouveau ticket.', 'info');
+      }
+    } else {
+      afficherNotif(d.msg || 'Erreur de synchronisation.', 'danger');
+    }
+  }).catch(() => {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+    afficherNotif('Erreur réseau.', 'danger');
+  });
+}
+
+// ── Statut de la sync automatique (badge) ──
+function majStatutSync(){
+  fetch('/api/sync-etat')
+    .then(r => r.json())
+    .then(d => {
+      const badge = document.getElementById('sync-badge');
+      if(!badge || !d.ok) return;
+      const s = d.stats || {};
+      if(!s.last_sync){
+        badge.className = 'sync-badge sync-unk';
+        badge.innerHTML = '<i class="fa fa-circle" style="font-size:8px"></i> En attente...';
+        return;
+      }
+      const diffSec = Math.round((Date.now() - new Date(s.last_sync).getTime()) / 1000);
+      const age     = diffSec < 60 ? `il y a ${diffSec}s` : `il y a ${Math.round(diffSec/60)}min`;
+      if(s.ok){
+        badge.className = 'sync-badge sync-ok';
+        badge.innerHTML = `<i class="fa fa-circle" style="font-size:8px"></i> Sync OK (${age})`;
+        badge.title = `Dernière sync : ${s.last_sync} — ${s.new} nouveau(x)`;
+      } else {
+        badge.className = 'sync-badge sync-off';
+        badge.innerHTML = `<i class="fa fa-circle" style="font-size:8px"></i> Hors ligne (${age})`;
+        badge.title = s.error || 'Routeur injoignable';
+      }
+    }).catch(() => {});
+}
+majStatutSync();
+setInterval(majStatutSync, 6000);
+
+// ── Export CSV ──
+function exporterCSV(){
+  const rows = [['#','Date','Heure','Identifiant','Profil','Réseau','Prix','Devise']];
+  document.querySelectorAll('#report-tbody tr:not([style*="none"])').forEach((tr, i) => {
+    const c = tr.querySelectorAll('td');
+    if(c.length < 7) return;
+    const prixTxt = c[6].textContent.trim().split(' ');
+    rows.push([
+      i + 1,
+      c[1].textContent.trim(),
+      c[2].textContent.trim(),
+      c[3].textContent.trim(),
+      c[4].textContent.trim(),
+      c[5].textContent.trim(),
+      prixTxt[0] || '',
+      prixTxt[1] || CURRENCY
+    ]);
+  });
+  const csv = rows.map(r =>
+    r.map(v => `"${String(v).replace(/"/g,'""').trim()}"`).join(',')
+  ).join('\n');
+  const a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,﻿' + encodeURIComponent(csv);
+  a.download = `ventes-${MOIS_FILTRE}-${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+}
+
+// ── Supprimer le mois filtré ──
+function supprimerMois(){
+  ouvrirModal(
+    `Supprimer toutes les ventes de ${MOIS_FILTRE} ?`,
+    'Cette action est irréversible. Toutes les ventes enregistrées pour ce mois seront supprimées.',
+    () => {
+      fetch("{{ url_for('report_supprimer_mois') }}", {
+        method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify({mois: MOIS_FILTRE})
+      }).then(r => r.json()).then(d => {
+        if(d.ok){
+          afficherNotif(`${d.deleted} vente(s) supprimée(s).`, 'success');
+          setTimeout(() => location.reload(), 900);
+        } else {
+          afficherNotif(d.msg || 'Erreur.', 'danger');
+        }
+      }).catch(() => afficherNotif('Erreur réseau.', 'danger'));
+    }
+  );
+}
+
+// ── Supprimer une vente ──
+function supprimerVente(id){
+  ouvrirModal('Supprimer cette vente ?', 'Cette action est irréversible.', () => {
+    fetch("{{ url_for('report_supprimer_vente') }}", {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+      body:JSON.stringify({id})
+    }).then(r => r.json()).then(d => {
+      if(d.ok){
+        const el = document.getElementById('row-' + id);
+        if(el){ el.remove(); afficherNotif('Vente supprimée.', 'success'); }
+      } else {
+        afficherNotif(d.msg || 'Erreur.', 'danger');
+      }
+    }).catch(() => afficherNotif('Erreur réseau.', 'danger'));
+  });
+}
+
+// ── Résumé par profil ──
+function afficherResume(){
+  const sec = document.getElementById('resume-section');
+  if(sec.style.display !== 'none'){ sec.style.display = 'none'; return; }
+  sec.style.display = '';
+
+  const profils = {};
+  let grandTotal = 0;
+  document.querySelectorAll('#report-tbody tr:not([style*="none"])').forEach(tr => {
+    const c = tr.querySelectorAll('td');
+    if(c.length < 7) return;
+    const profil = c[4].textContent.trim();
+    const prix   = parseFloat(c[6].textContent.trim()) || 0;
+    if(!profils[profil]) profils[profil] = {count: 0, total: 0};
+    profils[profil].count++;
+    profils[profil].total += prix;
+    grandTotal += prix;
+  });
+
+  const entries = Object.entries(profils).sort((a,b) => b[1].total - a[1].total);
+  if(!entries.length){
+    document.getElementById('resume-content').innerHTML = '<p class="text-muted">Aucune donnée.</p>';
+    return;
+  }
+
+  let html = '<table class="data-table"><thead><tr><th>Profil</th><th>Tickets</th><th>Total</th><th>Part</th></tr></thead><tbody>';
+  for(const [p, v] of entries){
+    const pct = grandTotal > 0 ? Math.round(v.total / grandTotal * 100) : 0;
+    html += `<tr>
+      <td><strong>${p}</strong></td>
+      <td>${v.count}</td>
+      <td><strong>${Math.round(v.total)} ${CURRENCY}</strong></td>
+      <td style="min-width:120px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="bar-wrap"><div class="bar-fill" style="width:${pct}%"></div></div>
+          <span style="font-size:12px;color:#94a3b8">${pct}%</span>
+        </div>
+      </td>
+    </tr>`;
+  }
+  html += `</tbody><tfoot><tr>
+    <td><strong>TOTAL</strong></td>
+    <td><strong>${entries.reduce((a,e)=>a+e[1].count,0)}</strong></td>
+    <td><strong>${Math.round(grandTotal)} ${CURRENCY}</strong></td>
+    <td></td>
+  </tr></tfoot></table>`;
+  document.getElementById('resume-content').innerHTML = html;
+}
+</script>
+{% endblock %}

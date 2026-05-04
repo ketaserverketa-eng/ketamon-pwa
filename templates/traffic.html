@@ -1,0 +1,201 @@
+{% extends "base.html" %}
+{% block title %}— Moniteur de Trafic{% endblock %}
+{% block page_title %}Moniteur de Trafic{% endblock %}
+
+{% block content %}
+<style>
+.traffic-stats{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;}
+.traffic-stat{background:#0f172a;border-radius:10px;padding:16px 20px;text-align:center;}
+.traffic-label{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;}
+.traffic-value{font-size:28px;font-weight:800;color:#e2e8f0;font-family:monospace;}
+.traffic-sub{font-size:11px;color:#475569;margin-top:4px;}
+#traffic-chart{width:100%;display:block;border-radius:8px;background:#0f172a;}
+.iface-badge{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;}
+.iface-up{background:rgba(34,197,94,.15);color:#22c55e;}
+.iface-down{background:rgba(239,68,68,.12);color:#ef4444;}
+</style>
+
+<div class="card" style="margin-bottom:16px">
+  <div class="card-header">
+    <h3><i class="fa fa-area-chart"></i> Trafic en Temps Réel</h3>
+    <div class="card-actions">
+      <label style="font-size:12px;color:#94a3b8;margin-right:6px">Interface :</label>
+      <select id="iface-select" class="form-control form-control-sm" onchange="changerInterface()">
+        {% for i in interfaces %}
+        <option value="{{ i.get('name','') }}">
+          {{ i.get('name','') }} ({{ i.get('type','') }})
+          {% if i.get('running','false') != 'true' %} — hors ligne{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="traffic-stats">
+      <div class="traffic-stat">
+        <div class="traffic-label">&#8595; Réception (Download)</div>
+        <div class="traffic-value" id="rx-rate">0 Ko/s</div>
+        <div class="traffic-sub" id="rx-total">Total : —</div>
+      </div>
+      <div class="traffic-stat">
+        <div class="traffic-label">&#8593; Émission (Upload)</div>
+        <div class="traffic-value" id="tx-rate">0 Ko/s</div>
+        <div class="traffic-sub" id="tx-total">Total : —</div>
+      </div>
+    </div>
+    <canvas id="traffic-chart" height="110"></canvas>
+    <div style="display:flex;justify-content:flex-end;gap:16px;margin-top:8px;font-size:11px">
+      <span style="color:#3b82f6">&#9632; Download</span>
+      <span style="color:#f97316">&#9632; Upload</span>
+    </div>
+  </div>
+</div>
+
+<!-- Liste des interfaces -->
+<div class="card">
+  <div class="card-header"><h3><i class="fa fa-plug"></i> Interfaces Réseau ({{ interfaces|length }})</h3></div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Nom</th>
+          <th>Type</th>
+          <th>Adresse MAC</th>
+          <th>MTU</th>
+          <th>RX octets</th>
+          <th>TX octets</th>
+          <th>État</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for i in interfaces %}
+        <tr>
+          <td><strong>{{ i.get('name','') }}</strong></td>
+          <td>{{ i.get('type','') }}</td>
+          <td><code>{{ i.get('mac-address','—') }}</code></td>
+          <td>{{ i.get('mtu','—') }}</td>
+          <td>{{ i.get('rx-byte','—') }}</td>
+          <td>{{ i.get('tx-byte','—') }}</td>
+          <td>
+            {% if i.get('running','false') == 'true' %}
+            <span class="badge badge-green">Actif</span>
+            {% elif i.get('disabled','false') == 'true' %}
+            <span class="badge badge-red">Désactivé</span>
+            {% else %}
+            <span class="badge">Inactif</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted">Aucune interface.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+/* ── Utilitaires ── */
+function fmtRate(bps){
+  bps = parseInt(bps) || 0;
+  if(bps >= 1e9) return (bps/1e9).toFixed(2) + ' Go/s';
+  if(bps >= 1e6) return (bps/1e6).toFixed(2) + ' Mo/s';
+  if(bps >= 1e3) return (bps/1e3).toFixed(1) + ' Ko/s';
+  return bps + ' o/s';
+}
+function fmtBytes(n){
+  n = parseInt(n) || 0;
+  if(n >= 1e12) return (n/1e12).toFixed(2) + ' To';
+  if(n >= 1e9)  return (n/1e9).toFixed(2)  + ' Go';
+  if(n >= 1e6)  return (n/1e6).toFixed(2)  + ' Mo';
+  if(n >= 1e3)  return (n/1e3).toFixed(1)  + ' Ko';
+  return n + ' o';
+}
+
+/* ── Canvas ── */
+const MAX_PTS = 50;
+let rxHist = new Array(MAX_PTS).fill(0);
+let txHist = new Array(MAX_PTS).fill(0);
+
+function dessinerGraphe(canvas){
+  const W = canvas.offsetWidth;
+  const H = canvas.offsetHeight;
+  canvas.width  = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+
+  const maxVal = Math.max(1, ...rxHist, ...txHist);
+  const pad = {top:14, right:6, bottom:14, left:6};
+  const gW = W - pad.left - pad.right;
+  const gH = H - pad.top  - pad.bottom;
+
+  /* Grille */
+  ctx.strokeStyle = 'rgba(255,255,255,.05)';
+  ctx.lineWidth = 1;
+  for(let i=0; i<4; i++){
+    const y = pad.top + gH * i / 3;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + gW, y); ctx.stroke();
+  }
+
+  /* Valeur max */
+  ctx.fillStyle = 'rgba(148,163,184,.5)';
+  ctx.font = '10px monospace';
+  ctx.fillText(fmtRate(maxVal), 4, pad.top - 2);
+
+  function tracerSerie(hist, color, fillColor){
+    if(hist.length < 2) return;
+    const step = gW / (hist.length - 1);
+    ctx.beginPath();
+    hist.forEach((v, i) => {
+      const x = pad.left + i * step;
+      const y = pad.top + gH - (v / maxVal) * gH;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    /* Remplissage */
+    ctx.lineTo(pad.left + gW, pad.top + gH);
+    ctx.lineTo(pad.left, pad.top + gH);
+    ctx.closePath();
+    ctx.fillStyle = fillColor;
+    ctx.fill();
+  }
+
+  tracerSerie(rxHist, '#3b82f6', 'rgba(59,130,246,.18)');
+  tracerSerie(txHist, '#f97316', 'rgba(249,115,22,.14)');
+}
+
+/* ── Polling trafic ── */
+const canvas = document.getElementById('traffic-chart');
+
+function actualiserTrafic(){
+  const iface = document.getElementById('iface-select').value;
+  fetch(`/api/trafic?interface=${encodeURIComponent(iface)}`)
+    .then(r => r.json())
+    .then(d => {
+      if(!d.ok) return;
+      rxHist.push(d.rx_rate); if(rxHist.length > MAX_PTS) rxHist.shift();
+      txHist.push(d.tx_rate); if(txHist.length > MAX_PTS) txHist.shift();
+      document.getElementById('rx-rate').textContent  = fmtRate(d.rx_rate);
+      document.getElementById('tx-rate').textContent  = fmtRate(d.tx_rate);
+      document.getElementById('rx-total').textContent = 'Total : ' + fmtBytes(d.rx);
+      document.getElementById('tx-total').textContent = 'Total : ' + fmtBytes(d.tx);
+      dessinerGraphe(canvas);
+    }).catch(()=>{});
+}
+
+function changerInterface(){
+  rxHist = new Array(MAX_PTS).fill(0);
+  txHist = new Array(MAX_PTS).fill(0);
+  actualiserTrafic();
+}
+
+actualiserTrafic();
+setInterval(actualiserTrafic, 3000);
+
+/* Redimensionner le canvas quand la fenêtre change */
+window.addEventListener('resize', () => dessinerGraphe(canvas));
+</script>
+{% endblock %}

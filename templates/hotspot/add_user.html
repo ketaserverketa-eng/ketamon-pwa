@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}— Ajouter Utilisateur{% endblock %}
+{% block page_title %}Ajouter un Utilisateur Hotspot{% endblock %}
+
+{% block content %}
+<div class="card card-form">
+  <div class="card-header">
+    <h3><i class="fa fa-user-plus"></i> Ajouter un Utilisateur</h3>
+  </div>
+  <div class="card-body">
+    <form method="POST">
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Nom d'utilisateur *</label>
+          <input type="text" name="name" class="form-control" required placeholder="ex: user001">
+        </div>
+        <div class="form-group col-6">
+          <label>Mot de passe</label>
+          <input type="text" name="password" class="form-control" placeholder="Laisser vide = même que le nom">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Profil</label>
+          <select name="profile" class="form-control">
+            {% for p in profiles %}
+            <option value="{{ p.name }}">{{ p.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group col-6">
+          <label>Serveur Hotspot</label>
+          <select name="server" class="form-control">
+            <option value="">— Tous —</option>
+            {% for s in servers %}
+            <option value="{{ s.name }}">{{ s.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Limite de temps (laisser vide = duree du profil, 0=illimité)</label>
+          <input type="text" name="time_limit" class="form-control" placeholder="laisser vide = profil">
+          <small class="text-muted">Premiere connexion = depart du compteur absolu. Meme ticket = meme appareil seulement.</small>
+        </div>
+        <div class="form-group col-6">
+          <label>Limite de données (Mo, 0=illimité)</label>
+          <input type="number" name="data_limit" class="form-control" placeholder="0" value="0" min="0">
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Commentaire</label>
+        <input type="text" name="comment" class="form-control" placeholder="Optionnel">
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary"><i class="fa fa-save"></i> Enregistrer</button>
+        <a href="{{ url_for('hotspot_users') }}" class="btn btn-secondary">Annuler</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

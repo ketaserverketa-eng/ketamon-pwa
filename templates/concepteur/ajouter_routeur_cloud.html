@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}— Ajouter Routeur Cloud{% endblock %}
+{% block page_title %}Ajouter Routeur Cloud{% endblock %}
+{% block content %}
+<div class="concepteur-banner"><i class="fa fa-shield"></i> Mode Concepteur</div>
+
+<div class="card card-form" style="max-width:540px;margin-top:16px">
+  <div class="card-header"><h3><i class="fa fa-plus"></i> Nouveau routeur MongoDB</h3></div>
+  <div class="card-body">
+    <form method="POST">
+      <div class="form-group">
+        <label>Hôte (IP) *</label>
+        <input type="text" name="host" class="form-control" placeholder="192.168.1.1" required>
+      </div>
+      <div class="form-group">
+        <label>Nom *</label>
+        <input type="text" name="name" class="form-control" placeholder="Mon routeur" required>
+      </div>
+      <div class="form-group">
+        <label>Utilisateur MikroTik</label>
+        <input type="text" name="username" class="form-control" placeholder="admin" value="admin">
+      </div>
+      <div class="form-group">
+        <label>Mot de passe</label>
+        <input type="password" name="password" class="form-control">
+      </div>
+      <div class="form-group">
+        <label>Port API</label>
+        <input type="number" name="port" class="form-control" value="8728">
+      </div>
+      <div class="form-group">
+        <label>Nom du serveur Hotspot</label>
+        <input type="text" name="hotspot_name" class="form-control" placeholder="hotspot1">
+      </div>
+      <div class="form-group">
+        <label>Devise</label>
+        <select name="currency" class="form-control">
+          <option value="FCFA">FCFA</option>
+          <option value="USD">USD</option>
+          <option value="EUR">EUR</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Interface trafic</label>
+        <input type="text" name="traffic_interface" class="form-control" value="ether1">
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary"><i class="fa fa-save"></i> Enregistrer</button>
+        <a href="{{ url_for('concepteur_routeurs_cloud') }}" class="btn btn-secondary">Annuler</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

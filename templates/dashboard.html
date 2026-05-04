@@ -1,0 +1,416 @@
+{% extends "base.html" %}
+{% block title %}— Tableau de Bord{% endblock %}
+{% block page_title %}Tableau de Bord{% endblock %}
+
+{% block content %}
+{% if data %}
+<div class="stats-grid">
+  <!-- Identité routeur -->
+  <div class="stat-card accent-blue">
+    <div class="stat-icon"><i class="fa fa-server"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Routeur</div>
+      <div class="stat-value">{{ data.identity }}</div>
+      <div class="stat-sub">{{ data.board }}</div>
+    </div>
+  </div>
+
+  <!-- RouterOS Version -->
+  <div class="stat-card accent-green">
+    <div class="stat-icon"><i class="fa fa-code"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">RouterOS</div>
+      <div class="stat-value">{{ data.version }}</div>
+      <div class="stat-sub">Version</div>
+    </div>
+  </div>
+
+  <!-- Temps de fonctionnement -->
+  <div class="stat-card accent-teal">
+    <div class="stat-icon"><i class="fa fa-clock-o"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Temps de Fonctionnement</div>
+      <div class="stat-value">{{ data.uptime }}</div>
+      <div class="stat-sub">{{ data.date }} {{ data.time }}</div>
+    </div>
+  </div>
+
+  <!-- CPU -->
+  <div class="stat-card accent-orange">
+    <div class="stat-icon"><i class="fa fa-microchip" style="font-family:sans-serif;">CPU</i></div>
+    <div class="stat-info">
+      <div class="stat-label">Charge CPU</div>
+      <div class="stat-value" id="cpu-val">{{ data.cpu_load }}%</div>
+      <div class="progress-bar">
+        <div class="progress-fill" id="cpu-bar" style="width:{{ data.cpu_load }}%;background:#ff9800;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Mémoire -->
+  <div class="stat-card accent-purple">
+    <div class="stat-icon"><i class="fa fa-database"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Mémoire Libre</div>
+      <div class="stat-value" id="mem-val">{{ data.free_mem }}</div>
+      <div class="progress-bar">
+        <div class="progress-fill" id="mem-bar" style="width:{{ data.mem_pct }}%;background:#9c27b0;"></div>
+      </div>
+      <div class="stat-sub">Total : {{ data.total_mem }}</div>
+    </div>
+  </div>
+
+  <!-- HDD -->
+  <div class="stat-card accent-red">
+    <div class="stat-icon"><i class="fa fa-hdd-o"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Espace Disque Libre</div>
+      <div class="stat-value">{{ data.free_hdd }}</div>
+      <div class="stat-sub">Total : {{ data.total_hdd }}</div>
+    </div>
+  </div>
+
+  <!-- Utilisateurs Hotspot -->
+  <div class="stat-card accent-blue">
+    <div class="stat-icon"><i class="fa fa-users"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Utilisateurs Hotspot</div>
+      <div class="stat-value">{{ data.hs_users }}</div>
+      <div class="stat-sub">Enregistrés</div>
+    </div>
+  </div>
+
+  <!-- Sessions Actives -->
+  <div class="stat-card accent-green">
+    <div class="stat-icon"><i class="fa fa-wifi"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Sessions Actives</div>
+      <div class="stat-value">{{ data.hs_active }}</div>
+      <div class="stat-sub">
+        {% for s in data.hs_servers %}
+        <span class="badge">{{ s }}</span>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <!-- Profils Hotspot -->
+  <div class="stat-card accent-teal">
+    <div class="stat-icon"><i class="fa fa-pie-chart"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Profils Hotspot</div>
+      <div class="stat-value">{{ data.hs_profiles }}</div>
+      <div class="stat-sub"><a href="{{ url_for('hotspot_profiles') }}" style="color:inherit">Gérer les profils</a></div>
+    </div>
+  </div>
+
+  <!-- Connexion Routeur -->
+  <div class="stat-card accent-purple">
+    <div class="stat-icon"><i class="fa fa-plug"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Connexion Routeur</div>
+      <div class="stat-value" style="font-size:13px">
+        <span style="color:#4ade80">&#9679;</span> En ligne
+      </div>
+      <div class="stat-sub">{{ data.router_host }}:{{ data.router_port }}</div>
+    </div>
+  </div>
+</div>
+
+<!-- Widget Revenus -->
+<div class="card" style="margin-top:16px">
+  <div class="card-body" style="display:flex;align-items:center;gap:20px;padding:18px 20px;flex-wrap:wrap">
+    <div style="font-size:40px;opacity:.7"><i class="fa fa-money"></i></div>
+    <div style="flex:1;min-width:160px">
+      <div style="font-size:12px;color:#94a3b8;margin-bottom:6px;display:flex;align-items:center;gap:6px">
+        <i class="fa fa-bar-chart"></i> Revenus
+        <span id="rev-sync-time" style="font-size:10px;color:#475569"></span>
+      </div>
+      <div style="font-size:17px;font-weight:700;color:#4ade80" id="rev-today">— chargement…</div>
+      <div style="font-size:14px;color:#94a3b8;margin-top:3px" id="rev-month">—</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
+      <a href="{{ url_for('report') }}" class="btn btn-sm btn-outline">
+        <i class="fa fa-bar-chart"></i> Rapport complet
+      </a>
+      <button class="btn btn-sm btn-outline" id="btn-sync" onclick="lancerSync()" style="font-size:11px">
+        <i class="fa fa-refresh"></i> Sync MikroTik
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Boutons raccourcis -->
+<div class="quick-actions" style="margin-top:16px">
+  <a href="{{ url_for('hotspot_users') }}" class="quick-btn">
+    <i class="fa fa-users"></i><br>Clients
+  </a>
+  <a href="{{ url_for('reseau_ajouter_client') }}" class="quick-btn">
+    <i class="fa fa-user-plus"></i><br>Ajouter
+  </a>
+  <a href="{{ url_for('reseau_creer_comptes') }}" class="quick-btn">
+    <i class="fa fa-magic"></i><br>Créer
+  </a>
+  <a href="{{ url_for('hotspot_active') }}" class="quick-btn">
+    <i class="fa fa-wifi"></i><br>Sessions
+  </a>
+  <a href="{{ url_for('report') }}" class="quick-btn">
+    <i class="fa fa-money"></i><br>Rapport
+  </a>
+  <a href="{{ url_for('traffic_monitor') }}" class="quick-btn">
+    <i class="fa fa-area-chart"></i><br>Trafic
+  </a>
+</div>
+
+<!-- Graphique Trafic Temps Réel -->
+<div class="card" style="margin-top:16px">
+  <div class="card-header" style="flex-wrap:wrap;gap:8px">
+    <h3><i class="fa fa-area-chart"></i> Trafic Réseau (Temps Réel)</h3>
+    <div style="display:flex;align-items:center;gap:8px;margin-left:auto">
+      <label style="font-size:12px;color:#94a3b8;margin:0">Interface :</label>
+      <select id="iface-select" class="form-control" style="width:130px;padding:3px 8px;font-size:12px" onchange="changerInterface(this.value)">
+        <option value="ether1">ether1</option>
+      </select>
+      <span id="trafic-ts" style="font-size:10px;color:#475569"></span>
+    </div>
+  </div>
+  <div class="card-body" style="padding:12px 16px">
+    <canvas id="traffic-chart" height="70"></canvas>
+    <div style="display:flex;justify-content:center;gap:28px;margin-top:10px;font-size:13px">
+      <span><span style="color:#3b82f6;font-size:16px">▬</span> Download : <strong id="rx-rate">—</strong></span>
+      <span><span style="color:#f59e0b;font-size:16px">▬</span> Upload : <strong id="tx-rate">—</strong></span>
+    </div>
+  </div>
+</div>
+
+<!-- Journal Hotspot -->
+<div class="card" style="margin-top:16px">
+  <div class="card-header">
+    <h3><i class="fa fa-align-justify"></i> Journal Hotspot</h3>
+    <button class="btn btn-outline btn-sm" onclick="chargerLogs()"><i class="fa fa-refresh"></i> Actualiser</button>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table" id="log-table">
+      <thead>
+        <tr><th>Heure</th><th>Utilisateur (IP)</th><th>Message</th></tr>
+      </thead>
+      <tbody id="log-body">
+        <tr><td colspan="3" class="text-center text-muted">Chargement…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% else %}
+<div class="alert alert-danger">
+  <i class="fa fa-exclamation-triangle"></i>
+  Impossible de récupérer les données du routeur.
+  <a href="{{ url_for('sessions_list') }}">Changer de routeur</a>
+</div>
+{% endif %}
+
+{% if data %}
+<script>
+// ── Utilitaire POST CSRF (indépendant de main.js) ────────────────────────────
+function _postCsrf(url){
+  return fetch(url, {
+    method:'POST',
+    headers:{'X-CSRF-Token': (window._KETAMON_CSRF||'')}
+  }).catch(()=>{});
+}
+
+// ── CPU/Mémoire live toutes les 5s ───────────────────────────────────────────
+function _refreshResources(){
+  fetch("{{ url_for('api_resources') }}")
+    .then(r=>r.json())
+    .then(d=>{
+      if(!d.ok) return;
+      const cv=document.getElementById("cpu-val");
+      const cb=document.getElementById("cpu-bar");
+      const mv=document.getElementById("mem-val");
+      const mb=document.getElementById("mem-bar");
+      if(cv) cv.textContent = d.cpu+"%";
+      if(cb) cb.style.width = d.cpu+"%";
+      if(mv) mv.textContent = d.free_mem;
+      if(mb) mb.style.width = d.mem_pct+"%";
+    }).catch(()=>{});
+}
+_refreshResources();
+setInterval(_refreshResources, 5000);
+
+// ── Revenus (lecture SQLite immédiate) ───────────────────────────────────────
+function chargerRevenus(){
+  fetch("{{ url_for('api_revenus') }}")
+    .then(r=>r.json())
+    .then(d=>{
+      const cur = d.currency||"FCFA";
+      document.getElementById("rev-today").textContent =
+        `Aujourd'hui : ${d.today_count||0} ticket(s) — ${cur} ${(d.today_total||0)|0}`;
+      document.getElementById("rev-month").textContent =
+        `Ce mois : ${d.month_count||0} ticket(s) — ${cur} ${(d.month_total||0)|0}`;
+      const el=document.getElementById("rev-sync-time");
+      if(el) el.textContent = `màj ${new Date().toLocaleTimeString()}`;
+    })
+    .catch(()=>{
+      document.getElementById("rev-today").textContent = "Données indisponibles";
+    });
+}
+
+// ── Sync MikroTik → SQLite (arrière-plan, ne bloque rien) ───────────────────
+function _syncBg(){
+  _postCsrf("/api/sync-ventes")
+    .then(r=>r&&r.json&&r.json())
+    .then(d=>{ if(d&&d.ok&&d.new>0) chargerRevenus(); })
+    .catch(()=>{});
+}
+
+// ── Bouton Sync manuel ───────────────────────────────────────────────────────
+function lancerSync(){
+  const btn=document.getElementById("btn-sync");
+  if(btn){ btn.disabled=true; btn.innerHTML='<i class="fa fa-spinner fa-spin"></i> Sync…'; }
+  _postCsrf("/api/sync-ventes")
+    .then(r=>r&&r.json())
+    .then(()=>chargerRevenus())
+    .catch(()=>{})
+    .finally(()=>{
+      if(btn){ btn.disabled=false; btn.innerHTML='<i class="fa fa-refresh"></i> Sync MikroTik'; }
+    });
+}
+
+// ── Lancement immédiat ───────────────────────────────────────────────────────
+chargerRevenus();            // affichage immédiat sans attendre sync
+_syncBg();                   // sync arrière-plan (non bloquant)
+setInterval(chargerRevenus, 15000);  // rafraîchir toutes les 15s
+setInterval(_syncBg, 60000);         // re-syncer toutes les 60s
+
+// ── Journal Hotspot ──────────────────────────────────────────────────────────
+function chargerLogs(){
+  fetch("{{ url_for('api_log_hotspot') }}")
+    .then(r=>r.json())
+    .then(d=>{
+      const tbody=document.getElementById("log-body");
+      if(!d.ok||!d.logs||!d.logs.length){
+        tbody.innerHTML='<tr><td colspan="3" class="text-center text-muted">Aucun journal hotspot.</td></tr>';
+        return;
+      }
+      tbody.innerHTML=d.logs.slice(0,20).map(l=>`
+        <tr>
+          <td style="white-space:nowrap">${l.time||''}</td>
+          <td>${l.user?`<strong>${l.user}</strong> (${l.ip||'—'})`:l.ip||'—'}</td>
+          <td>${l.message||''}</td>
+        </tr>`).join('');
+    })
+    .catch(()=>{
+      document.getElementById("log-body").innerHTML=
+        '<tr><td colspan="3" class="text-center text-muted">Impossible de charger les logs.</td></tr>';
+    });
+}
+chargerLogs();
+setInterval(chargerLogs, 30000);
+
+// ── Graphique trafic (Canvas pur — aucune dépendance CDN) ────────────────────
+const MAX_PTS = 50;
+const _rxData = Array(MAX_PTS).fill(0);
+const _txData = Array(MAX_PTS).fill(0);
+let _currentIface = 'ether1';
+
+function formatBits(b){
+  b = parseFloat(b)||0;
+  if(b>=1e9) return (b/1e9).toFixed(2)+' Gbps';
+  if(b>=1e6) return (b/1e6).toFixed(2)+' Mbps';
+  if(b>=1e3) return (b/1e3).toFixed(1)+' Kbps';
+  return b.toFixed(0)+' bps';
+}
+
+function drawTrafficCanvas(){
+  const canvas = document.getElementById('traffic-chart');
+  if(!canvas) return;
+  const W = canvas.width  = canvas.offsetWidth  || 600;
+  const H = canvas.height = 80;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+
+  // fond
+  ctx.fillStyle = '#0f172a';
+  ctx.fillRect(0,0,W,H);
+
+  // lignes grille
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 1;
+  [H/4, H/2, H*3/4].forEach(y=>{ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); });
+
+  const maxVal = Math.max(..._rxData, ..._txData, 1);
+  const step   = W / (MAX_PTS - 1);
+
+  function drawSeries(data, color, fill){
+    ctx.beginPath();
+    data.forEach((v,i)=>{
+      const x = i*step;
+      const y = H - (v/maxVal)*(H-6) - 3;
+      i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+    });
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+    // remplissage
+    ctx.lineTo((MAX_PTS-1)*step, H); ctx.lineTo(0,H); ctx.closePath();
+    ctx.fillStyle = fill; ctx.fill();
+  }
+
+  drawSeries(_rxData, '#3b82f6', 'rgba(59,130,246,0.15)');
+  drawSeries(_txData, '#f59e0b', 'rgba(245,158,11,0.12)');
+
+  // étiquette max
+  ctx.fillStyle = '#475569'; ctx.font = '10px sans-serif';
+  ctx.fillText(formatBits(maxVal), 4, 12);
+}
+
+function mettreAJourTrafic(){
+  fetch(`/api/trafic?interface=${_currentIface}`)
+    .then(r=>r.json())
+    .then(d=>{
+      if(!d.ok) return;
+      const rx = parseFloat(d.rx_rate)||0;
+      const tx = parseFloat(d.tx_rate)||0;
+      _rxData.push(rx); _rxData.shift();
+      _txData.push(tx); _txData.shift();
+      drawTrafficCanvas();
+      document.getElementById('rx-rate').textContent = formatBits(rx);
+      document.getElementById('tx-rate').textContent = formatBits(tx);
+      const ts = document.getElementById('trafic-ts');
+      if(ts) ts.textContent = new Date().toLocaleTimeString();
+    })
+    .catch(()=>{});
+}
+
+function changerInterface(iface){
+  _currentIface = iface;
+  _rxData.fill(0); _txData.fill(0);
+  drawTrafficCanvas();
+}
+
+// ── Démarrage immédiat du trafic ─────────────────────────────────────────────
+mettreAJourTrafic();
+setInterval(mettreAJourTrafic, 2000);
+
+// Charger la liste des interfaces en arrière-plan (ne bloque pas le graphique)
+fetch('/api/interfaces')
+  .then(r=>r.json())
+  .then(d=>{
+    if(!d.ok||!d.interfaces.length) return;
+    const sel=document.getElementById('iface-select');
+    sel.innerHTML='';
+    d.interfaces.forEach(i=>{
+      const opt=document.createElement('option');
+      opt.value=i.name;
+      opt.textContent=i.name+(i.running?'':' ✗');
+      sel.appendChild(opt);
+    });
+    // Garder ether1 si présent, sinon prendre la première
+    const hasEther1 = d.interfaces.some(i=>i.name==='ether1');
+    if(!hasEther1){ _currentIface=d.interfaces[0].name; sel.value=_currentIface; }
+  })
+  .catch(()=>{});
+
+window.addEventListener('resize', drawTrafficCanvas);
+</script>
+{% endif %}
+{% endblock %}

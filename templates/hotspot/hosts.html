@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}— Hôtes Hotspot{% endblock %}
+{% block page_title %}Hôtes Hotspot{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-laptop"></i> Hôtes ({{ hosts|length }})</h3>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      {% if hosts %}
+      <button class="btn btn-danger btn-sm" onclick="supprimerTousHotes()">
+        <i class="fa fa-trash"></i> Supprimer tout
+      </button>
+      {% endif %}
+      <a href="{{ url_for('hotspot_hosts') }}" class="btn btn-outline btn-sm" title="Rafraîchir"><i class="fa fa-refresh"></i></a>
+    </div>
+  </div>
+
+  {% if not hosts %}
+  <div class="card-body" style="text-align:center;padding:40px 20px;color:#94a3b8">
+    <i class="fa fa-laptop" style="font-size:48px;color:#334155;margin-bottom:16px;display:block"></i>
+    <p style="font-size:15px;margin:0 0 8px;color:#e2e8f0">Aucun hôte pour le moment.</p>
+    <p style="font-size:13px;margin:0;max-width:420px;margin:0 auto;line-height:1.6">
+      Les hôtes apparaissent automatiquement quand des appareils se connectent au réseau hotspot,
+      même sans s'authentifier. Cette liste est mise à jour toutes les 30 secondes.
+    </p>
+  </div>
+  {% else %}
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Adresse MAC</th>
+          <th>Adresse IP</th>
+          <th>Serveur</th>
+          <th>Connecté depuis</th>
+          <th>Authentifié</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for h in hosts %}
+        <tr>
+          <td><code>{{ h.get('mac-address','—') }}</code></td>
+          <td>{{ h.get('address','—') }}</td>
+          <td>{{ h.get('server','—') }}</td>
+          <td>{{ h.get('uptime','—') }}</td>
+          <td>
+            {% if h.get('authorized','no') == 'yes' %}
+            <span class="badge badge-green">Oui</span>
+            {% else %}
+            <span class="badge badge-red">Non</span>
+            {% endif %}
+          </td>
+          <td>
+            <button onclick="supprimerHote('{{ h.get('id','') }}', '{{ h.get('mac-address','') }}')"
+              style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+              <i class="fa fa-trash"></i> Supprimer
+            </button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+const _CSRF = window._KETAMON_CSRF || '';
+
+function supprimerHote(id, mac){
+  ouvrirModal(
+    `Supprimer l'hôte ${mac} ?`,
+    "L'appareil sera retiré de la liste des hôtes connus.",
+    () => {
+      fetch("{{ url_for('hotspot_remove_host') }}", {
+        method:"POST",
+        headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF},
+        body:JSON.stringify({id})
+      }).then(r=>r.json()).then(d=>{
+        if(d.ok){ afficherNotif("Hôte supprimé.","success"); setTimeout(()=>location.reload(),500); }
+        else afficherNotif(d.msg || "Erreur.","danger");
+      }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+    }
+  );
+}
+
+function supprimerTousHotes(){
+  var lignes = document.querySelectorAll('tbody tr');
+  ouvrirModal(
+    `Supprimer tous les hôtes (${lignes.length}) ?`,
+    "Tous les appareils seront retirés de la liste. Ils pourront se reconnecter.",
+    async () => {
+      var btns = Array.from(document.querySelectorAll('[onclick^="supprimerHote"]'));
+      var ids = btns.map(b => {
+        var m = b.getAttribute('onclick').match(/'([^']+)'/);
+        return m ? m[1] : null;
+      }).filter(Boolean);
+      var errs = 0;
+      for(var id of ids){
+        try{
+          var r = await fetch("{{ url_for('hotspot_remove_host') }}", {
+            method:"POST",
+            headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF},
+            body:JSON.stringify({id})
+          });
+          var d = await r.json();
+          if(!d.ok) errs++;
+        }catch(e){ errs++; }
+      }
+      if(errs) afficherNotif(`${errs} erreur(s) lors de la suppression.`,"danger");
+      else afficherNotif("Tous les hôtes supprimés.","success");
+      setTimeout(()=>location.reload(),600);
+    }
+  );
+}
+
+setInterval(() => location.reload(), 30000);
+</script>
+{% endblock %}

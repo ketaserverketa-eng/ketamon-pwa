@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+{% block title %}— Clients Réseau{% endblock %}
+{% block page_title %}Clients Réseau{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-users"></i> Liste des Clients ({{ users|length }})</h3>
+    <div class="card-actions">
+      <a href="{{ url_for('reseau_ajouter_client') }}" class="btn btn-primary btn-sm">
+        <i class="fa fa-user-plus"></i> Ajouter
+      </a>
+      <a href="{{ url_for('reseau_creer_comptes') }}" class="btn btn-success btn-sm">
+        <i class="fa fa-magic"></i> Créer des comptes
+      </a>
+    </div>
+  </div>
+
+  <!-- Filtres -->
+  <div class="filter-bar">
+    <form method="get" class="filter-form">
+      <select name="profil" class="form-control form-control-sm" onchange="this.form.submit()">
+        <option value="tous" {% if prof_filter=='tous' %}selected{% endif %}>Tous les profils</option>
+        {% for p in profiles %}
+        <option value="{{ p.name }}" {% if prof_filter==p.name %}selected{% endif %}>{{ p.name }}</option>
+        {% endfor %}
+      </select>
+      <input type="text" name="commentaire" class="form-control form-control-sm"
+             placeholder="Filtrer par commentaire" value="{{ request.args.get('commentaire','') }}">
+      <button type="submit" class="btn btn-secondary btn-sm"><i class="fa fa-filter"></i> Filtrer</button>
+      <a href="{{ url_for('reseau_clients') }}" class="btn btn-outline btn-sm"><i class="fa fa-refresh"></i></a>
+    </form>
+    <input type="text" id="search-input" class="form-control form-control-sm" placeholder="Rechercher...">
+  </div>
+
+  <div class="table-responsive">
+    <table class="data-table" id="users-table">
+      <thead>
+        <tr>
+          <th><input type="checkbox" id="select-all"></th>
+          <th>Identifiant</th>
+          <th>Profil</th>
+          <th>Serveur</th>
+          <th>Limite Temps</th>
+          <th>Limite Données</th>
+          <th>Commentaire</th>
+          <th>État</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in users %}
+        <tr class="{% if u.get('disabled','no')=='yes' %}row-disabled{% endif %}">
+          <td><input type="checkbox" class="row-check" value="{{ u.get('id','') }}"></td>
+          <td><strong>{{ u.get('name','') }}</strong></td>
+          <td><span class="badge badge-blue">{{ u.get('profile','—') }}</span></td>
+          <td>{{ u.get('server','—') }}</td>
+          <td>{{ u.get('limit-uptime','—') or '∞' }}</td>
+          <td>{{ u.get('limit-bytes-total','—') or '∞' }}</td>
+          {% set _c = u.get('comment','') %}
+          <td>{{ _c[3:] if (_c.startswith('vc-') or _c.startswith('up-')) else _c }}</td>
+          <td>
+            <span class="badge {{ u.get('_live_state_badge', 'badge-blue') }}">{{ u.get('_live_state_label', 'Inconnu') }}</span>
+            {% if u.get('_active_sessions', 0) %}
+            <div class="text-muted" style="margin-top:6px">{{ u.get('_active_sessions', 0) }} session(s)</div>
+            {% endif %}
+          </td>
+          <td>
+            <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+              <a href="{{ url_for('reseau_modifier_client', uid=u.get('id','')) }}"
+                style="background:#1e3a5f;color:#93c5fd;border:none;border-radius:5px;padding:3px 8px;font-size:11px;text-decoration:none;white-space:nowrap;display:inline-block">
+                <i class="fa fa-edit"></i> Modifier
+              </a>
+              {% if u.get('disabled','no') == 'yes' %}
+              <button onclick="basculerClient('{{ u.get('id','') }}','no')"
+                style="background:#166534;color:#86efac;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-toggle-off"></i> Activer
+              </button>
+              {% else %}
+              <button onclick="basculerClient('{{ u.get('id','') }}','yes')"
+                style="background:#78350f;color:#fcd34d;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-toggle-on"></i> Désact.
+              </button>
+              {% endif %}
+              <button onclick="reinitialiserClient('{{ u.get('id','') }}','{{ u.get('name','') }}')"
+                style="background:#78350f;color:#fcd34d;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-refresh"></i> Reset
+              </button>
+              <button onclick="supprimerClient('{{ u.get('id','') }}','{{ u.get('name','') }}')"
+                style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-trash"></i> Suppr.
+              </button>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="text-center text-muted">Aucun client trouvé.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Actions groupées -->
+  <div class="bulk-actions" id="bulk-bar" style="display:none">
+    <span id="bulk-count">0</span> sélectionné(s)
+    <button class="btn btn-danger btn-sm" onclick="supprimerSelection()">
+      <i class="fa fa-trash"></i> Supprimer
+    </button>
+  </div>
+</div>
+
+<script>
+document.getElementById("search-input").addEventListener("input", function(){
+  const q = this.value.toLowerCase();
+  document.querySelectorAll("#users-table tbody tr").forEach(tr => {
+    tr.style.display = tr.textContent.toLowerCase().includes(q) ? "" : "none";
+  });
+});
+
+document.getElementById("select-all").addEventListener("change", function(){
+  document.querySelectorAll(".row-check").forEach(cb => { cb.checked = this.checked; });
+  mettreAJourBulk();
+});
+document.querySelectorAll(".row-check").forEach(cb => cb.addEventListener("change", mettreAJourBulk));
+
+function mettreAJourBulk(){
+  const checked = document.querySelectorAll(".row-check:checked");
+  const bar = document.getElementById("bulk-bar");
+  document.getElementById("bulk-count").textContent = checked.length;
+  bar.style.display = checked.length > 0 ? "flex" : "none";
+}
+
+function basculerClient(id, disabled){
+  fetch("{{ url_for('reseau_basculer_client') }}", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({id, disabled})
+  }).then(async (r) => {
+    const d = await r.json().catch(() => ({ok:false, msg:"Reponse invalide du serveur"}));
+    if(!r.ok || !d.ok){
+      throw new Error(d.msg || `Erreur ${r.status}`);
+    }
+    afficherNotif(
+      d.msg || (disabled === "yes" ? "Utilisateur desactive." : "Utilisateur active."),
+      disabled === "yes" ? "warning" : "success"
+    );
+    setTimeout(() => location.reload(), 450);
+  }).catch((err) => {
+    afficherNotif(err.message || "Operation impossible", "danger");
+  });
+}
+
+function supprimerClient(id, nom){
+  ouvrirModal(
+    `Supprimer « ${nom} » ?`,
+    "Cette action est irréversible.",
+    () => {
+      fetch("{{ url_for('reseau_supprimer_client') }}", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({id})
+      }).then(r => r.json()).then(d => {
+        if(d.ok) location.reload();
+        else afficherNotif(d.msg, "danger");
+      });
+    }
+  );
+}
+
+function reinitialiserClient(id, nom){
+  ouvrirModal(
+    `Réinitialiser « ${nom} » ?`,
+    "Le ticket sera remis à zéro (compteurs, MAC) — il pourra être réutilisé sur un nouvel appareil.",
+    () => {
+      fetch("{{ url_for('hotspot_reset_user') }}", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({id})
+      }).then(r => r.json()).then(d => {
+        if(d.ok){
+          afficherNotif(d.msg || "Ticket réinitialisé.", "success");
+          setTimeout(() => location.reload(), 600);
+        } else {
+          afficherNotif(d.msg || "Réinitialisation impossible.", "danger");
+        }
+      }).catch(() => afficherNotif("Erreur réseau.", "danger"));
+    }
+  );
+}
+
+function supprimerSelection(){
+  const ids = Array.from(document.querySelectorAll(".row-check:checked")).map(cb => cb.value);
+  if(!ids.length) return;
+  ouvrirModal(
+    `Supprimer ${ids.length} client(s) ?`,
+    "Cette action est irréversible.",
+    async () => {
+      for(const id of ids){
+        await fetch("{{ url_for('reseau_supprimer_client') }}", {
+          method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})
+        });
+      }
+      location.reload();
+    }
+  );
+}
+</script>
+{% endblock %}

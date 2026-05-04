@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+{% block title %}— Tickets{% endblock %}
+{% block page_title %}Tickets & Revenus{% endblock %}
+{% block content %}
+<div class="concepteur-banner"><i class="fa fa-shield"></i> Mode Concepteur</div>
+
+<!-- Résumé revenus -->
+<div class="stats-grid" style="margin-top:16px">
+  <div class="stat-card accent-blue">
+    <div class="stat-icon"><i class="fa fa-archive"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Stock non utilisé</div>
+      <div class="stat-value">{{ stock|length }}</div>
+      <div class="stat-sub">tickets en attente</div>
+    </div>
+  </div>
+  <div class="stat-card accent-green">
+    <div class="stat-icon"><i class="fa fa-check-circle"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Utilisés aujourd'hui</div>
+      <div class="stat-value">{{ summary.get('day',{}).get('count',0) }}</div>
+      <div class="stat-sub">{{ summary.get('day',{}).get('generatedValue',0)|int }} FCFA</div>
+    </div>
+  </div>
+  <div class="stat-card accent-orange">
+    <div class="stat-icon"><i class="fa fa-calendar"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Ce mois</div>
+      <div class="stat-value">{{ summary.get('month',{}).get('generatedValue',0)|int }} FCFA</div>
+      <div class="stat-sub">{{ summary.get('month',{}).get('count',0) }} tickets</div>
+    </div>
+  </div>
+  <div class="stat-card accent-purple">
+    <div class="stat-icon"><i class="fa fa-database"></i></div>
+    <div class="stat-info">
+      <div class="stat-label">Total revenus</div>
+      <div class="stat-value">{{ summary.get('total',{}).get('generatedValue',0)|int }} FCFA</div>
+      <div class="stat-sub">{{ summary.get('total',{}).get('count',0) }} tickets</div>
+    </div>
+  </div>
+</div>
+
+<!-- Stock : tickets créés non utilisés -->
+<div class="card" style="margin-top:16px">
+  <div class="card-header">
+    <h3><i class="fa fa-archive"></i> Stock — Tickets non utilisés ({{ stock|length }})</h3>
+    <button class="btn btn-sm btn-secondary" onclick="reinstallerScripts()" title="Met à jour les scripts d'expiration sur le MikroTik">
+      <i class="fa fa-refresh"></i> Réinstaller scripts MikroTik
+    </button>
+  </div>
+  {% if stock %}
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead><tr><th>Code</th><th>Routeur</th><th>Profil</th><th>Prix</th></tr></thead>
+      <tbody>
+        {% for t in stock %}
+        <tr>
+          <td><code>{{ t.code }}</code></td>
+          <td>{{ t.router }}</td>
+          <td>{{ t.profile }}</td>
+          <td>{{ t.price }} {{ t.currency }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="card-body text-muted text-center">Aucun ticket en stock (tous utilisés ou MikroTik inaccessible).</div>
+  {% endif %}
+</div>
+
+<!-- Tickets utilisés (revenus) -->
+<div class="card" style="margin-top:16px">
+  <div class="card-header">
+    <h3><i class="fa fa-ticket"></i> Tickets utilisés — Revenus ({{ tickets|length }})</h3>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead><tr><th>Code</th><th>Routeur</th><th>Prix</th><th>Plan</th><th>Date</th><th>Actions</th></tr></thead>
+      <tbody>
+        {% for t in tickets %}
+        <tr id="row-{{ t.get('_id') }}">
+          <td><code>{{ t.get('code','—') }}</code></td>
+          <td>{{ t.get('routerHost','—') }}</td>
+          <td><b>{{ t.get('price',0) }} {{ t.get('currency','FCFA') }}</b></td>
+          <td>{{ t.get('plan','—') }}</td>
+          <td>{{ t.get('soldAt','—')[:16] if t.get('soldAt') else '—' }}</td>
+          <td>
+            {% set tid = t.get('_id') %}
+            <button class="btn btn-xs btn-danger" onclick="deleteTicket('{{ tid }}')"><i class="fa fa-trash"></i></button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-center text-muted">Aucun ticket utilisé.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const _CSRF = window._KETAMON_CSRF || '';
+
+function reinstallerScripts(){
+  ouvrirModal("Réinstaller les scripts MikroTik ?",
+    "Met à jour les scripts d'expiration et de login sur tous les routeurs connectés.",
+    () => {
+      afficherNotif("Mise à jour des scripts MikroTik…","info");
+      fetch("/hotspot/scripts/reinstaller", {
+        method:"POST",
+        headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF}
+      }).then(r=>r.json()).then(d=>{
+        afficherNotif(d.ok ? (d.msg||"Scripts mis à jour.") : (d.msg||"Erreur"), d.ok?"success":"danger");
+      }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+    }
+  );
+}
+
+function deleteTicket(id){
+  ouvrirModal("Supprimer ce ticket des revenus ?", "Cette action est irréversible.", () => {
+    fetch("/concepteur/tickets/"+id+"/supprimer", {
+      method:"POST",
+      headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF}
+    }).then(r=>r.json()).then(d=>{
+      if(d.ok){ var el=document.getElementById("row-"+id); if(el)el.remove(); }
+      else afficherNotif(d.msg||"Erreur","danger");
+    }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+  });
+}
+</script>
+{% endblock %}

@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}— Cookies Hotspot{% endblock %}
+{% block page_title %}Cookies Hotspot{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-hourglass"></i> Cookies ({{ cookies|length }})</h3>
+    <a href="{{ url_for('hotspot_cookies') }}" class="btn btn-outline btn-sm"><i class="fa fa-refresh"></i> Actualiser</a>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Utilisateur</th>
+          <th>Adresse MAC</th>
+          <th>Adresse IP</th>
+          <th>Expiration</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in cookies %}
+        <tr>
+          <td><strong>{{ c.get('user','—') }}</strong></td>
+          <td><code>{{ c.get('mac-address','—') }}</code></td>
+          <td>{{ c.get('address','—') }}</td>
+          <td>{{ c.get('expires-in','—') }}</td>
+          <td>
+            <button onclick="supprimerCookie('{{ c.get('id','') }}')"
+              style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer">
+              <i class="fa fa-trash"></i> Supprimer
+            </button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-center text-muted">Aucun cookie trouvé.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function supprimerCookie(id){
+  ouvrirModal("Supprimer ce cookie ?","",()=>{
+    fetch("{{ url_for('hotspot_remove_cookie') }}", {
+      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})
+    }).then(r=>r.json()).then(d=>{ if(d.ok) location.reload(); else afficherNotif(d.msg,"danger"); });
+  });
+}
+</script>
+{% endblock %}

@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0EA5E9">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="KetaMon">
+<title>KetaMon {% block title %}{% endblock %}</title>
+<link rel="manifest" href="/static/manifest.json">
+<link rel="apple-touch-icon" href="/static/img/default-ticket-logo.png">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ _css_ver }}">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+{% if adsense_pub_id %}
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={{ adsense_pub_id }}" crossorigin="anonymous"></script>
+{% endif %}
+</head>
+<body class="dark">
+
+{% if session.get('logged_in') %}
+<!-- Barre de navigation -->
+<div id="navbar">
+  <div class="nav-left">
+    <button id="toggle-sidebar" class="nav-btn"><i class="fa fa-bars"></i></button>
+    <a href="{{ url_for('index') }}" class="brand" style="display:flex;align-items:center;gap:8px">
+      {% if ticket_logo_url %}
+      <img src="{{ ticket_logo_url }}" alt="logo" style="height:28px;width:28px;object-fit:contain;border-radius:6px">
+      {% endif %}
+      KetaMon
+    </a>
+    <span class="page-title">{% block page_title %}{% endblock %}</span>
+  </div>
+  <div class="nav-right">
+    {% if active_router %}
+    <span class="router-badge"><i class="fa fa-wifi"></i> {{ active_router.name }}</span>
+    <a href="{{ url_for('disconnect_router') }}" class="nav-link" title="Changer de routeur"><i class="fa fa-exchange"></i></a>
+    {% endif %}
+    <select id="switch-router" class="nav-select" onchange="changerRouteur(this.value)">
+      <option value="">Changer de routeur</option>
+      {% for r in routers %}
+      <option value="{{ r.id }}" {% if active_router and active_router.id == r.id %}selected{% endif %}>
+        {{ r.name }}
+      </option>
+      {% endfor %}
+    </select>
+    <a href="{{ url_for('abonnement') }}" class="nav-link" title="Mon abonnement Premium"><i class="fa fa-star"></i></a>
+    <span class="nav-user"><i class="fa fa-user-circle"></i> {{ session.username }}</span>
+    <a href="{{ url_for('logout') }}" class="nav-link"><i class="fa fa-sign-out"></i> Déconnexion</a>
+  </div>
+</div>
+
+<!-- Sidebar -->
+<div id="sidenav">
+  {% if active_router %}
+  <div class="sidebar-header">
+    <div class="router-name">{{ active_router.name }}</div>
+  </div>
+  <a href="{{ url_for('dashboard') }}" class="menu-item {% if current_page=='dashboard' %}active{% endif %}">
+    <i class="fa fa-tachometer"></i> Tableau de Bord
+  </a>
+
+  <!-- HOTSPOT -->
+  <div class="menu-group-btn {% if 'hotspot' in current_page %}open{% endif %}" onclick="toggleMenu(this)">
+    <i class="fa fa-wifi"></i> Hotspot <i class="fa fa-caret-down float-right"></i>
+  </div>
+  <div class="menu-group {% if 'hotspot' in current_page %}open{% endif %}">
+
+    <!-- Utilisateurs -->
+    <div class="menu-sub-btn {% if current_page in ['hotspot_users','hotspot_add_user','hotspot_generate','hotspot_edit_user'] %}open{% endif %}" onclick="toggleMenu(this)">
+      <i class="fa fa-users"></i> Utilisateurs <i class="fa fa-caret-down float-right"></i>
+    </div>
+    <div class="menu-sub {% if current_page in ['hotspot_users','hotspot_add_user','hotspot_generate','hotspot_edit_user'] %}open{% endif %}">
+      <a href="{{ url_for('hotspot_users') }}" class="{% if current_page=='hotspot_users' %}active{% endif %}">
+        <i class="fa fa-list"></i> Liste des utilisateurs
+      </a>
+      <a href="{{ url_for('hotspot_add_user') }}" class="{% if current_page=='hotspot_add_user' %}active{% endif %}">
+        <i class="fa fa-user-plus"></i> Ajouter un utilisateur
+      </a>
+      <a href="{{ url_for('hotspot_generate') }}" class="{% if current_page=='hotspot_generate' %}active{% endif %}">
+        <i class="fa fa-magic"></i> Générer des utilisateurs
+      </a>
+    </div>
+
+    <!-- Profils -->
+    <div class="menu-sub-btn {% if current_page in ['hotspot_profiles','hotspot_add_profile'] %}open{% endif %}" onclick="toggleMenu(this)">
+      <i class="fa fa-pie-chart"></i> Profils <i class="fa fa-caret-down float-right"></i>
+    </div>
+    <div class="menu-sub {% if current_page in ['hotspot_profiles','hotspot_add_profile'] %}open{% endif %}">
+      <a href="{{ url_for('hotspot_profiles') }}" class="{% if current_page=='hotspot_profiles' %}active{% endif %}">
+        <i class="fa fa-list"></i> Liste des profils
+      </a>
+      <a href="{{ url_for('hotspot_add_profile') }}" class="{% if current_page=='hotspot_add_profile' %}active{% endif %}">
+        <i class="fa fa-plus-square"></i> Ajouter un profil
+      </a>
+    </div>
+
+    <a href="{{ url_for('hotspot_active') }}" class="menu-item {% if current_page=='hotspot_active' %}active{% endif %}">
+      <i class="fa fa-wifi"></i> Actifs Hotspot
+    </a>
+    <a href="{{ url_for('hotspot_hosts') }}" class="menu-item {% if current_page=='hotspot_hosts' %}active{% endif %}">
+      <i class="fa fa-laptop"></i> Hôtes
+    </a>
+    <a href="{{ url_for('hotspot_ip_bindings') }}" class="menu-item {% if current_page=='hotspot_ip_bindings' %}active{% endif %}">
+      <i class="fa fa-address-book"></i> Liaisons IP
+    </a>
+    <a href="{{ url_for('hotspot_cookies') }}" class="menu-item {% if current_page=='hotspot_cookies' %}active{% endif %}">
+      <i class="fa fa-hourglass"></i> Cookies
+    </a>
+  </div>
+
+  <a href="{{ url_for('quick_print') }}" class="menu-item {% if current_page=='quick_print' %}active{% endif %}">
+    <i class="fa fa-print"></i> Impression Rapide
+  </a>
+  <a href="{{ url_for('vouchers') }}" class="menu-item {% if current_page=='vouchers' %}active{% endif %}">
+    <i class="fa fa-ticket"></i> Bons de Connexion
+  </a>
+
+  <!-- JOURNAUX -->
+  <div class="menu-group-btn {% if 'log' in current_page %}open{% endif %}" onclick="toggleMenu(this)">
+    <i class="fa fa-align-justify"></i> Journaux <i class="fa fa-caret-down float-right"></i>
+  </div>
+  <div class="menu-group {% if 'log' in current_page %}open{% endif %}">
+    <a href="{{ url_for('log_hotspot') }}" class="{% if current_page=='log_hotspot' %}active{% endif %}">
+      <i class="fa fa-wifi"></i> Journal Hotspot
+    </a>
+    <a href="{{ url_for('log_users') }}" class="{% if current_page=='log_users' %}active{% endif %}">
+      <i class="fa fa-users"></i> Journal Utilisateurs
+    </a>
+  </div>
+
+  <!-- SYSTÈME -->
+  <div class="menu-group-btn {% if 'system' in current_page %}open{% endif %}" onclick="toggleMenu(this)">
+    <i class="fa fa-gear"></i> Système <i class="fa fa-caret-down float-right"></i>
+  </div>
+  <div class="menu-group {% if 'system' in current_page %}open{% endif %}">
+    <a href="{{ url_for('system_scheduler') }}" class="{% if current_page=='system_scheduler' %}active{% endif %}">
+      <i class="fa fa-clock-o"></i> Planificateur
+    </a>
+    <a href="#" onclick="confirmerRedemarrage()">
+      <i class="fa fa-refresh"></i> Redémarrer
+    </a>
+    <a href="#" onclick="confirmerArrêt()">
+      <i class="fa fa-power-off"></i> Éteindre
+    </a>
+  </div>
+
+  <a href="{{ url_for('dhcp_leases') }}" class="menu-item {% if current_page=='dhcp_leases' %}active{% endif %}">
+    <i class="fa fa-sitemap"></i> Baux DHCP
+  </a>
+  <a href="{{ url_for('traffic_monitor') }}" class="menu-item {% if current_page=='traffic_monitor' %}active{% endif %}">
+    <i class="fa fa-area-chart"></i> Moniteur de Trafic
+  </a>
+  <a href="{{ url_for('report') }}" class="menu-item {% if current_page=='report' %}active{% endif %}">
+    <i class="fa fa-money"></i> Rapport de Ventes
+  </a>
+
+  <!-- ABONNEMENT PREMIUM -->
+  <div class="sidebar-divider"></div>
+  <a href="{{ url_for('abonnement') }}" class="menu-item {% if current_page=='abonnement' %}active{% endif %}"
+     style="color:#fbbf24;font-weight:600">
+    <i class="fa fa-star"></i> Abonnement Premium
+  </a>
+  <div class="sidebar-divider"></div>
+
+  <!-- PARAMÈTRES -->
+  <div class="menu-group-btn {% if 'settings' in current_page or 'upload_logo' in current_page %}open{% endif %}" onclick="toggleMenu(this)">
+    <i class="fa fa-cog"></i> Paramètres <i class="fa fa-caret-down float-right"></i>
+  </div>
+  <div class="menu-group {% if 'settings' in current_page or 'upload_logo' in current_page %}open{% endif %}">
+    <a href="{{ url_for('sessions_list') }}" class="{% if current_page=='sessions_list' %}active{% endif %}">
+      <i class="fa fa-server"></i> Gestion des routeurs
+    </a>
+    <a href="{{ url_for('settings_add_router') }}" class="{% if current_page=='settings_add_router' %}active{% endif %}">
+      <i class="fa fa-plus"></i> Ajouter un routeur
+    </a>
+    <a href="{{ url_for('upload_logo') }}" class="{% if current_page=='upload_logo' %}active{% endif %}">
+      <i class="fa fa-upload"></i> Charger un logo
+    </a>
+    <a href="{{ url_for('settings_account') }}" class="{% if current_page=='settings_account' %}active{% endif %}">
+      <i class="fa fa-user"></i> Mon compte
+    </a>
+  </div>
+
+  {% else %}
+  <!-- Pas de routeur sélectionné -->
+  <div class="sidebar-header"><div class="router-name">Aucun routeur</div></div>
+  <a href="{{ url_for('sessions_list') }}" class="menu-item {% if current_page=='sessions_list' %}active{% endif %}">
+    <i class="fa fa-server"></i> Gestion des routeurs
+  </a>
+  <a href="{{ url_for('settings_add_router') }}" class="menu-item {% if current_page=='settings_add_router' %}active{% endif %}">
+    <i class="fa fa-plus"></i> Ajouter un routeur
+  </a>
+  {% endif %}
+
+  {% if session.get('role') == 'concepteur' %}
+  <div class="sidebar-divider"></div>
+  <div class="menu-group-btn {% if 'concepteur' in current_page %}open{% endif %}" onclick="toggleMenu(this)">
+    <i class="fa fa-shield"></i> <span style="color:#fbbf24">Concepteur</span>
+    <i class="fa fa-caret-down float-right"></i>
+  </div>
+  <div class="menu-group {% if 'concepteur' in current_page %}open{% endif %}">
+    <a href="{{ url_for('concepteur_dashboard') }}" class="{% if current_page=='concepteur_dashboard' %}active{% endif %}">
+      <i class="fa fa-line-chart"></i> Analytics
+    </a>
+    <a href="{{ url_for('concepteur_users') }}" class="{% if current_page=='concepteur_users' %}active{% endif %}">
+      <i class="fa fa-users"></i> Utilisateurs Cloud
+    </a>
+    <a href="{{ url_for('concepteur_pubs') }}" class="{% if current_page=='concepteur_pubs' %}active{% endif %}">
+      <i class="fa fa-play-circle"></i> Publicités
+    </a>
+    <a href="{{ url_for('concepteur_tickets') }}" class="{% if current_page=='concepteur_tickets' %}active{% endif %}">
+      <i class="fa fa-ticket"></i> Tickets & Revenus
+    </a>
+    <a href="{{ url_for('concepteur_paiements') }}" class="{% if current_page=='concepteur_paiements' %}active{% endif %}">
+      <i class="fa fa-money"></i> Paiements
+    </a>
+    <a href="{{ url_for('concepteur_abonnements') }}" class="{% if current_page in ['concepteur_abonnements','concepteur_plans','concepteur_paiements_config'] %}active{% endif %}">
+      <i class="fa fa-credit-card"></i> Abonnements Premium
+    </a>
+    <a href="{{ url_for('concepteur_routeurs_cloud') }}" class="{% if current_page=='concepteur_routeurs_cloud' %}active{% endif %}">
+      <i class="fa fa-server"></i> Routeurs Cloud
+    </a>
+    <a href="{{ url_for('concepteur_logs') }}" class="{% if current_page=='concepteur_logs' %}active{% endif %}">
+      <i class="fa fa-list-alt"></i> Logs & Sécurité
+    </a>
+    <a href="{{ url_for('concepteur_database') }}" class="{% if current_page=='concepteur_database' %}active{% endif %}">
+      <i class="fa fa-database"></i> Base de données
+    </a>
+    <a href="{{ url_for('concepteur_services') }}" class="{% if current_page=='concepteur_services' %}active{% endif %}">
+      <i class="fa fa-cogs"></i> Services
+    </a>
+    <a href="{{ url_for('concepteur_backup') }}" class="{% if current_page=='concepteur_backup' %}active{% endif %}">
+      <i class="fa fa-hdd-o"></i> Sauvegarde
+    </a>
+    <a href="{{ url_for('concepteur_credentials') }}" class="{% if current_page=='concepteur_credentials' %}active{% endif %}">
+      <i class="fa fa-key"></i> Mes Identifiants
+    </a>
+    <a href="{{ url_for('concepteur_mise_a_jour') }}" class="{% if current_page=='concepteur_mise_a_jour' %}active{% endif %}"
+       style="color:#4ade80;font-weight:600">
+      <i class="fa fa-cloud-download"></i> Mise à jour
+    </a>
+  </div>
+  {% endif %}
+
+  <a href="{{ url_for('about') }}" class="menu-item {% if current_page=='about' %}active{% endif %}">
+    <i class="fa fa-info-circle"></i> A Propos
+  </a>
+</div>
+
+<!-- Contenu principal -->
+<div id="main-content">
+{% endif %}
+
+<!-- Notifications flash -->
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% if messages %}
+<div class="flash-container">
+{% for cat, msg in messages %}
+<div class="flash flash-{{ cat }}">{{ msg }}
+  <button onclick="this.parentElement.remove()">×</button>
+</div>
+{% endfor %}
+</div>
+{% endif %}
+{% endwith %}
+
+{% if session.get('logged_in') and not ks_enabled %}
+<div class="flash-container">
+<div class="flash flash-warning">Mode degrade : KetaServer est indisponible. Les fonctions cloud sont limitees tant que le service ne repond pas.</div>
+</div>
+{% endif %}
+
+<div class="content-body">
+{% block content %}{% endblock %}
+</div>
+
+{% if session.get('logged_in') %}
+</div><!-- /main-content -->
+{% endif %}
+
+<!-- Modal confirmation générique -->
+<div id="modal-confirm" class="modal" style="display:none">
+  <div class="modal-box">
+    <div class="modal-title" id="modal-confirm-title">Confirmation</div>
+    <div class="modal-body" id="modal-confirm-body">Êtes-vous sûr ?</div>
+    <div class="modal-actions">
+      <button class="btn btn-danger" id="modal-confirm-ok">Confirmer</button>
+      <button class="btn btn-secondary" onclick="fermerModal()">Annuler</button>
+    </div>
+  </div>
+</div>
+
+{% if session.get('role') != 'concepteur' %}
+<!-- Bannière AdSense (alternée via JS) -->
+<div id="ad-banner-wrap" style="display:none;text-align:center;padding:8px 0;background:#0d1526;border-top:1px solid #1e2d42;">
+  {% if adsense_pub_id and adsense_banner_slot %}
+  <ins class="adsbygoogle"
+       style="display:block"
+       data-ad-client="{{ adsense_pub_id }}"
+       data-ad-slot="{{ adsense_banner_slot }}"
+       data-ad-format="auto"
+       data-full-width-responsive="true"></ins>
+  <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
+  {% else %}
+  <div style="background:#1e2d42;color:#94a3b8;font-size:11px;padding:10px;border-radius:6px;display:inline-block;min-width:320px;">
+    <i class="fa fa-bullhorn"></i> Bannière AdSense —
+    <a href="/concepteur/pubs" style="color:#0ea5e9;text-decoration:none;">configurer l'ID Publisher &amp; Slot</a>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+<!-- Footer légal -->
+<footer style="text-align:center;padding:12px 20px 16px;font-size:12px;color:#94a3b8;border-top:1px solid #1e2d42;background:#0b1220;">
+  <span style="margin:0 6px;color:#cbd5e1;font-weight:600;"><i class="fa fa-wifi" style="color:#0ea5e9"></i> KetaMon</span>
+  <span style="color:#334155;margin:0 4px;">|</span>
+  <a href="{{ url_for('about') }}" style="color:#94a3b8;text-decoration:none;margin:0 6px;">À propos</a>
+  <span style="color:#334155;margin:0 4px;">|</span>
+  <a href="{{ url_for('contact') }}" style="color:#94a3b8;text-decoration:none;margin:0 6px;">Contact</a>
+  <span style="color:#334155;margin:0 4px;">|</span>
+  <a href="{{ url_for('privacy') }}" style="color:#94a3b8;text-decoration:none;margin:0 6px;">Confidentialité</a>
+</footer>
+
+{% if session.get('role') != 'concepteur' %}
+<!-- Interstitielle AdSense (overlay plein écran) -->
+<div id="ad-interstitial" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:99999;align-items:center;justify-content:center;flex-direction:column;">
+  <div style="background:#0f172a;border:1px solid #334155;border-radius:14px;padding:24px;max-width:420px;width:90%;text-align:center;position:relative;">
+    <button onclick="document.getElementById('ad-interstitial').style.display='none'"
+            id="ad-close-btn" disabled
+            style="position:absolute;top:10px;right:12px;background:none;border:none;color:#94a3b8;font-size:20px;cursor:pointer;opacity:.4">✕</button>
+    <div id="ad-countdown" style="font-size:11px;color:#64748b;margin-bottom:10px;">Fermeture dans <b id="ad-sec">5</b>s</div>
+    {% if adsense_pub_id and adsense_inter_slot %}
+    <ins class="adsbygoogle"
+         style="display:block;min-height:250px;"
+         data-ad-client="{{ adsense_pub_id }}"
+         data-ad-slot="{{ adsense_inter_slot }}"
+         data-ad-format="auto"></ins>
+    <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
+    {% else %}
+    <div style="background:#1e2d42;color:#94a3b8;font-size:11px;padding:30px;border-radius:8px;">
+      <i class="fa fa-bullhorn" style="font-size:28px;display:block;margin-bottom:8px;color:#0ea5e9"></i>
+      Espace interstitielle AdSense<br>
+      <a href="/concepteur/pubs" style="color:#0ea5e9;text-decoration:none;">→ Configurer dans Concepteur / Publicités</a>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(function(){});
+}
+
+/* ── Alternance bannière / interstitielle (utilisateurs uniquement) ── */
+{% if session.get('role') != 'concepteur' %}
+(function(){
+  var BANNER_EVERY  = 2;
+  var INTER_EVERY   = 6;
+  var INTER_DELAY   = 5;
+
+  var visits = parseInt(localStorage.getItem('_ktm_visits') || '0') + 1;
+  localStorage.setItem('_ktm_visits', visits);
+
+  // Bannière
+  if (visits % BANNER_EVERY === 0) {
+    var b = document.getElementById('ad-banner-wrap');
+    if (b) b.style.display = 'block';
+  }
+
+  // Interstitielle
+  if (visits % INTER_EVERY === 0) {
+    var ov = document.getElementById('ad-interstitial');
+    var btn = document.getElementById('ad-close-btn');
+    var sec = document.getElementById('ad-sec');
+    if (ov) {
+      ov.style.display = 'flex';
+      var t = INTER_DELAY;
+      sec.textContent = t;
+      var iv = setInterval(function(){
+        t--;
+        sec.textContent = t;
+        if (t <= 0) {
+          clearInterval(iv);
+          if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+        }
+      }, 1000);
+    }
+  }
+})();
+{% endif %}
+</script>
+<script>
+// Vérification automatique des mises à jour (toutes les 5 min)
+{% if session.get('logged_in') %}
+(function(){
+  let _currentVersion = null;
+  function checkVersion(){
+    fetch("/api/version").then(r=>r.json()).then(d=>{
+      const v = d.version || "";
+      if(_currentVersion === null){ _currentVersion = v; return; }
+      if(v && v !== _currentVersion){
+        // Nouvelle version disponible — notification non-intrusive
+        const banner = document.getElementById("_update-banner");
+        if(banner){ banner.style.display="flex"; banner.querySelector("span").textContent = `Nouvelle version disponible (${v}). Rechargez pour mettre à jour.`; }
+        _currentVersion = v;
+      }
+    }).catch(()=>{});
+  }
+  // Bannière de mise à jour (injectée dynamiquement)
+  const b = document.createElement("div");
+  b.id="_update-banner";
+  b.style.cssText="display:none;position:fixed;bottom:16px;right:16px;background:#1e40af;color:#fff;padding:12px 20px;border-radius:8px;z-index:9999;align-items:center;gap:12px;box-shadow:0 4px 16px rgba(0,0,0,.4);font-size:13px";
+  b.innerHTML='<i class="fa fa-cloud-download"></i> <span></span> <button onclick="location.reload()" style="background:#fff;color:#1e40af;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-weight:600">Recharger</button><button onclick="this.parentElement.style.display=\'none\'" style="background:transparent;border:none;color:#fff;cursor:pointer;font-size:18px;line-height:1">×</button>';
+  document.body.appendChild(b);
+  checkVersion();
+  setInterval(checkVersion, 300000); // toutes les 5 min
+})();
+{% endif %}
+
+// Inject CSRF token into all forms and set header for fetch() calls
+window._KETAMON_CSRF = "{{ csrf_token }}" || "";
+document.addEventListener('DOMContentLoaded', function(){
+  try{
+    document.querySelectorAll('form').forEach(function(f){
+      if (!f.querySelector('input[name="csrf_token"]')){
+        var i = document.createElement('input');
+        i.type = 'hidden'; i.name = 'csrf_token'; i.value = window._KETAMON_CSRF;
+        f.appendChild(i);
+      }
+    });
+    // wrap fetch to add CSRF header automatically
+    if (window.fetch){
+      const _fetch = window.fetch.bind(window);
+      window.fetch = function(resource, init){
+        init = init || {};
+        init.headers = init.headers || {};
+        if (!init.headers['X-CSRF-Token']) init.headers['X-CSRF-Token'] = window._KETAMON_CSRF;
+        return _fetch(resource, init);
+      };
+    }
+  }catch(e){console.warn('CSRF auto-inject failed', e)}
+});
+</script>
+</body>
+</html>

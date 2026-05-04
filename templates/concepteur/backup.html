@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}— Sauvegarde{% endblock %}
+{% block page_title %}Sauvegarde MongoDB{% endblock %}
+
+{% block content %}
+<div class="concepteur-banner"><i class="fa fa-shield"></i> Mode Concepteur</div>
+
+{% if is_local %}
+<div class="flash flash-warning" style="margin-top:12px">
+  <i class="fa fa-hdd-o"></i>
+  <strong>Données locales</strong> — KetaServer Cloud non connecté. Affichage des fichiers de données locaux (<code>data/</code>).
+  Pour sauvegarder, copiez manuellement le dossier <code>data/</code>.
+</div>
+{% endif %}
+
+<div class="card" style="margin-top:16px">
+  <div class="card-header">
+    <h3><i class="fa fa-database"></i> {% if is_local %}Fichiers de données locaux{% else %}Sauvegardes{% endif %} ({{ backups|length }})</h3>
+    {% if not is_local %}
+    <button class="btn btn-primary btn-sm" onclick="lancerBackup()">
+      <i class="fa fa-download"></i> Lancer une sauvegarde
+    </button>
+    {% endif %}
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr><th>Fichier</th><th>Date</th><th>Taille</th></tr>
+      </thead>
+      <tbody>
+        {% for b in backups %}
+        <tr>
+          <td><i class="fa fa-file-archive-o"></i> {{ b.name or b }}</td>
+          <td>{{ b.createdAt or '—' }}</td>
+          <td>{{ b.size or '—' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="3" class="text-center text-muted">Aucune sauvegarde disponible.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const _CSRF = window._KETAMON_CSRF || '';
+
+function lancerBackup(){
+  ouvrirModal("Lancer une sauvegarde MongoDB ?", "Un fichier de sauvegarde sera créé sur le serveur.", () => {
+    afficherNotif("Sauvegarde en cours…", "info");
+    fetch("/concepteur/backup/lancer", {
+      method:"POST",
+      headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF},
+      body:"{}"
+    }).then(r=>r.json()).then(d=>{
+      if(d.ok){
+        afficherNotif("Sauvegarde terminée.", "success");
+        setTimeout(() => location.reload(), 1500);
+      } else {
+        afficherNotif(d.msg || d.message || "Erreur", "danger");
+      }
+    }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+  });
+}
+</script>
+{% endblock %}

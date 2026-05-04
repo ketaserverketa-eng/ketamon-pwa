@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}— Imprimer Tickets{% endblock %}
+{% block page_title %}Imprimer Tickets{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-print"></i> Imprimer Tickets</h3>
+  </div>
+  {% if quick_items %}
+  <div class="grid-cards">
+    {% for item in quick_items %}
+    <div class="quick-card">
+      <div class="quick-card-header">{{ item.name }}</div>
+      <div class="quick-card-body">
+        <div>Profil : <strong>{{ item.profile }}</strong></div>
+        <div>Quantité : <strong>{{ item.qty }}</strong></div>
+        <div>Point d'accès : {{ item.server or '—' }}</div>
+        <div>Prix : {{ item.price or '0' }}</div>
+      </div>
+      <div class="quick-card-actions">
+        <button class="btn btn-primary btn-sm" onclick="genererEtImprimer('{{ item.id }}')">
+          <i class="fa fa-print"></i> Imprimer
+        </button>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card-body text-center text-muted">
+    <i class="fa fa-print" style="font-size:48px;opacity:.3;"></i>
+    <p>Aucun modèle d'impression configuré.</p>
+    <p>Créez des scripts MikroTik avec le commentaire <code>KetaImpression</code>.</p>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+function genererEtImprimer(id){
+  afficherNotif("Génération en cours...", "info");
+}
+</script>
+{% endblock %}

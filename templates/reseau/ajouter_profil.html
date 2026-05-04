@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}- Ajouter Profil{% endblock %}
+{% block page_title %}Ajouter un Profil Reseau{% endblock %}
+
+{% block content %}
+<div class="card card-form">
+  <div class="card-header">
+    <h3><i class="fa fa-plus-square"></i> Ajouter un Profil</h3>
+  </div>
+  <div class="card-body">
+    <form method="POST">
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Nom du profil *</label>
+          <input type="text" name="name" class="form-control" required placeholder="ex: 1h-500f">
+        </div>
+        <div class="form-group col-6">
+          <label>Appareils autorises</label>
+          <input type="hidden" name="shared_users" value="1">
+          <div class="form-control" style="display:flex;align-items:center;background:#111827;color:#f8fafc;">1 ticket = 1 appareil</div>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Debit max (ex: 2M/1M)</label>
+          <input type="text" name="rate_limit" class="form-control" placeholder="ex: 2M/1M ou laisser vide">
+        </div>
+        <div class="form-group col-6">
+          <label>Duree ticket (1re connexion -> expiration absolue)</label>
+          <input type="text" name="time_limit" class="form-control" placeholder="ex: 1h, 30m, 1d, 0=illimite" value="0">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Mode d'expiration</label>
+          <select name="expire_behavior" class="form-control">
+            <option value="none">Aucun</option>
+            <option value="remove">Supprimer</option>
+            <option value="notice">Notifier</option>
+            <option value="remove and record">Supprimer et Enregistrer</option>
+            <option value="notice and record">Notifier et Enregistrer</option>
+          </select>
+        </div>
+        <div class="form-group col-6">
+          <label>Verrouillage appareil</label>
+          <input type="hidden" name="lock_policy" value="yes">
+          <div class="form-control" style="display:flex;align-items:center;background:#111827;color:#f8fafc;">Automatique : 1 ticket = 1 appareil</div>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Pool d'adresses IP</label>
+          <select name="addr_pool" class="form-control">
+            <option value="">- Aucun -</option>
+            {% for pool in pools %}
+            <option value="{{ pool.get('name','') }}">{{ pool.get('name','') }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group col-6">
+          <label>Execution ticket</label>
+          <div class="form-control" style="display:flex;align-items:center;background:#111827;color:#f8fafc;">Le compteur demarre a la premiere connexion et continue jusqu'a expiration.</div>
+        </div>
+      </div>
+
+      <div class="section-title" style="color:#ffd700;margin:16px 0 8px;font-weight:bold;">
+        <i class="fa fa-money"></i> Prix
+      </div>
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Prix de vente</label>
+          <input type="number" name="price" class="form-control" value="0" min="0" placeholder="0">
+        </div>
+        <div class="form-group col-6">
+          <label>Devise</label>
+          <select name="currency" class="form-control">
+            <option value="FCFA">FCFA</option>
+            <option value="CFA">CFA</option>
+            <option value="XOF">XOF</option>
+            <option value="USD">USD</option>
+            <option value="EUR">EUR</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary"><i class="fa fa-save"></i> Enregistrer</button>
+        <a href="{{ url_for('reseau_profils') }}" class="btn btn-secondary">Annuler</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

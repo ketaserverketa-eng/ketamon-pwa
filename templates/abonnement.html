@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+{% block title %}— Abonnement Premium{% endblock %}
+{% block page_title %}Abonnement Premium{% endblock %}
+{% block content %}
+
+{% set devise_base = cfg.get('devise_base','FCFA') %}
+
+<!-- Statut actuel -->
+{% if sub %}
+<div class="card" style="margin-bottom:16px;border-left:4px solid #22c55e">
+  <div class="card-body" style="display:flex;align-items:center;gap:16px">
+    <i class="fa fa-check-circle" style="font-size:36px;color:#22c55e"></i>
+    <div>
+      <div style="font-size:17px;font-weight:700;color:#f8fafc">
+        Abonnement <span style="color:#22c55e">{{ sub.plan_nom }}</span> actif
+      </div>
+      <div style="color:#94a3b8;font-size:13px;margin-top:4px">
+        <i class="fa fa-calendar"></i> Expire le <b>{{ sub.expire_le[:10] }}</b>
+        &nbsp;•&nbsp; <i class="fa fa-mobile"></i> {{ sub.methode }}
+      </div>
+    </div>
+  </div>
+</div>
+{% else %}
+{% if pending_sub %}
+<div class="card" style="margin-bottom:16px;border-left:4px solid #f59e0b">
+  <div class="card-body" style="display:flex;align-items:center;gap:16px">
+    <i class="fa fa-clock-o" style="font-size:32px;color:#f59e0b"></i>
+    <div>
+      <div style="font-size:15px;font-weight:600;color:#f8fafc">
+        Demande en attente — plan <span style="color:#f59e0b">{{ pending_sub.plan_nom }}</span>
+      </div>
+      <div style="color:#94a3b8;font-size:13px;margin-top:4px">
+        Envoyée le {{ pending_sub.demande_le[:10] if pending_sub.demande_le else '—' }}
+        &nbsp;•&nbsp; Réf. <code>{{ pending_sub.reference }}</code>
+      </div>
+      <div style="color:#64748b;font-size:12px;margin-top:4px">
+        Le concepteur va vérifier votre paiement et activer l'abonnement sous peu.
+      </div>
+    </div>
+  </div>
+</div>
+{% else %}
+<div class="card" style="margin-bottom:16px;border-left:4px solid #f59e0b">
+  <div class="card-body" style="display:flex;align-items:center;gap:12px">
+    <i class="fa fa-star" style="font-size:32px;color:#f59e0b"></i>
+    <div>
+      <div style="font-size:15px;font-weight:600;color:#f8fafc">Aucun abonnement actif</div>
+      <div style="color:#94a3b8;font-size:13px">Choisissez un plan ci-dessous.</div>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endif %}
+
+{% if pending_sub %}
+{# Demande en attente : masquer les plans pour éviter les doublons #}
+{% elif not methodes %}
+<div class="flash flash-warning">
+  <i class="fa fa-exclamation-triangle"></i>
+  Aucune méthode de paiement disponible pour le moment. Contactez l'administrateur.
+</div>
+{% else %}
+
+<!-- Plans (prix non modifiables, définis par concepteur) -->
+{% if plans %}
+<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:24px">
+  {% for plan in plans %}
+  {% set popular = loop.index == 2 %}
+  <div onclick="selectionnerPlan('{{ plan.id }}','{{ plan.nom }}',{{ plan.prix }},'{{ plan.devise }}')"
+       style="flex:1;min-width:190px;max-width:270px;background:#1f2937;border:2px solid {{ '#0ea5e9' if popular else 'var(--border)' }};border-radius:12px;cursor:pointer;overflow:hidden;transition:.15s"
+       onmouseover="this.style.borderColor='#0ea5e9'" onmouseout="this.style.borderColor='{{ '#0ea5e9' if popular else 'var(--border)' }}'">
+    {% if popular %}
+    <div style="background:#0ea5e9;color:#fff;font-size:11px;font-weight:700;text-align:center;padding:4px;letter-spacing:1px">
+      POPULAIRE
+    </div>
+    {% endif %}
+    <div style="padding:20px 16px;text-align:center">
+      <div style="font-size:17px;font-weight:700;color:#f8fafc;margin-bottom:6px">{{ plan.nom }}</div>
+      <div style="font-size:34px;font-weight:800;color:#0ea5e9;line-height:1">
+        {{ plan.prix|int }}
+        <span style="font-size:13px;font-weight:400;color:#94a3b8">{{ plan.devise }}</span>
+      </div>
+      <div style="color:#64748b;font-size:12px;margin-top:6px"><i class="fa fa-clock-o"></i> {{ plan.duree }} jours</div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<!-- Formulaire paiement (s'affiche après sélection d'un plan) -->
+<div class="card card-form" id="form-abo" style="max-width:520px;display:none">
+  <div class="card-header">
+    <h3><i class="fa fa-credit-card"></i> Paiement — <span id="plan-label" style="color:#0ea5e9">—</span></h3>
+  </div>
+  <div class="card-body">
+    <form method="POST" action="{{ url_for('abonnement_souscrire') }}" id="form-sub">
+      <input type="hidden" name="plan_id"    id="plan_id_input">
+      <input type="hidden" name="devise_paye" id="devise_paye_input" value="{{ devise_base }}">
+
+      <!-- Méthode -->
+      <div class="form-group">
+        <label><i class="fa fa-mobile"></i> Méthode de paiement</label>
+        <select name="methode" class="form-control" id="select-methode" onchange="afficherInstruction(this.value)">
+          {% for m in methodes %}
+          <option value="{{ m.id }}">{{ m.nom }}{% if m.numero %} — {{ m.numero }}{% endif %}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <!-- Instructions (depuis config concepteur) -->
+      <div id="bloc-instructions" style="background:#0f172a;border-radius:8px;padding:12px;margin-bottom:12px;font-size:13px">
+        {% for m in methodes %}
+        <div id="instr-{{ m.id }}" style="{{ '' if loop.first else 'display:none' }}">
+          {% if m.numero %}
+          <div style="font-size:15px;font-weight:700;color:#0ea5e9;margin-bottom:6px">
+            <i class="fa fa-mobile"></i> {{ m.nom }} : <span style="color:#f8fafc">{{ m.numero }}</span>
+          </div>
+          {% endif %}
+          <div style="color:#94a3b8">{{ m.get('instructions','Envoyez le montant exact.') }}</div>
+          <div style="margin-top:8px;color:#fbbf24;font-weight:600">
+            <i class="fa fa-exclamation-triangle"></i>
+            Montant à envoyer : <span class="montant-display">—</span>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+
+      <!-- Montant payé (saisi par l'utilisateur pour vérification) -->
+      <div class="form-group">
+        <label><i class="fa fa-money"></i> Montant que vous avez envoyé *</label>
+        <div style="display:flex;gap:8px">
+          <input type="number" name="montant_paye" id="montant-input" class="form-control"
+                 placeholder="Ex: 5000" step="1" min="1" required style="flex:2">
+          <select name="devise_paye" id="devise-input" class="form-control" style="flex:1">
+            <option value="{{ devise_base }}">{{ devise_base }}</option>
+            {% for d in cfg.get('taux_change',{}).keys() %}
+            {% if d != devise_base and d != 'FCFA' or (d == 'FCFA' and devise_base != 'FCFA') %}
+            <option value="{{ d }}">{{ d }}</option>
+            {% endif %}
+            {% endfor %}
+          </select>
+        </div>
+        <small style="color:#64748b">Entrez exactement le montant envoyé. Toute divergence sera détectée.</small>
+      </div>
+
+      <!-- Référence -->
+      <div class="form-group">
+        <label><i class="fa fa-hashtag"></i> Code / Référence de transaction *</label>
+        <input type="text" name="reference_paiement" class="form-control"
+               placeholder="Code reçu par SMS après le paiement" required
+               style="text-transform:uppercase" oninput="this.value=this.value.toUpperCase()">
+        <small style="color:#64748b">Ce code est unique — toute référence déjà utilisée sera rejetée.</small>
+      </div>
+
+      <!-- Avertissement anti-fraude -->
+      <div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:10px 12px;font-size:12px;color:#fca5a5;margin-bottom:12px">
+        <i class="fa fa-shield"></i> <b>Vérification automatique :</b>
+        Montant, référence et méthode sont vérifiés instantanément. Toute tentative de fraude est enregistrée.
+      </div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">
+          <i class="fa fa-paper-plane"></i> Envoyer la demande
+        </button>
+        <button type="button" class="btn btn-secondary" onclick="document.getElementById('form-abo').style.display='none'">
+          Annuler
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+{% else %}
+<div class="flash flash-warning"><i class="fa fa-info-circle"></i> Aucun plan d'abonnement disponible pour le moment.</div>
+{% endif %}
+{% endif %}
+
+<script>
+var planActuel = null;
+var methodes   = {{ methodes | tojson }};
+
+function selectionnerPlan(id, nom, prix, devise) {
+  planActuel = {id, nom, prix, devise};
+  document.getElementById("plan_id_input").value = id;
+  document.getElementById("plan-label").textContent = nom + " — " + prix + " " + devise;
+  document.getElementById("montant-input").placeholder = prix;
+  // Afficher montant dans les instructions
+  document.querySelectorAll(".montant-display").forEach(function(el){
+    el.textContent = prix + " " + devise;
+  });
+  document.getElementById("form-abo").style.display = "";
+  // Scroll
+  document.getElementById("form-abo").scrollIntoView({behavior:"smooth", block:"start"});
+}
+
+function afficherInstruction(methodeId) {
+  methodes.forEach(function(m) {
+    var el = document.getElementById("instr-" + m.id);
+    if (el) el.style.display = m.id === methodeId ? "" : "none";
+  });
+}
+
+// Init à la sélection de méthode initiale
+document.addEventListener("DOMContentLoaded", function() {
+  var sel = document.getElementById("select-methode");
+  if (sel && sel.value) afficherInstruction(sel.value);
+});
+</script>
+{% endblock %}

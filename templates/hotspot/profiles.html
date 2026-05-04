@@ -1,0 +1,233 @@
+{% extends "base.html" %}
+{% block title %}- Profils Hotspot{% endblock %}
+{% block page_title %}Profils Hotspot{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-pie-chart"></i> Liste des Profils ({{ profiles|length }})</h3>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <button id="btn-del-sel" class="btn btn-danger btn-sm" style="display:none"
+              onclick="supprimerSelection()">
+        <i class="fa fa-trash"></i> Supprimer la sélection (<span id="sel-count">0</span>)
+      </button>
+      <a href="{{ url_for('hotspot_add_profile') }}" class="btn btn-primary btn-sm">
+        <i class="fa fa-plus"></i> Ajouter un profil
+      </a>
+    </div>
+  </div>
+  <div class="card-body" style="padding-bottom:0">
+    <p class="text-muted">La durée ticket et le verrou 1 ticket = 1 appareil sont appliqués en direct sur MikroTik. Les colonnes Prix/Devise sont les métadonnées KetaMon (modifiables).</p>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th style="width:36px;text-align:center;">
+            <input type="checkbox" id="chk-all" title="Tout sélectionner" onchange="toggleAll(this)">
+          </th>
+          <th>Nom</th>
+          <th>Débit max</th>
+          <th>Durée Ticket</th>
+          <th>Expiration</th>
+          <th>1 Ticket = 1 Appareil</th>
+          <th>Prix</th>
+          <th>Devise</th>
+          <th>Pool IP</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in profiles %}
+        <tr>
+          <td style="text-align:center;">
+            <input type="checkbox" class="chk-profil"
+                   data-id="{{ p.get('id','') }}"
+                   data-nom="{{ p.get('name','') }}"
+                   onchange="majSelection()">
+          </td>
+          <td><strong>{{ p.get('name','') }}</strong></td>
+          <td>{{ p.get('rate-limit','-') or '-' }}</td>
+          <td>{{ p.get('time-limit','0') or '0' }}</td>
+          <td>{{ p.get('expire-mode','none') }}</td>
+          <td>
+            {% if p.get('add-mac-cookie','yes') == 'yes' %}
+            <span class="badge badge-green">Active</span>
+            {% else %}
+            <span class="badge badge-red">Désactivée</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if p.get('price') %}
+            <span style="color:#fbbf24;font-weight:700">{{ p.get('price','0') }}</span>
+            {% else %}
+            <span style="color:#475569">—</span>
+            {% endif %}
+          </td>
+          <td>{{ p.get('currency','FCFA') }}</td>
+          <td>{{ p.get('address-pool','-') or '-' }}</td>
+          <td>
+            <div style="display:flex;gap:4px;flex-wrap:wrap">
+              <button onclick="ouvrirEdition('{{ p.get('name','') }}','{{ p.get('price','0') or '0' }}','{{ p.get('currency','FCFA') }}','{{ p.get('time-limit','0') or '0' }}','{{ p.get('expire-mode','none') }}')"
+                style="background:#1e3a5f;color:#93c5fd;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-edit"></i> Modifier
+              </button>
+              <button onclick="supprimerProfil('{{ p.get('id','') }}','{{ p.get('name','') }}')"
+                style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-trash"></i> Supprimer
+              </button>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="10" class="text-center text-muted">Aucun profil trouvé.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Modal édition métadonnées profil -->
+<div id="modal-edition" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.65);align-items:center;justify-content:center">
+  <div style="background:#1e293b;border-radius:12px;padding:24px;min-width:340px;max-width:440px;width:100%;border:1px solid #334155">
+    <h4 style="margin:0 0 16px;color:#f8fafc"><i class="fa fa-edit"></i> Modifier — <span id="ed-nom-label"></span></h4>
+    <div class="form-group">
+      <label>Prix de vente</label>
+      <input type="number" id="ed-price" class="form-control" min="0" step="1" placeholder="0">
+    </div>
+    <div class="form-group">
+      <label>Devise</label>
+      <select id="ed-currency" class="form-control">
+        <option value="FCFA">FCFA</option>
+        <option value="CFA">CFA</option>
+        <option value="XOF">XOF</option>
+        <option value="USD">USD</option>
+        <option value="EUR">EUR</option>
+        <option value="GNF">GNF</option>
+        <option value="MAD">MAD</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Durée ticket (ex: 1h, 30m, 1d, 0=illimité)</label>
+      <input type="text" id="ed-timelimit" class="form-control" placeholder="0">
+    </div>
+    <div class="form-group">
+      <label>Mode d'expiration</label>
+      <select id="ed-expire" class="form-control">
+        <option value="none">Aucun</option>
+        <option value="remove">Supprimer</option>
+        <option value="notice">Notifier</option>
+        <option value="remove and record">Supprimer et Enregistrer</option>
+        <option value="notice and record">Notifier et Enregistrer</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:16px">
+      <button class="btn btn-primary" onclick="sauvegarderEdition()"><i class="fa fa-save"></i> Enregistrer</button>
+      <button class="btn btn-secondary" onclick="fermerEdition()">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const _CSRF = window._KETAMON_CSRF || '';
+var _edNom = '';
+
+function ouvrirEdition(nom, prix, devise, timelimit, expire){
+  _edNom = nom;
+  document.getElementById('ed-nom-label').textContent = nom;
+  document.getElementById('ed-price').value = prix || '0';
+  document.getElementById('ed-currency').value = devise || 'FCFA';
+  document.getElementById('ed-timelimit').value = timelimit || '0';
+  var sel = document.getElementById('ed-expire');
+  sel.value = expire || 'none';
+  if(!sel.value) sel.value = 'none';
+  var modal = document.getElementById('modal-edition');
+  modal.style.display = 'flex';
+}
+function fermerEdition(){
+  document.getElementById('modal-edition').style.display = 'none';
+}
+document.getElementById('modal-edition').addEventListener('click', function(e){
+  if(e.target === this) fermerEdition();
+});
+
+function sauvegarderEdition(){
+  var prix    = document.getElementById('ed-price').value;
+  var devise  = document.getElementById('ed-currency').value;
+  var tl      = document.getElementById('ed-timelimit').value;
+  var expire  = document.getElementById('ed-expire').value;
+  fetch("{{ url_for('reseau_modifier_profil_meta') }}", {
+    method:"POST",
+    headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF},
+    body: JSON.stringify({name:_edNom, price:prix, currency:devise, time_limit:tl, expire_mode:expire})
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok){ afficherNotif("Métadonnées mises à jour.","success"); fermerEdition(); setTimeout(()=>location.reload(),800); }
+    else afficherNotif(d.msg || "Erreur.","danger");
+  }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+}
+
+function supprimerProfil(id, nom){
+  ouvrirModal(
+    `Supprimer le profil "${nom}" ?`,
+    "Tous les utilisateurs de ce profil seront affectés.",
+    () => {
+      fetch("{{ url_for('reseau_supprimer_profil') }}", {
+        method:"POST",
+        headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF},
+        body:JSON.stringify({id})
+      }).then(r=>r.json()).then(d=>{
+        if(d.ok) location.reload();
+        else afficherNotif(d.msg || "Erreur.","danger");
+      }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+    }
+  );
+}
+
+/* ── Sélection multiple ── */
+function toggleAll(chk){
+  document.querySelectorAll('.chk-profil').forEach(c => c.checked = chk.checked);
+  majSelection();
+}
+
+function majSelection(){
+  var coches = document.querySelectorAll('.chk-profil:checked');
+  var total  = document.querySelectorAll('.chk-profil').length;
+  var btn    = document.getElementById('btn-del-sel');
+  document.getElementById('sel-count').textContent = coches.length;
+  btn.style.display = coches.length > 0 ? 'inline-flex' : 'none';
+  // Case "tout" : cochée si tous cochés, indéterminée si partiellement
+  var chkAll = document.getElementById('chk-all');
+  chkAll.indeterminate = coches.length > 0 && coches.length < total;
+  chkAll.checked = coches.length === total && total > 0;
+}
+
+function supprimerSelection(){
+  var coches = Array.from(document.querySelectorAll('.chk-profil:checked'));
+  if(!coches.length) return;
+  var noms = coches.map(c => c.dataset.nom).join(', ');
+  ouvrirModal(
+    `Supprimer ${coches.length} profil(s) ?`,
+    `Profils : ${noms}`,
+    async () => {
+      var erreurs = [];
+      for(var c of coches){
+        try{
+          var r = await fetch("{{ url_for('reseau_supprimer_profil') }}", {
+            method:"POST",
+            headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF},
+            body:JSON.stringify({id: c.dataset.id})
+          });
+          var d = await r.json();
+          if(!d.ok) erreurs.push(c.dataset.nom);
+        }catch(e){ erreurs.push(c.dataset.nom); }
+      }
+      if(erreurs.length)
+        afficherNotif(`Erreur sur : ${erreurs.join(', ')}`, "danger");
+      else
+        afficherNotif(`${coches.length} profil(s) supprimé(s).`, "success");
+      setTimeout(()=>location.reload(), 800);
+    }
+  );
+}
+</script>
+{% endblock %}

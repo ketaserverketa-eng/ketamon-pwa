@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}— Appareils Connectés{% endblock %}
+{% block page_title %}Appareils Connectés{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-laptop"></i> Appareils ({{ hosts|length }})</h3>
+    <a href="{{ url_for('reseau_appareils') }}" class="btn btn-outline btn-sm"><i class="fa fa-refresh"></i> Actualiser</a>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Adresse MAC</th>
+          <th>Adresse IP</th>
+          <th>Point d'accès</th>
+          <th>Connecté depuis</th>
+          <th>Authentifié</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for h in hosts %}
+        <tr>
+          <td><code>{{ h.get('mac-address','—') }}</code></td>
+          <td>{{ h.get('address','—') }}</td>
+          <td>{{ h.get('server','—') }}</td>
+          <td>{{ h.get('uptime','—') }}</td>
+          <td>
+            {% if h.get('authorized','no') == 'yes' %}
+            <span class="badge badge-green">Oui</span>
+            {% else %}
+            <span class="badge badge-red">Non</span>
+            {% endif %}
+          </td>
+          <td>
+            <button onclick="supprimerAppareil('{{ h.get('id','') }}')"
+              style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer">
+              <i class="fa fa-trash"></i> Supprimer
+            </button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-center text-muted">Aucun appareil trouvé.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function supprimerAppareil(id){
+  ouvrirModal("Supprimer cet appareil ?","",() => {
+    fetch("{{ url_for('reseau_supprimer_appareil') }}", {
+      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})
+    }).then(r=>r.json()).then(d=>{
+      if(d.ok) location.reload();
+      else afficherNotif(d.msg,"danger");
+    });
+  });
+}
+</script>
+{% endblock %}

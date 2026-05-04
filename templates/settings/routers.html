@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}— Gestion des Routeurs{% endblock %}
+{% block page_title %}Gestion des Routeurs{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-server"></i> Routeurs Enregistrés ({{ routers|length }})</h3>
+    <a href="{{ url_for('settings_add_router') }}" class="btn btn-primary btn-sm">
+      <i class="fa fa-plus"></i> Ajouter un routeur
+    </a>
+  </div>
+
+  {% if routers %}
+  <div class="routers-grid">
+    {% for r in routers %}
+    <div class="router-card {% if active_router and active_router.id == r.id %}router-active{% endif %}">
+      <div class="router-card-icon"><i class="fa fa-wifi"></i></div>
+      <div class="router-card-info">
+        <div class="router-card-name">{{ r.name }}</div>
+        <div class="router-card-host">{{ r.host }}:{{ r.get('port',8728) }}</div>
+        <div class="router-card-user">{{ r.get('user') or r.get('username', 'admin') }} - {{ r.get('currency','FCFA') }}</div>
+      </div>
+      <div class="router-card-actions">
+        {% if active_router and active_router.id == r.id %}
+        <span class="badge badge-green"><i class="fa fa-check"></i> Connecté</span>
+        {% else %}
+        <a href="{{ url_for('connect_router', rid=r.id) }}" class="btn btn-primary btn-sm">
+          <i class="fa fa-plug"></i> Connecter
+        </a>
+        {% endif %}
+        <button class="btn btn-outline btn-sm"
+                data-host="{{ r.get('host','') }}"
+                data-user="{{ r.get('user') or r.get('username','admin') }}"
+                data-port="{{ r.get('port',8728) }}"
+                data-password="{{ r.get('password','') }}"
+                onclick="testerConnexion(this)">
+          <i class="fa fa-heartbeat"></i> Tester
+        </button>
+        <a href="{{ url_for('edit_router', rid=r.id) }}" class="btn btn-outline btn-sm">
+          <i class="fa fa-edit"></i> Modifier
+        </a>
+        <button class="btn btn-danger btn-sm" onclick="supprimerRouteur('{{ r.id }}','{{ r.name }}')">
+          <i class="fa fa-trash"></i> Supprimer
+        </button>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card-body text-center text-muted">
+    <i class="fa fa-server" style="font-size:48px;opacity:.3;display:block;margin-bottom:16px;"></i>
+    <p>Aucun routeur configuré.</p>
+    <a href="{{ url_for('settings_add_router') }}" class="btn btn-primary">
+      <i class="fa fa-plus"></i> Ajouter votre premier routeur
+    </a>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+const _CSRF = window._KETAMON_CSRF || '';
+
+function supprimerRouteur(id, nom){
+  ouvrirModal(`Supprimer le routeur « ${nom} » ?`, "Cette action supprimera la configuration enregistrée.", () => {
+    fetch(`/parametres/routeurs/${id}/supprimer`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF}
+    }).then(r => r.ok ? location.reload() : afficherNotif("Erreur lors de la suppression.","danger"))
+      .catch(() => afficherNotif("Erreur réseau.","danger"));
+  });
+}
+
+function testerConnexion(btn){
+  var host     = btn.dataset.host;
+  var user     = btn.dataset.user;
+  var port     = parseInt(btn.dataset.port) || 8728;
+  var password = btn.dataset.password || "";
+  afficherNotif("Test de connexion en cours…","info");
+  fetch('/api/test-connexion', {
+    method:"POST",
+    headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF},
+    body: JSON.stringify({host, user, port, password})
+  }).then(r=>r.json()).then(d=>{
+    afficherNotif(d.msg || (d.ok ? "Connexion OK" : "Echec"), d.ok ? "success" : "danger");
+  }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+}
+</script>
+{% endblock %}

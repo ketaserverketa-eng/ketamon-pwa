@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}— Ajouter Routeur{% endblock %}
+{% block page_title %}Ajouter un Routeur MikroTik{% endblock %}
+
+{% block content %}
+<div class="card card-form">
+  <div class="card-header">
+    <h3><i class="fa fa-plus"></i> Nouveau Routeur MikroTik</h3>
+  </div>
+  <div class="card-body">
+    <form method="POST">
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Nom de session *</label>
+          <input type="text" name="name" class="form-control" required placeholder="ex: Café-WiFi">
+        </div>
+        <div class="form-group col-6">
+          <label>Adresse IP / Hôte *</label>
+          <input type="text" name="host" class="form-control" required placeholder="ex: 192.168.1.1">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group col-4">
+          <label>Port API</label>
+          <input type="number" name="port" class="form-control" value="8728" placeholder="8728">
+        </div>
+        <div class="form-group col-4">
+          <label>Utilisateur MikroTik</label>
+          <input type="text" name="user" class="form-control" value="admin" placeholder="admin">
+        </div>
+        <div class="form-group col-4">
+          <label>Mot de passe MikroTik</label>
+          <input type="password" name="password" class="form-control" placeholder="Laisser vide si aucun">
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Devise locale</label>
+        <select name="currency" class="form-control">
+          <option value="FCFA">FCFA (Franc CFA)</option>
+          <option value="CFA">CFA</option>
+          <option value="XOF">XOF</option>
+          <option value="USD">USD (Dollar)</option>
+          <option value="EUR">EUR (Euro)</option>
+          <option value="MAD">MAD (Dirham)</option>
+          <option value="GNF">GNF (Franc Guinéen)</option>
+        </select>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary"><i class="fa fa-save"></i> Enregistrer</button>
+        <a href="{{ url_for('sessions_list') }}" class="btn btn-secondary">Annuler</a>
+      </div>
+      <div class="info-box" style="margin-top:12px">
+        <i class="fa fa-info-circle"></i>
+        La connexion sera testee quand vous cliquerez sur <strong>Connecter</strong> depuis la liste des routeurs.
+      </div>
+    </form>
+    <div class="info-box" style="margin-top:16px">
+      <i class="fa fa-info-circle"></i>
+      Assurez-vous que l'API MikroTik est activée :
+      <code>/ip service set api disabled=no</code>
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}— Abonnements{% endblock %}
+{% block page_title %}Gestion des Abonnements{% endblock %}
+{% block content %}
+<div class="concepteur-banner"><i class="fa fa-shield"></i> Mode Concepteur</div>
+
+<!-- Stats rapides -->
+{% set actifs   = subs | selectattr('statut','equalto','actif')      | list %}
+{% set attentes = subs | selectattr('statut','equalto','en_attente') | list %}
+{% set expires  = subs | selectattr('statut','equalto','expire')     | list %}
+<div class="stats-grid" style="margin-top:16px">
+  <div class="stat-card"><div class="stat-value">{{ subs|length }}</div><div class="stat-label"><i class="fa fa-list"></i> Total demandes</div></div>
+  <div class="stat-card"><div class="stat-value" style="color:#22c55e">{{ actifs|length }}</div><div class="stat-label"><i class="fa fa-check-circle"></i> Actifs</div></div>
+  <div class="stat-card"><div class="stat-value" style="color:#f59e0b">{{ attentes|length }}</div><div class="stat-label"><i class="fa fa-clock-o"></i> En attente</div></div>
+  <div class="stat-card"><div class="stat-value">{{ (actifs | map(attribute='prix_plan') | sum)|int }} FCFA</div><div class="stat-label"><i class="fa fa-money"></i> Revenus abonnements</div></div>
+</div>
+
+<!-- Alertes en attente -->
+{% if attentes %}
+<div class="flash flash-warning" style="margin-top:16px">
+  <i class="fa fa-exclamation-triangle"></i> {{ attentes|length }} paiement(s) en attente de validation !
+</div>
+{% endif %}
+
+<!-- Tableau -->
+<div class="card" style="margin-top:16px">
+  <div class="card-header">
+    <h3><i class="fa fa-credit-card"></i> Tous les abonnements ({{ subs|length }})</h3>
+    <div style="display:flex;gap:8px">
+      <a href="{{ url_for('concepteur_plans') }}" class="btn btn-sm btn-secondary"><i class="fa fa-list"></i> Plans</a>
+      <a href="{{ url_for('concepteur_paiements_config') }}" class="btn btn-sm btn-secondary"><i class="fa fa-cog"></i> Config paiements</a>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr><th>Utilisateur</th><th>Plan</th><th>Prix</th><th>Méthode</th><th>Référence / Fraude</th><th>Montant payé</th><th>Statut</th><th>Demandé</th><th>Expire</th><th>Actions</th></tr>
+      </thead>
+      <tbody>
+        {% for s in subs | sort(attribute='demande_le', reverse=True) %}
+        <tr id="row-{{ s.id }}">
+          <td><i class="fa fa-user"></i> {{ s.username }}</td>
+          <td><b>{{ s.plan_nom }}</b></td>
+          <td>{{ s.prix_plan|int }} {{ s.devise_plan }}</td>
+          <td>{{ s.methode }}</td>
+          <td>
+            <code style="font-size:11px">{{ s.reference }}</code>
+            {% if s.get('fraude_flags') %}
+            <br><span style="color:#ef4444;font-size:10px"><i class="fa fa-exclamation-triangle"></i> {{ s.fraude_flags | join(', ') }}</span>
+            {% endif %}
+          </td>
+          <td>
+            <div style="font-size:12px">
+              {{ s.get('montant_paye',0)|int }} {{ s.get('devise_paye','') }}
+              {% if s.get('devise_paye') != s.get('devise_base') %}
+              <span style="color:#64748b">= {{ s.get('montant_base',0)|int }} {{ s.get('devise_base','FCFA') }}</span>
+              {% endif %}
+              <br><span style="color:#64748b">Attendu: {{ s.get('prix_plan_base',0)|int }} {{ s.get('devise_base','FCFA') }}</span>
+            </div>
+          </td>
+          <td>
+            {% if s.statut == 'actif' %}
+              <span class="badge badge-success">Actif</span>
+            {% elif s.statut == 'en_attente' %}
+              <span class="badge badge-warning">En attente</span>
+            {% elif s.statut == 'expire' %}
+              <span class="badge badge-secondary">Expiré</span>
+            {% elif s.statut == 'revoque' %}
+              <span class="badge badge-danger">Révoqué</span>
+            {% endif %}
+          </td>
+          <td style="white-space:nowrap">{{ s.demande_le[:10] if s.demande_le else '—' }}</td>
+          <td style="white-space:nowrap">{{ s.expire_le[:10] if s.expire_le else '—' }}</td>
+          <td style="white-space:nowrap">
+            {% if s.statut == 'en_attente' %}
+            <button class="btn btn-xs btn-success" onclick="valider('{{ s.id }}')"><i class="fa fa-check"></i> Valider</button>
+            {% endif %}
+            {% if s.statut == 'actif' %}
+            <button class="btn btn-xs btn-warning" onclick="revoquer('{{ s.id }}')"><i class="fa fa-ban"></i> Révoquer</button>
+            {% endif %}
+            <button class="btn btn-xs btn-danger" onclick="supprimer('{{ s.id }}')"><i class="fa fa-trash"></i></button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="10" class="text-center text-muted">Aucun abonnement.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const _CSRF = window._KETAMON_CSRF || '';
+
+function valider(id){
+  ouvrirModal("Valider et activer cet abonnement ?", "L'abonnement sera marqué actif et la date d'expiration calculée.", () => {
+    fetch("/concepteur/abonnements/"+id+"/valider", {
+      method:"POST",
+      headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF}
+    }).then(r=>r.json()).then(d=>{
+      if(d.ok){ afficherNotif("Abonnement activé.","success"); setTimeout(()=>location.reload(),900); }
+      else afficherNotif(d.msg || d.message || "Erreur","danger");
+    }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+  });
+}
+function revoquer(id){
+  ouvrirModal("Révoquer cet abonnement ?", "L'abonnement sera désactivé immédiatement.", () => {
+    fetch("/concepteur/abonnements/"+id+"/revoquer", {
+      method:"POST",
+      headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF}
+    }).then(r=>r.json()).then(d=>{
+      if(d.ok){ afficherNotif("Abonnement révoqué.","warning"); setTimeout(()=>location.reload(),900); }
+      else afficherNotif(d.msg || d.message || "Erreur","danger");
+    }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+  });
+}
+function supprimer(id){
+  ouvrirModal("Supprimer définitivement cet abonnement ?", "Cette action est irréversible.", () => {
+    fetch("/concepteur/abonnements/"+id+"/supprimer", {
+      method:"POST",
+      headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF}
+    }).then(r=>r.json()).then(d=>{
+      if(d.ok){ var el=document.getElementById("row-"+id); if(el)el.remove(); }
+      else afficherNotif(d.msg || d.message || "Erreur","danger");
+    }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+  });
+}
+</script>
+{% endblock %}

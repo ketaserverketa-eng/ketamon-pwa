@@ -1,0 +1,299 @@
+{% extends "base.html" %}
+{% block title %}— Impression Rapide{% endblock %}
+{% block page_title %}Impression Rapide{% endblock %}
+
+{% block content %}
+<style>
+.qp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px;padding:16px;}
+.qp-card{background:#1e293b;border:1px solid #334155;border-radius:10px;overflow:hidden;}
+.qp-card-head{background:#0f2a4a;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;}
+.qp-card-head strong{color:#fff;font-size:14px;}
+.qp-card-body{padding:12px 14px;}
+.qp-card-body div{font-size:12px;color:#94a3b8;margin-bottom:3px;}
+.qp-card-body div strong{color:#e2e8f0;}
+.qp-card-actions{display:flex;gap:8px;padding:10px 14px;border-top:1px solid #334155;}
+</style>
+
+<!-- Formulaire création de modèle -->
+<div class="card card-form no-print" style="max-width:700px;margin:0 auto 22px;">
+  <div class="card-header">
+    <h3><i class="fa fa-plus-circle"></i> Nouveau modèle d'impression rapide</h3>
+  </div>
+  <div class="card-body">
+    <div class="form-row">
+      <div class="form-group col-6">
+        <label>Nom du modèle *</label>
+        <input type="text" id="qp-name" class="form-control" placeholder="ex: Ticket-1h-500F">
+      </div>
+      <div class="form-group col-6">
+        <label>Nom du réseau WiFi <small class="text-muted">(affiché sur ticket)</small></label>
+        <input type="text" id="qp-network" class="form-control" placeholder="ex: MON-WIFI">
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group col-6">
+        <label>Profil</label>
+        <select id="qp-profile" class="form-control">
+          {% for p in profiles %}
+          {% set meta = profiles_meta.get(p.name, {}) %}
+          <option value="{{ p.name }}"
+                  data-price="{{ meta.get('price','0') }}"
+                  data-currency="{{ meta.get('currency','FCFA') }}">
+            {{ p.name }}{% if meta.get('price','0') != '0' %} — {{ meta.get('price') }} {{ meta.get('currency','FCFA') }}{% endif %}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="form-group col-6">
+        <label>Point d'accès</label>
+        <select id="qp-server" class="form-control">
+          <option value="">— Tous —</option>
+          {% for s in servers %}
+          <option value="{{ s.name }}">{{ s.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group col-4">
+        <label>Quantité par défaut</label>
+        <input type="number" id="qp-qty" class="form-control" value="10" min="1" max="500">
+      </div>
+      <div class="form-group col-4">
+        <label>Mode génération</label>
+        <select id="qp-mode" class="form-control">
+          <option value="aleatoire">Aléatoire (lettres+chiffres)</option>
+          <option value="chiffres">Chiffres seulement</option>
+          <option value="lettres">Lettres seulement</option>
+        </select>
+      </div>
+      <div class="form-group col-4">
+        <label>Longueur du code</label>
+        <input type="number" id="qp-length" class="form-control" value="8" min="4" max="20">
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group col-6">
+        <label>Préfixe <small class="text-muted">(optionnel)</small></label>
+        <input type="text" id="qp-prefix" class="form-control" placeholder="ex: wifi-">
+      </div>
+      <div class="form-group col-6">
+        <label>Prix unitaire <small class="text-muted">(optionnel)</small></label>
+        <input type="text" id="qp-price" class="form-control" placeholder="ex: 500">
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="creerModele()">
+        <i class="fa fa-save"></i> Enregistrer le modèle
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Liste des modèles -->
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-print"></i> Modèles disponibles ({{ quick_items|length }})</h3>
+  </div>
+  {% if quick_items %}
+  <div class="qp-grid">
+    {% for item in quick_items %}
+    <div class="qp-card" id="qpc-{{ item.id }}">
+      <div class="qp-card-head">
+        <strong><i class="fa fa-tag"></i> {{ item.name }}</strong>
+        <button onclick="supprimerModele('{{ item.id }}','{{ item.name }}')"
+          style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer">
+          <i class="fa fa-trash"></i> Suppr.
+        </button>
+      </div>
+      <div class="qp-card-body">
+        <div>Profil : <strong>{{ item.profile or '—' }}</strong></div>
+        <div>Quantité : <strong>{{ item.qty }}</strong> ticket(s)</div>
+        {% if item.server %}<div>Point d'accès : <strong>{{ item.server }}</strong></div>{% endif %}
+        {% if item.network %}<div>Réseau : <strong>{{ item.network }}</strong></div>{% endif %}
+        {% if item.price and item.price != '0' %}<div>Prix : <strong>{{ item.price }} FCFA</strong></div>{% endif %}
+        <div>Code : <strong>{{ item.mode or 'aléatoire' }}, {{ item.length or 8 }} car.{% if item.prefix %}, préfixe «&nbsp;{{ item.prefix }}&nbsp;»{% endif %}</strong></div>
+      </div>
+      <div class="qp-card-actions">
+        <button class="btn btn-primary btn-sm" style="flex:1"
+                onclick="genererEtImprimer('{{ item.id }}', this)">
+          <i class="fa fa-print"></i> Générer &amp; Imprimer
+        </button>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card-body text-center text-muted" style="padding:40px">
+    <i class="fa fa-print" style="font-size:52px;opacity:.25;display:block;margin-bottom:14px"></i>
+    <p style="font-size:15px">Aucun modèle d'impression rapide configuré.</p>
+    <p style="font-size:12px;margin-top:6px">Créez un modèle ci-dessus pour générer et imprimer des tickets en un seul clic.</p>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+/* ── CSS injecté dans la fenêtre d'impression ── */
+const _QP_CSS = `
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#fff;font-family:'Segoe UI',Arial,sans-serif;padding:4mm;color:#000;}
+@page{size:A4 landscape;margin:5mm;}
+@media print{.no-print{display:none!important;}body{padding:2mm;}}
+.print-bar{margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;
+  padding:8px 14px;background:#f1f5f9;border-radius:6px;}
+.print-bar h3{font-size:14px;color:#0f2a4a;font-weight:700;}
+.print-bar button{padding:6px 16px;background:#3b82f6;color:#fff;border:none;border-radius:6px;
+  cursor:pointer;font-size:13px;font-weight:600;}
+.print-page{width:100%;page-break-after:always;break-after:page;margin-bottom:5mm;}
+.print-page:last-child{page-break-after:auto;break-after:auto;}
+.print-grid{display:grid;grid-template-columns:repeat(9,1fr);gap:1.5mm;}
+.tc{border:1.5px solid #0f2a4a;display:flex;flex-direction:column;overflow:hidden;
+  background:#fff;color:#000;border-radius:3px;min-height:44mm;}
+.tc-head{background:linear-gradient(135deg,#0f2a4a,#1e4976);padding:2.5px 5px;
+  display:flex;justify-content:space-between;align-items:center;flex-shrink:0;}
+.tc-wifi{color:#fff;font-size:7pt;font-weight:800;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;max-width:72%;letter-spacing:.03em;}
+.tc-num{color:#fff;font-size:6.5pt;font-weight:700;white-space:nowrap;
+  background:rgba(255,255,255,.25);border-radius:8px;padding:0 4px;}
+.tc-accent{height:2px;background:linear-gradient(90deg,#3b82f6,#06b6d4);flex-shrink:0;}
+.tc-body{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  padding:3px 4px 2px;text-align:center;}
+.tc-brand{font-size:5.5pt;color:#3b82f6;font-weight:700;letter-spacing:.12em;
+  text-transform:uppercase;margin-bottom:2px;}
+.tc-code-box{background:#f0f7ff;border:1.2px dashed #3b82f6;border-radius:3px;
+  padding:2px 5px;margin-bottom:2px;width:90%;}
+.tc-code{font-size:9.5pt;font-weight:900;letter-spacing:.08em;font-family:'Courier New',monospace;
+  color:#0f2a4a;line-height:1.2;word-break:break-all;}
+.tc-foot{background:#0f2a4a;padding:2.5px 5px;flex-shrink:0;
+  display:flex;justify-content:space-between;align-items:center;}
+.tc-profile{font-size:6pt;color:#fff;font-weight:700;letter-spacing:.02em;}
+.tc-price{font-size:6pt;color:#7dd3fc;font-weight:800;}
+`;
+
+function _ticketHTML(t, idx){
+  const wifi  = (t.network || 'WIFI').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const code  = t.name.replace(/</g,'&lt;');
+  const tl    = (t.time_limit && t.time_limit !== '0') ? ' · '+t.time_limit : '';
+  const prof  = (t.profile + tl).replace(/</g,'&lt;');
+  const prix  = (t.price && t.price !== '0') ? `${t.price} ${t.currency||'FCFA'}` : '—';
+  return `<div class="tc">
+    <div class="tc-head">
+      <span class="tc-wifi">&#128246; ${wifi}</span>
+      <span class="tc-num">[${idx}]</span>
+    </div>
+    <div class="tc-accent"></div>
+    <div class="tc-body">
+      <div class="tc-brand">KetaServer</div>
+      <div class="tc-code-box"><div class="tc-code">${code}</div></div>
+    </div>
+    <div class="tc-foot">
+      <span class="tc-profile">${prof}</span>
+      <span class="tc-price">${prix}</span>
+    </div>
+  </div>`;
+}
+
+function genererEtImprimer(id, btn){
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fa fa-spinner fa-spin"></i> Génération...';
+
+  fetch("{{ url_for('quick_print_generer') }}", {
+    method: "POST",
+    headers: {"Content-Type":"application/json","X-CSRF-Token":(window._KETAMON_CSRF||'')},
+    body: JSON.stringify({id})
+  })
+  .then(r => r.json())
+  .then(d => {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+    if(!d.ok){
+      afficherNotif(d.msg || "Erreur de génération.", "danger");
+      return;
+    }
+    const tickets = d.tickets || [];
+    if(!tickets.length){
+      afficherNotif("Aucun ticket généré.", "warning");
+      return;
+    }
+    afficherNotif(`${tickets.length} ticket(s) généré(s) avec succès.`, "success");
+
+    /* Construire fenêtre d'impression */
+    const CHUNK = 36;
+    let pages = '';
+    for(let i = 0; i < tickets.length; i += CHUNK){
+      const chunk = tickets.slice(i, i + CHUNK);
+      const cells = chunk.map((t, j) => _ticketHTML(t, i + j + 1)).join('');
+      pages += `<div class="print-page"><div class="print-grid">${cells}</div></div>`;
+    }
+    const pageCount = Math.ceil(tickets.length / CHUNK);
+    const w = window.open('', '_blank', 'width=1000,height=700');
+    if(!w){ afficherNotif("Fenêtre bloquée par le navigateur.", "warning"); return; }
+    w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8">
+      <title>KetaMon — ${tickets.length} tickets</title>
+      <style>${_QP_CSS}</style></head><body>
+      <div class="print-bar no-print">
+        <h3>&#127918; ${tickets.length} ticket(s) — ${pageCount} page(s) A4 paysage</h3>
+        <button onclick="window.print()">&#128424; Imprimer</button>
+      </div>
+      ${pages}
+      <script>setTimeout(function(){window.print();},400);<\/script>
+    </body></html>`);
+    w.document.close();
+  })
+  .catch(() => {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+    afficherNotif("Erreur réseau.", "danger");
+  });
+}
+
+function supprimerModele(id, nom){
+  ouvrirModal(
+    `Supprimer le modèle «&nbsp;${nom}&nbsp;» ?`,
+    "Le modèle sera retiré du MikroTik. Les tickets déjà générés restent actifs.",
+    () => {
+      fetch("{{ url_for('quick_print_supprimer') }}", {
+        method: "POST",
+        headers: {"Content-Type":"application/json","X-CSRF-Token":(window._KETAMON_CSRF||'')},
+        body: JSON.stringify({id})
+      }).then(r => r.json()).then(d => {
+        if(d.ok){
+          afficherNotif("Modèle supprimé.", "success");
+          document.getElementById('qpc-' + id)?.remove();
+        } else {
+          afficherNotif(d.msg || "Erreur.", "danger");
+        }
+      }).catch(() => afficherNotif("Erreur réseau.", "danger"));
+    }
+  );
+}
+
+function creerModele(){
+  const name    = document.getElementById('qp-name').value.trim();
+  const profile = document.getElementById('qp-profile').value;
+  const server  = document.getElementById('qp-server').value;
+  const qty     = parseInt(document.getElementById('qp-qty').value) || 10;
+  const mode    = document.getElementById('qp-mode').value;
+  const length  = parseInt(document.getElementById('qp-length').value) || 8;
+  const prefix  = document.getElementById('qp-prefix').value.trim();
+  const price   = document.getElementById('qp-price').value.trim();
+  const network = document.getElementById('qp-network').value.trim();
+
+  if(!name){ afficherNotif("Le nom du modèle est requis.", "warning"); return; }
+
+  fetch("{{ url_for('quick_print_creer') }}", {
+    method: "POST",
+    headers: {"Content-Type":"application/json","X-CSRF-Token":(window._KETAMON_CSRF||'')},
+    body: JSON.stringify({name, profile, server, qty, mode, length, prefix, price, network})
+  }).then(r => r.json()).then(d => {
+    if(d.ok){
+      afficherNotif("Modèle enregistré.", "success");
+      setTimeout(() => location.reload(), 700);
+    } else {
+      afficherNotif(d.msg || "Erreur.", "danger");
+    }
+  }).catch(() => afficherNotif("Erreur réseau.", "danger"));
+}
+</script>
+{% endblock %}

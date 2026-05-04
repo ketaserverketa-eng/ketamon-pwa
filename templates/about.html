@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}— À Propos{% endblock %}
+{% block page_title %}À Propos de KetaMon{% endblock %}
+
+{% block content %}
+<div class="card card-form" style="max-width:640px">
+  <div class="card-body" style="text-align:center;padding:36px 40px 24px">
+    <i class="fa fa-wifi" style="font-size:64px;color:#4fc3f7;display:block;margin-bottom:16px"></i>
+    <h2 style="margin:0 0 4px;color:#f8fafc">KetaMon</h2>
+    <div style="opacity:.6;margin-bottom:24px;font-size:14px">Gestionnaire MikroTik — KetaServer</div>
+    <div class="info-box" style="text-align:left;line-height:2">
+      <div><strong>Version :</strong> <span style="color:#4fc3f7;font-family:monospace">{{ version }}</span></div>
+      <div><strong>Python :</strong> <span style="color:#94a3b8;font-family:monospace">{{ python_version }}</span></div>
+      <div><strong>Flask :</strong> <span style="color:#94a3b8;font-family:monospace">{{ flask_version }}</span></div>
+      <div><strong>Technologie :</strong> Python 3 + Flask + RouterOS API (port 8728)</div>
+      <div><strong>Auteur :</strong> KetaServer</div>
+      <div><strong>Connecté en tant que :</strong>
+        <span style="color:#22c55e">{{ session.get('username','—') }}</span>
+        <span class="badge {{ 'badge-warning' if session.get('role')=='concepteur' else 'badge-blue' }}" style="font-size:11px;margin-left:6px">
+          {{ session.get('role','user') }}
+        </span>
+      </div>
+    </div>
+  </div>
+
+  {% if active_router %}
+  <div style="border-top:1px solid var(--border);padding:16px 24px">
+    <div style="font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">
+      <i class="fa fa-wifi"></i> Routeur actif
+    </div>
+    <div style="display:flex;gap:24px;flex-wrap:wrap;font-size:13px">
+      <div><i class="fa fa-tag" style="color:#4fc3f7"></i> <strong>{{ active_router.name }}</strong></div>
+      <div><i class="fa fa-server" style="color:#94a3b8"></i> <code>{{ active_router.host }}:{{ active_router.get('port',8728) }}</code></div>
+      <div><i class="fa fa-user" style="color:#94a3b8"></i> {{ active_router.get('user') or active_router.get('username','admin') }}</div>
+      <div><i class="fa fa-money" style="color:#94a3b8"></i> {{ active_router.get('currency','FCFA') }}</div>
+    </div>
+  </div>
+  {% else %}
+  <div style="border-top:1px solid var(--border);padding:14px 24px;font-size:13px;color:#64748b">
+    <i class="fa fa-exclamation-circle"></i> Aucun routeur connecté.
+    <a href="{{ url_for('sessions_list') }}" style="margin-left:8px;color:#4fc3f7">Connecter un routeur →</a>
+  </div>
+  {% endif %}
+
+  <div style="border-top:1px solid var(--border);padding:14px 24px;display:flex;gap:12px;flex-wrap:wrap">
+    <a href="{{ url_for('dashboard') }}" class="btn btn-outline btn-sm"><i class="fa fa-home"></i> Tableau de bord</a>
+    <a href="{{ url_for('sessions_list') }}" class="btn btn-outline btn-sm"><i class="fa fa-server"></i> Routeurs</a>
+    {% if session.get('role') == 'concepteur' %}
+    <a href="{{ url_for('concepteur_dashboard') }}" class="btn btn-outline btn-sm"><i class="fa fa-shield"></i> Concepteur</a>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

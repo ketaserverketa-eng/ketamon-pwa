@@ -1,0 +1,196 @@
+{% extends "base.html" %}
+{% block title %}— Planificateur{% endblock %}
+{% block page_title %}Planificateur & Système{% endblock %}
+
+{% block content %}
+
+<!-- ── Ressources système live ── -->
+<div class="stats-grid" style="margin-bottom:16px">
+  <div class="stat-card">
+    <div class="stat-label"><i class="fa fa-microchip"></i> CPU</div>
+    <div class="stat-value" id="sys-cpu">—</div>
+    <div class="stat-sub" id="sys-uptime">Chargement...</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label"><i class="fa fa-database"></i> RAM</div>
+    <div class="stat-value" id="sys-mem">—</div>
+    <div class="stat-sub" id="sys-mem-pct">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label"><i class="fa fa-hdd-o"></i> Disque</div>
+    <div class="stat-value" id="sys-hdd">—</div>
+    <div class="stat-sub" id="sys-hdd-pct">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label"><i class="fa fa-server"></i> Routeur</div>
+    <div class="stat-value" id="sys-board" style="font-size:14px">—</div>
+    <div class="stat-sub" id="sys-version">—</div>
+  </div>
+</div>
+
+<!-- ── Planificateur ── -->
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-clock-o"></i> Planificateur ({{ schedulers|length }})</h3>
+    <a href="{{ url_for('system_scheduler') }}" class="btn btn-outline btn-sm">
+      <i class="fa fa-refresh"></i> Actualiser
+    </a>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Nom</th>
+          <th>Intervalle</th>
+          <th>Prochaine exécution</th>
+          <th>Politique</th>
+          <th>État</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in schedulers %}
+        <tr>
+          <td><strong>{{ s.get('name','') }}</strong></td>
+          <td>{{ s.get('interval','—') }}</td>
+          <td>{{ s.get('next-run','—') }}</td>
+          <td>{{ s.get('policy','—') }}</td>
+          <td>
+            {% if s.get('disabled','no') == 'yes' %}
+            <span class="badge badge-red">Désactivé</span>
+            {% else %}
+            <span class="badge badge-green">Actif</span>
+            {% endif %}
+          </td>
+          <td class="actions">
+            {% set sid      = s.get('id','') %}
+            {% set sdis     = s.get('disabled','no') %}
+            {% set sname    = s.get('name','') %}
+            <div style="display:flex;gap:4px;flex-wrap:wrap">
+              {% if sdis == 'yes' %}
+              <button data-id="{{ sid }}" data-disabled="{{ sdis }}"
+                onclick="basculerPlanif(this.dataset.id, this.dataset.disabled)"
+                style="background:#166534;color:#86efac;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-toggle-off"></i> Activer
+              </button>
+              {% else %}
+              <button data-id="{{ sid }}" data-disabled="{{ sdis }}"
+                onclick="basculerPlanif(this.dataset.id, this.dataset.disabled)"
+                style="background:#78350f;color:#fcd34d;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-toggle-on"></i> Désact.
+              </button>
+              {% endif %}
+              <button data-id="{{ sid }}" data-name="{{ sname }}"
+                onclick="supprimerPlanif(this.dataset.id, this.dataset.name)"
+                style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-trash"></i> Suppr.
+              </button>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-center text-muted">Aucun planificateur configuré.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── Actions système ── -->
+<div class="card" style="margin-top:16px">
+  <div class="card-header"><h3><i class="fa fa-power-off"></i> Actions Système</h3></div>
+  <div class="card-body" style="display:flex;gap:12px;flex-wrap:wrap;padding:16px">
+    <button class="btn btn-warning" onclick="confirmerRedemarrage()">
+      <i class="fa fa-refresh"></i> Redémarrer le routeur
+    </button>
+    <button class="btn btn-danger" onclick="confirmerArret()">
+      <i class="fa fa-power-off"></i> Éteindre le routeur
+    </button>
+  </div>
+</div>
+
+<script>
+// ── Planificateur ──
+function basculerPlanif(id, current){
+  const disabled = current === 'yes' ? 'no' : 'yes';
+  fetch("{{ url_for('system_scheduler_toggle') }}", {
+    method:'POST',
+    headers:{'Content-Type':'application/json','X-CSRF-Token':(window._KETAMON_CSRF||'')},
+    body:JSON.stringify({id, disabled})
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok) location.reload();
+    else afficherNotif(d.msg || 'Erreur.','danger');
+  }).catch(()=>afficherNotif('Erreur réseau.','danger'));
+}
+
+function supprimerPlanif(id, nom){
+  ouvrirModal(`Supprimer le planificateur « ${nom} » ?`, '', () => {
+    fetch("{{ url_for('system_scheduler_remove') }}", {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-CSRF-Token':(window._KETAMON_CSRF||'')},
+      body:JSON.stringify({id})
+    }).then(r=>r.json()).then(d=>{
+      if(d.ok) location.reload();
+      else afficherNotif(d.msg || 'Erreur.','danger');
+    }).catch(()=>afficherNotif('Erreur réseau.','danger'));
+  });
+}
+
+// ── Actions système ──
+function confirmerRedemarrage(){
+  ouvrirModal(
+    'Redémarrer le routeur MikroTik ?',
+    'Le routeur redémarrera. La connexion sera coupée ~30 secondes.',
+    () => {
+      fetch("{{ url_for('system_reboot') }}", {
+        method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':(window._KETAMON_CSRF||'')}
+      }).then(r=>r.json()).then(d=>{
+        afficherNotif(d.ok ? 'Redémarrage en cours…' : (d.msg||'Erreur.'), d.ok?'success':'danger');
+      }).catch(()=>{
+        afficherNotif('Redémarrage en cours…','success');
+      });
+    }
+  );
+}
+
+function confirmerArret(){
+  ouvrirModal(
+    'Éteindre le routeur MikroTik ?',
+    'Le routeur sera éteint. Vous devrez le rallumer manuellement.',
+    () => {
+      fetch("{{ url_for('system_shutdown') }}", {
+        method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':(window._KETAMON_CSRF||'')}
+      }).then(r=>r.json()).then(d=>{
+        afficherNotif(d.ok ? 'Arrêt en cours…' : (d.msg||'Erreur.'), d.ok?'warning':'danger');
+      }).catch(()=>{
+        afficherNotif('Arrêt en cours…','warning');
+      });
+    }
+  );
+}
+
+// ── Ressources système live ──
+function _fmt(n){ return n===undefined||n===null?'—':n; }
+
+function chargerRessources(){
+  fetch('/api/ressources')
+    .then(r=>r.json())
+    .then(d=>{
+      if(!d.ok) return;
+      document.getElementById('sys-cpu').textContent    = _fmt(d.cpu) + '%';
+      document.getElementById('sys-uptime').textContent = 'Uptime : ' + _fmt(d.uptime);
+      document.getElementById('sys-mem').textContent    = _fmt(d.free_mem) + ' libres';
+      document.getElementById('sys-mem-pct').textContent= 'RAM utilisée : ' + _fmt(d.mem_pct) + '%';
+      document.getElementById('sys-hdd').textContent    = _fmt(d.free_hdd) + ' libres';
+      document.getElementById('sys-hdd-pct').textContent= 'Disque utilisé : ' + _fmt(d.hdd_pct) + '%';
+      document.getElementById('sys-board').textContent  = _fmt(d.board || d.platform || '—');
+      document.getElementById('sys-version').textContent= 'RouterOS ' + _fmt(d.version);
+    }).catch(()=>{});
+}
+
+chargerRessources();
+setInterval(chargerRessources, 10000);
+</script>
+{% endblock %}

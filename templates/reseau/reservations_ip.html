@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% block title %}— Réservations IP{% endblock %}
+{% block page_title %}Réservations IP{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-address-book"></i> Réservations IP ({{ bindings|length }})</h3>
+    <button class="btn btn-primary btn-sm" onclick="afficherFormulaireAjout()">
+      <i class="fa fa-plus"></i> Ajouter
+    </button>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Adresse MAC</th>
+          <th>Adresse IP</th>
+          <th>Vers Adresse</th>
+          <th>Point d'accès</th>
+          <th>Type</th>
+          <th>État</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for b in bindings %}
+        <tr>
+          <td><code>{{ b.get('mac-address','—') }}</code></td>
+          <td>{{ b.get('address','—') }}</td>
+          <td>{{ b.get('to-address','—') }}</td>
+          <td>{{ b.get('server','—') }}</td>
+          <td>{{ b.get('type','—') }}</td>
+          <td>
+            {% if b.get('disabled','no') == 'yes' %}
+            <span class="badge badge-red">Désactivé</span>
+            {% else %}
+            <span class="badge badge-green">Actif</span>
+            {% endif %}
+          </td>
+          <td>
+            <div style="display:flex;gap:4px;flex-wrap:wrap">
+              {% if b.get('disabled','no') == 'yes' %}
+              <button onclick="basculerReservation('{{ b.get('id','') }}','{{ b.get('disabled','no') }}')"
+                style="background:#166534;color:#86efac;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-toggle-off"></i> Activer
+              </button>
+              {% else %}
+              <button onclick="basculerReservation('{{ b.get('id','') }}','{{ b.get('disabled','no') }}')"
+                style="background:#78350f;color:#fcd34d;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-toggle-on"></i> Désact.
+              </button>
+              {% endif %}
+              <button onclick="supprimerReservation('{{ b.get('id','') }}')"
+                style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+                <i class="fa fa-trash"></i> Suppr.
+              </button>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted">Aucune réservation IP.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Formulaire ajout -->
+<div id="form-ajout" class="card card-form" style="display:none;margin-top:16px">
+  <div class="card-header"><h3>Ajouter une Réservation IP</h3></div>
+  <div class="card-body">
+    <div class="form-row">
+      <div class="form-group col-6">
+        <label>Adresse MAC</label>
+        <input type="text" id="f-mac" class="form-control" placeholder="XX:XX:XX:XX:XX:XX">
+      </div>
+      <div class="form-group col-6">
+        <label>Adresse IP source</label>
+        <input type="text" id="f-address" class="form-control" placeholder="192.168.1.100">
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group col-6">
+        <label>Vers adresse IP</label>
+        <input type="text" id="f-to-address" class="form-control" placeholder="192.168.1.200">
+      </div>
+      <div class="form-group col-6">
+        <label>Type</label>
+        <select id="f-type" class="form-control">
+          <option value="regular">Regular</option>
+          <option value="bypassed">Bypassed</option>
+          <option value="blocked">Blocked</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="ajouterReservation()"><i class="fa fa-save"></i> Enregistrer</button>
+      <button class="btn btn-secondary" onclick="document.getElementById('form-ajout').style.display='none'">Annuler</button>
+    </div>
+  </div>
+</div>
+
+<script>
+function afficherFormulaireAjout(){
+  document.getElementById("form-ajout").style.display = "";
+  document.getElementById("form-ajout").scrollIntoView({behavior:"smooth"});
+}
+function ajouterReservation(){
+  fetch("{{ url_for('reseau_ajouter_reservation') }}", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({
+      mac:        document.getElementById("f-mac").value,
+      address:    document.getElementById("f-address").value,
+      to_address: document.getElementById("f-to-address").value,
+      type:       document.getElementById("f-type").value,
+    })
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok) location.reload();
+    else afficherNotif(d.msg,"danger");
+  });
+}
+function basculerReservation(id, current){
+  const disabled = current === "yes" ? "no" : "yes";
+  fetch("{{ url_for('reseau_basculer_reservation') }}", {
+    method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id,disabled})
+  }).then(r=>r.json()).then(d=>{ if(d.ok) location.reload(); else afficherNotif(d.msg,"danger"); });
+}
+function supprimerReservation(id){
+  ouvrirModal("Supprimer cette réservation IP ?","",()=>{
+    fetch("{{ url_for('reseau_supprimer_reservation') }}", {
+      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})
+    }).then(r=>r.json()).then(d=>{ if(d.ok) location.reload(); else afficherNotif(d.msg,"danger"); });
+  });
+}
+</script>
+{% endblock %}

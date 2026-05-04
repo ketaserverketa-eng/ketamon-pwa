@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}— Modifier Utilisateur{% endblock %}
+{% block page_title %}Modifier l'Utilisateur{% endblock %}
+
+{% block content %}
+<div class="card card-form">
+  <div class="card-header">
+    <h3><i class="fa fa-edit"></i> Modifier : {{ user.get('name','') }}</h3>
+  </div>
+  <div class="card-body">
+    <form method="POST">
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Nom d'utilisateur *</label>
+          <input type="text" name="name" class="form-control" value="{{ user.get('name','') }}" required>
+        </div>
+        <div class="form-group col-6">
+          <label>Mot de passe</label>
+          <input type="text" name="password" class="form-control" value="{{ user.get('password','') }}">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Profil</label>
+          <select name="profile" class="form-control">
+            {% for p in profiles %}
+            <option value="{{ p.name }}" {% if p.name == user.get('profile','') %}selected{% endif %}>
+              {{ p.name }}
+            </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group col-6">
+          <label>Serveur</label>
+          <select name="server" class="form-control">
+            <option value="">— Tous —</option>
+            {% for s in servers %}
+            <option value="{{ s.name }}" {% if s.name == user.get('server','') %}selected{% endif %}>
+              {{ s.name }}
+            </option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group col-6">
+          <label>Limite de temps</label>
+          <input type="text" name="time_limit" class="form-control" value="{{ user.get('limit-uptime','0') }}">
+        </div>
+        <div class="form-group col-6">
+          <label>Limite de données (octets)</label>
+          <input type="text" name="data_limit" class="form-control" value="{{ user.get('limit-bytes-total','0') }}">
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Commentaire</label>
+        <input type="text" name="comment" class="form-control" value="{{ user.get('comment','') }}">
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary"><i class="fa fa-save"></i> Enregistrer</button>
+        <a href="{{ url_for('hotspot_users') }}" class="btn btn-secondary">Annuler</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

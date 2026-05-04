@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}— Routeurs Cloud{% endblock %}
+{% block page_title %}Routeurs MongoDB{% endblock %}
+{% block content %}
+<div class="concepteur-banner"><i class="fa fa-shield"></i> Mode Concepteur</div>
+
+<div class="card" style="margin-top:16px">
+  <div class="card-header">
+    <h3><i class="fa fa-server"></i> Routeurs Cloud ({{ profiles|length }})</h3>
+    <a href="{{ url_for('concepteur_add_routeur_cloud') }}" class="btn btn-primary btn-sm">
+      <i class="fa fa-plus"></i> Ajouter
+    </a>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead><tr><th>Nom</th><th>Hôte</th><th>Port</th><th>Hotspot</th><th>Devise</th><th>Interface</th><th>Actions</th></tr></thead>
+      <tbody>
+        {% for p in profiles %}
+        <tr>
+          <td><b>{{ p.get('name','—') }}</b></td>
+          <td><code>{{ p.get('host','—') }}</code></td>
+          <td>{{ p.get('port',8728) }}</td>
+          <td>{{ p.get('hotspotName','—') }}</td>
+          <td>{{ p.get('currency','FCFA') }}</td>
+          <td>{{ p.get('trafficInterface','ether1') }}</td>
+          <td>
+            {% set rid = p.get('_id') or p.get('id') %}
+            <button onclick="supprimerRouteur('{{ rid }}','{{ p.get('name','') }}')"
+              style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer">
+              <i class="fa fa-trash"></i> Supprimer
+            </button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted">Aucun routeur enregistré dans MongoDB.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const _CSRF = window._KETAMON_CSRF || '';
+function supprimerRouteur(id, nom){
+  ouvrirModal(`Supprimer le routeur "${nom}" ?`, "Ce routeur sera retiré de MongoDB.", () => {
+    fetch(`/concepteur/routeurs-cloud/${id}/supprimer`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF}
+    }).then(r => r.ok ? location.reload() : afficherNotif("Erreur lors de la suppression.","danger"))
+      .catch(()=>afficherNotif("Erreur réseau.","danger"));
+  });
+}
+</script>
+{% endblock %}

@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0EA5E9">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="KetaMon">
+<title>KetaMon — Connexion</title>
+<link rel="manifest" href="/static/manifest.json">
+<link rel="apple-touch-icon" href="/static/img/default-ticket-logo.png">
+{% if adsense_pub_id %}
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={{ adsense_pub_id }}" crossorigin="anonymous"></script>
+{% endif %}
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0f172a;font-family:system-ui,sans-serif;color:#f8fafc;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+.card{width:100%;max-width:420px;background:#1f2937;border:1px solid #334155;border-radius:14px;padding:24px;display:flex;flex-direction:column;gap:16px}
+.logo{display:flex;flex-direction:column;align-items:center;gap:8px}
+.logo-icon{width:72px;height:72px;border-radius:16px;background:#0ea5e9;display:flex;align-items:center;justify-content:center;font-size:32px}
+.logo h1{font-size:20px;color:#f8fafc}
+.logo p{font-size:12px;color:#64748b;text-align:center}
+.tabs{display:flex;gap:6px;background:#0f172a;border-radius:10px;padding:4px}
+.tab{flex:1;padding:8px 4px;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:500;transition:.15s;background:transparent;color:#94a3b8}
+.tab.active{background:#0ea5e9;color:#fff}
+.hint{font-size:12px;color:#64748b;text-align:center}
+.hint.yellow{color:#fbbf24;background:rgba(251,191,36,.08);border-radius:6px;padding:5px 8px}
+.section{display:flex;flex-direction:column;gap:12px}
+.section.hidden{display:none}
+.fg{display:flex;flex-direction:column;gap:6px}
+.fg label{font-size:12px;color:#94a3b8}
+input[type=text],input[type=email],input[type=password]{background:#111827;border:1px solid #334155;border-radius:8px;color:#f8fafc;padding:9px 12px;font-size:14px;width:100%}
+input:focus{outline:none;border-color:#0ea5e9}
+.btn{background:#0ea5e9;color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;width:100%}
+.btn:hover{background:#0284c7}
+.lnk{background:none;border:none;color:#60a5fa;cursor:pointer;font-size:13px;text-decoration:underline;padding:0}
+.row{display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px}
+.err{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);border-radius:8px;padding:9px 12px;font-size:13px;color:#fca5a5}
+.ok{background:rgba(22,163,74,.12);border:1px solid rgba(22,163,74,.3);border-radius:8px;padding:9px 12px;font-size:13px;color:#86efac}
+.token{background:rgba(22,163,74,.12);border:1px solid rgba(22,163,74,.3);border-radius:8px;padding:10px 12px;font-size:12px;color:#86efac;word-break:break-all}
+.footer{display:flex;gap:8px;justify-content:center;font-size:11px;color:#475569}
+</style>
+</head>
+<body>
+<div class="card">
+
+  <!-- Logo -->
+  <div class="logo">
+    <div class="logo-icon" style="background:transparent;width:90px;height:90px;border-radius:16px;overflow:hidden;display:flex;align-items:center;justify-content:center">
+      {% if ticket_logo_url %}
+      <img src="{{ ticket_logo_url }}" alt="KetaMon" style="max-width:88px;max-height:88px;object-fit:contain">
+      {% else %}
+      <span style="font-size:40px">📡</span>
+      {% endif %}
+    </div>
+    <h1>KetaMon</h1>
+    <p>Gestionnaire MikroTik — KetaServer Cloud</p>
+  </div>
+
+  <!-- Flash messages -->
+  {% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}{% for cat, msg in messages %}
+  <div class="{{ 'ok' if cat == 'success' else 'err' }}">{{ msg }}</div>
+  {% endfor %}{% endif %}
+  {% endwith %}
+
+  <!-- Onglets -->
+  <div class="tabs">
+    <button class="tab active" id="tab-user" onclick="showMode('user')">📧 Utilisateur (Gmail)</button>
+    <button class="tab"        id="tab-dev"  onclick="showMode('dev')">🔑 Concepteur</button>
+  </div>
+
+  <!-- ── HINT ── -->
+  <p id="hint-user" class="hint">Connectez-vous avec votre Gmail. Première fois → créez un compte.</p>
+  <p id="hint-dev"  class="hint yellow hidden">Accès réservé au Concepteur Développeur</p>
+
+  <!-- ══════════════════════════════════════════
+       MODE UTILISATEUR — CONNEXION
+  ══════════════════════════════════════════ -->
+  <form id="sec-login" class="section" method="POST">
+    <input type="hidden" name="mode" value="email">
+    <input type="hidden" name="submode" value="login">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p style="font-size:13px;color:#94a3b8;text-align:center">Connexion avec votre adresse Gmail</p>
+    <div class="fg">
+      <label>Adresse Gmail / Email</label>
+      <input type="email" name="email" placeholder="vous@gmail.com" value="{{ prefill_email or '' }}" required>
+    </div>
+    <div class="fg">
+      <label>Mot de passe</label>
+      <input type="password" name="password" required>
+    </div>
+    <button type="submit" class="btn">Se connecter</button>
+    <div class="row">
+      <button type="button" class="lnk" onclick="showSec('register')">Première fois ? Créer un compte</button>
+      <button type="button" class="lnk" onclick="showSec('forgot')">Mot de passe oublié ?</button>
+    </div>
+  </form>
+
+  <!-- ══════════════════════════════════════════
+       MODE UTILISATEUR — INSCRIPTION
+  ══════════════════════════════════════════ -->
+  <form id="sec-register" class="section hidden" method="POST">
+    <input type="hidden" name="mode" value="email">
+    <input type="hidden" name="submode" value="register">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p style="font-size:13px;color:#94a3b8;text-align:center">Créer votre compte KetaServer</p>
+    <div class="fg">
+      <label>Adresse Gmail / Email *</label>
+      <input type="email" name="email" placeholder="vous@gmail.com" value="{{ prefill_email or '' }}" required>
+    </div>
+    <div class="fg">
+      <label>Nom affiché (optionnel)</label>
+      <input type="text" name="display_name" placeholder="Ex: Moussa Traoré">
+    </div>
+    <div class="fg">
+      <label>Mot de passe (min. 8 caracteres) *</label>
+      <input type="password" name="password" required>
+    </div>
+    <div class="fg">
+      <label>Confirmer le mot de passe *</label>
+      <input type="password" name="confirm_password" required>
+    </div>
+    <button type="submit" class="btn">Créer mon compte</button>
+    <button type="button" class="lnk" onclick="showSec('login')">← Retour à la connexion</button>
+  </form>
+
+  <!-- ══════════════════════════════════════════
+       MODE UTILISATEUR — MOT DE PASSE OUBLIÉ
+  ══════════════════════════════════════════ -->
+  <form id="sec-forgot" class="section hidden" method="POST">
+    <input type="hidden" name="mode" value="email">
+    <input type="hidden" name="submode" value="forgot">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p style="font-size:13px;color:#94a3b8;text-align:center">Entrez votre email pour réinitialiser</p>
+    <div class="fg">
+      <label>Votre email</label>
+      <input type="email" name="email" placeholder="vous@gmail.com" value="{{ prefill_email or '' }}" required>
+    </div>
+    <button type="submit" class="btn">Obtenir le lien</button>
+    <button type="button" class="lnk" onclick="showSec('login')">← Retour</button>
+  </form>
+
+  <!-- ══════════════════════════════════════════
+       MODE UTILISATEUR — RESET MOT DE PASSE
+  ══════════════════════════════════════════ -->
+  {% if reset_token %}
+  <form id="sec-reset" class="section" method="POST">
+    <input type="hidden" name="mode" value="email">
+    <input type="hidden" name="submode" value="reset">
+    <input type="hidden" name="reset_token" value="{{ reset_token }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="token">Token : <code>{{ reset_token }}</code></div>
+    <div class="fg">
+      <label>Nouveau mot de passe</label>
+      <input type="password" name="new_password" placeholder="Nouveau mot de passe" required>
+    </div>
+    <button type="submit" class="btn">Changer le mot de passe</button>
+    <button type="button" class="lnk" onclick="showSec('login')">← Retour</button>
+  </form>
+  {% endif %}
+
+  <!-- ══════════════════════════════════════════
+       MODE CONCEPTEUR
+  ══════════════════════════════════════════ -->
+  <form id="sec-dev" class="section hidden" method="POST">
+    <input type="hidden" name="mode" value="username">
+    <input type="hidden" name="submode" value="login">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p style="font-size:12px;color:#FCD34D;text-align:center;background:rgba(251,191,36,.08);border-radius:6px;padding:6px 10px">
+      Accès réservé au Concepteur Développeur
+    </p>
+    <div class="fg">
+      <label>Nom utilisateur</label>
+      <input type="text" name="username" placeholder="KETASERVER" required>
+    </div>
+    <div class="fg">
+      <label>Mot de passe Concepteur</label>
+      <input type="password" name="password" required>
+    </div>
+    <button type="submit" class="btn">Accéder</button>
+  </form>
+
+  <div class="footer"><span>KetaServer Cloud</span><span>•</span><span>Port 5001</span></div>
+</div>
+
+<script>
+// ── Sous-mode à afficher au chargement (défini par Flask) ──
+var initMode    = "{{ mode or 'user' }}";
+var initSubmode = "{{ submode or 'login' }}";
+var hasReset    = {{ 'true' if reset_token else 'false' }};
+var csrfToken   = "{{ csrf_token }}";
+
+var userSecs = ["login","register","forgot","reset"];
+
+function showMode(m) {
+  // Onglets
+  document.getElementById("tab-user").classList.toggle("active", m === "user");
+  document.getElementById("tab-dev").classList.toggle("active",  m === "dev");
+  // Hints
+  document.getElementById("hint-user").classList.toggle("hidden", m !== "user");
+  document.getElementById("hint-dev").classList.toggle("hidden",  m !== "dev");
+  // Formulaires
+  document.getElementById("sec-dev").classList.toggle("hidden", m !== "dev");
+  if (m === "user") {
+    showSec(hasReset ? "reset" : initSubmode !== "login" ? initSubmode : "login");
+  } else {
+    userSecs.forEach(function(s){ var el = document.getElementById("sec-"+s); if(el) el.classList.add("hidden"); });
+  }
+}
+
+function showSec(s) {
+  userSecs.forEach(function(id){ var el = document.getElementById("sec-"+id); if(el) el.classList.add("hidden"); });
+  var el = document.getElementById("sec-"+s);
+  if (el) el.classList.remove("hidden");
+}
+
+document.querySelectorAll("form").forEach(function(form){
+  if (!form.querySelector('input[name="csrf_token"]')) {
+    var input = document.createElement("input");
+    input.type = "hidden";
+    input.name = "csrf_token";
+    input.value = csrfToken;
+    form.appendChild(input);
+  }
+});
+
+// Init au chargement
+(function(){
+  if (initMode === "concepteur" || initMode === "dev") {
+    showMode("dev");
+  } else {
+    showMode("user");
+    if (hasReset) showSec("reset");
+    else if (initSubmode === "register") showSec("register");
+    else if (initSubmode === "forgot")   showSec("forgot");
+    else showSec("login");
+  }
+})();
+</script>
+
+<!-- Footer légal -->
+<footer style="position:fixed;bottom:0;left:0;right:0;text-align:center;padding:8px 16px;font-size:11px;color:#475569;background:#0b1220;border-top:1px solid #1e293b;z-index:100;">
+  <i class="fa fa-wifi" style="color:#0ea5e9"></i> KetaMon &nbsp;|&nbsp;
+  <a href="/a-propos" style="color:#64748b;text-decoration:none;">À propos</a> &nbsp;|&nbsp;
+  <a href="/contact" style="color:#64748b;text-decoration:none;">Contact</a> &nbsp;|&nbsp;
+  <a href="/politique-de-confidentialite" style="color:#64748b;text-decoration:none;">Confidentialité</a>
+</footer>
+
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(function(){});
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}- Sessions Actives{% endblock %}
+{% block page_title %}Sessions Actives{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-wifi"></i> Sessions en Cours ({{ actifs|length }})</h3>
+    <div class="card-actions">
+      <form method="get" class="filter-form">
+        <select name="serveur" class="form-control form-control-sm" onchange="this.form.submit()">
+          <option value="">Tous les points d'acces</option>
+          {% for s in servers %}
+          <option value="{{ s.name }}" {% if server_filter==s.name %}selected{% endif %}>{{ s.name }}</option>
+          {% endfor %}
+        </select>
+      </form>
+      <a href="{{ url_for('reseau_sessions') }}" class="btn btn-outline btn-sm"><i class="fa fa-refresh"></i> Actualiser</a>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Client</th>
+          <th>Adresse IP</th>
+          <th>Adresse MAC</th>
+          <th>Point d'acces</th>
+          <th>Duree</th>
+          <th>Temps restant</th>
+          <th>Debit ↓</th>
+          <th>Debit ↑</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in actifs %}
+        <tr>
+          <td><strong>{{ a.get('user','-') }}</strong></td>
+          <td>{{ a.get('address','-') }}</td>
+          <td><code>{{ a.get('mac-address','-') }}</code></td>
+          <td>{{ a.get('server','-') }}</td>
+          <td>{{ a.get('uptime','-') }}</td>
+          <td>{{ a.get('temps-restant','∞') }}</td>
+          <td>{{ a.get('rx-rate','-') }}</td>
+          <td>{{ a.get('tx-rate','-') }}</td>
+          <td class="actions">
+            <button type="button"
+              onclick='terminerSession({{ a.get("id","")|tojson }}, {{ a.get("user","")|tojson }})'
+              style="background:#92400e;color:#fcd34d;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
+              <i class="fa fa-sign-out"></i> Couper
+            </button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="text-center text-muted">Aucune session en cours.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function terminerSession(id, user){
+  ouvrirModal(
+    `Terminer la session de "${user}" ?`,
+    "La session active, le cookie et l'hôte seront coupés.",
+    () => {
+      fetch("{{ url_for('reseau_supprimer_session') }}", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({id})
+      }).then(r => r.json()).then(d => {
+        if(d.ok){
+          afficherNotif("Session coupée.", "success");
+          // Retirer la ligne sans recharger la page
+          const btns = document.querySelectorAll('button[onclick*="'+id+'"]');
+          btns.forEach(b => b.closest('tr')?.remove());
+          // Mettre à jour le compteur
+          const h = document.querySelector('.card-header h3');
+          if(h){ const m=h.textContent.match(/\d+/); if(m) h.textContent=h.textContent.replace(m[0], Math.max(0,parseInt(m[0])-1)); }
+        } else {
+          afficherNotif(d.msg || "Coupure impossible.", "danger");
+        }
+      }).catch(()=>afficherNotif("Erreur réseau.", "danger"));
+    }
+  );
+}
+
+// Refresh AJAX toutes les 20s (pas de rechargement de page complet)
+let _sessionsTimer = setInterval(function(){
+  fetch(location.href, {headers:{"X-Requested-With":"XMLHttpRequest"}})
+    .then(r=>r.text())
+    .then(html=>{
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, 'text/html');
+      const newTbody = doc.querySelector('.data-table tbody');
+      const curTbody = document.querySelector('.data-table tbody');
+      if(newTbody && curTbody) curTbody.innerHTML = newTbody.innerHTML;
+      const newH = doc.querySelector('.card-header h3');
+      const curH = document.querySelector('.card-header h3');
+      if(newH && curH) curH.textContent = newH.textContent;
+    }).catch(()=>{});
+}, 20000);
+</script>
+{% endblock %}

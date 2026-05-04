@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}— Contact{% endblock %}
+{% block page_title %}Contact{% endblock %}
+
+{% block content %}
+<div class="card card-form" style="max-width:580px;margin:40px auto;">
+  <div class="card-body" style="padding:36px 40px;">
+
+    <div style="text-align:center;margin-bottom:28px;">
+      <i class="fa fa-envelope" style="font-size:52px;color:#0ea5e9;display:block;margin-bottom:12px;"></i>
+      <h2 style="margin:0 0 6px;color:#f8fafc;font-size:22px;">Nous contacter</h2>
+      <p style="color:#94a3b8;font-size:14px;margin:0;">Pour toute question technique, partenariat ou signalement</p>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:16px;">
+
+      <div style="background:#1e2d42;border:1px solid #fbbf2433;border-radius:10px;padding:12px 16px;font-size:12px;color:#fbbf24;">
+        <i class="fa fa-info-circle"></i>
+        Cet email est celui du <strong>Concepteur (développeur)</strong> de KetaMon.<br>
+        Les utilisateurs finaux doivent contacter l'administrateur de leur réseau WiFi.
+      </div>
+
+      <div style="background:#121a2b;border-radius:10px;padding:18px 20px;display:flex;align-items:center;gap:14px;">
+        <i class="fa fa-envelope-o" style="color:#0ea5e9;font-size:22px;width:28px;text-align:center;flex-shrink:0;"></i>
+        <div>
+          <div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Email du Concepteur</div>
+          <a href="mailto:ouedraogonebketaboukare@gmail.com"
+             style="color:#e5eef8;font-size:15px;font-weight:600;text-decoration:none;word-break:break-all;">
+            ouedraogonebketaboukare@gmail.com
+          </a>
+        </div>
+      </div>
+
+      <div style="background:#121a2b;border-radius:10px;padding:18px 20px;display:flex;align-items:center;gap:14px;">
+        <i class="fa fa-globe" style="color:#0ea5e9;font-size:22px;width:28px;text-align:center;flex-shrink:0;"></i>
+        <div>
+          <div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Application</div>
+          <div style="color:#e5eef8;font-size:15px;font-weight:600;">KetaMon — Gestionnaire MikroTik</div>
+          <div style="color:#94a3b8;font-size:12px;margin-top:2px;">Gestion de routeurs, hotspots et vouchers WiFi</div>
+        </div>
+      </div>
+
+      <div style="background:#121a2b;border-radius:10px;padding:18px 20px;display:flex;align-items:center;gap:14px;">
+        <i class="fa fa-clock-o" style="color:#0ea5e9;font-size:22px;width:28px;text-align:center;flex-shrink:0;"></i>
+        <div>
+          <div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Délai de réponse</div>
+          <div style="color:#e5eef8;font-size:14px;">Généralement sous 24 à 48 heures</div>
+        </div>
+      </div>
+
+    </div>
+
+    <div style="margin-top:28px;text-align:center;">
+      <a href="{{ url_for('login') }}" class="btn btn-outline btn-sm">
+        <i class="fa fa-arrow-left"></i> Retour à l'accueil
+      </a>
+    </div>
+
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}— Mon Compte{% endblock %}
+{% block page_title %}Mon Compte{% endblock %}
+
+{% block content %}
+<div class="card card-form" style="max-width:500px">
+  <div class="card-header">
+    <h3><i class="fa fa-user"></i> Mon Compte</h3>
+  </div>
+  <div class="card-body">
+    <div class="info-box" style="margin-bottom:16px">
+      Connecté en tant que : <strong>{{ session.username }}</strong>
+      ({{ session.role }})
+    </div>
+    <form method="POST" onsubmit="return validerForm(this)">
+      <div class="form-group">
+        <label>Mot de passe actuel *</label>
+        <input type="password" name="current_password" id="current-pwd" class="form-control" placeholder="••••••" required autocomplete="current-password">
+      </div>
+      <div class="form-group">
+        <label>Nouveau mot de passe *</label>
+        <input type="password" name="new_password" id="new-pwd" class="form-control" placeholder="••••••" required minlength="4" autocomplete="new-password">
+      </div>
+      <div class="form-group">
+        <label>Confirmer le nouveau mot de passe *</label>
+        <input type="password" name="confirm_password" id="confirm-pwd" class="form-control" placeholder="••••••" required autocomplete="new-password">
+        <small id="pwd-mismatch" style="color:#ef4444;display:none"><i class="fa fa-exclamation-circle"></i> Les mots de passe ne correspondent pas.</small>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary"><i class="fa fa-save"></i> Modifier</button>
+      </div>
+    </form>
+    <script>
+    document.getElementById('confirm-pwd').addEventListener('input', function(){
+      var match = this.value === document.getElementById('new-pwd').value;
+      document.getElementById('pwd-mismatch').style.display = match ? 'none' : '';
+    });
+    function validerForm(f){
+      var np = document.getElementById('new-pwd').value;
+      var cp = document.getElementById('confirm-pwd').value;
+      if(np !== cp){ document.getElementById('pwd-mismatch').style.display=''; return false; }
+      return true;
+    }
+    </script>
+  </div>
+</div>
+{% endblock %}

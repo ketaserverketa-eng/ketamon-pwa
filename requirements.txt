@@ -1,0 +1,7 @@
+﻿Flask==3.0.3
+librouteros==4.0.1
+Werkzeug==3.0.3
+requests==2.31.0
+waitress==2.1.2
+gunicorn==21.2.0
+cryptography==41.0.3

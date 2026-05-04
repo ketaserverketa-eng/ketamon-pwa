@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}— Politique de Confidentialité{% endblock %}
+{% block page_title %}Politique de Confidentialité{% endblock %}
+
+{% block content %}
+<div class="card card-form" style="max-width:700px;margin:40px auto;">
+  <div class="card-body" style="padding:36px 40px;line-height:1.8;">
+
+    <div style="text-align:center;margin-bottom:28px;">
+      <i class="fa fa-shield" style="font-size:48px;color:#0ea5e9;display:block;margin-bottom:12px;"></i>
+      <h2 style="margin:0 0 6px;color:#f8fafc;font-size:22px;">Politique de Confidentialité</h2>
+      <p style="color:#64748b;font-size:13px;margin:0;">Dernière mise à jour : mai 2026</p>
+    </div>
+
+    {% set sections = [
+      ("1. Présentation", "KetaMon est une application web de gestion de routeurs MikroTik. Elle permet à l'administrateur réseau de surveiller et gérer les hotspots, utilisateurs WiFi, bons de connexion (vouchers), trafic réseau et journaux système."),
+      ("2. Données collectées", "KetaMon collecte uniquement les données strictement nécessaires à son fonctionnement : nom d'utilisateur et mot de passe (hashés) pour l'authentification locale, adresses IP et MAC des appareils connectés au routeur MikroTik, journaux de connexion (hotspot) provenant du routeur, et informations de configuration des profils et vouchers. Aucune donnée personnelle n'est transmise à des tiers."),
+      ("3. Utilisation des données", "Les données collectées sont utilisées exclusivement pour : afficher les tableaux de bord et rapports d'utilisation réseau, gérer les utilisateurs et profils hotspot, générer et imprimer des bons de connexion, et assurer la sécurité de l'accès à l'interface d'administration."),
+      ("4. Stockage et sécurité", "Toutes les données sont stockées localement sur le serveur de l'administrateur. Les mots de passe sont stockés sous forme hachée (bcrypt). L'accès à l'application est protégé par authentification. Aucune donnée n'est hébergée sur des serveurs externes sans consentement explicite."),
+      ("5. Cookies et sessions", "L'application utilise des cookies de session (session Flask) pour maintenir la connexion de l'utilisateur. Ces cookies sont temporaires et expirés à la fermeture du navigateur ou lors de la déconnexion. Aucun cookie publicitaire ou de traçage tiers n'est utilisé par défaut."),
+      ("6. Partage des données", "KetaMon ne vend, ne loue et ne partage aucune donnée utilisateur avec des tiers. Les données restent sur l'infrastructure de l'administrateur."),
+      ("7. Vos droits", "En tant qu'utilisateur, vous avez le droit d'accéder à vos données, de les corriger ou de les supprimer en contactant l'administrateur de votre instance KetaMon."),
+      ("8. Contact", "Pour toute question relative à la confidentialité, contactez-nous à : ouedraogonebketaboukare@gmail.com")
+    ] %}
+
+    {% for title, text in sections %}
+    <div style="margin-bottom:20px;">
+      <h3 style="color:#e5eef8;font-size:15px;font-weight:700;margin:0 0 6px;">{{ title }}</h3>
+      <p style="color:#94a3b8;font-size:14px;margin:0;">{{ text }}</p>
+    </div>
+    {% endfor %}
+
+    <div style="margin-top:32px;text-align:center;border-top:1px solid #1e2d42;padding-top:20px;">
+      <a href="{{ url_for('login') }}" class="btn btn-outline btn-sm">
+        <i class="fa fa-arrow-left"></i> Retour à l'accueil
+      </a>
+    </div>
+
+  </div>
+</div>
+{% endblock %}

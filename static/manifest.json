@@ -1,0 +1,27 @@
+{
+  "name": "KetaMon — Gestionnaire MikroTik",
+  "short_name": "KetaMon",
+  "description": "Gérez vos routeurs MikroTik, hotspots et vouchers depuis votre appareil.",
+  "start_url": "/login",
+  "display": "standalone",
+  "background_color": "#0B1220",
+  "theme_color": "#0EA5E9",
+  "lang": "fr",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/static/img/default-ticket-logo.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/img/default-ticket-logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["productivity", "utilities"],
+  "screenshots": []
+}
