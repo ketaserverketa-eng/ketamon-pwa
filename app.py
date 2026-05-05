@@ -26,7 +26,8 @@ import database as db_mod
 
 # KetaServer endpoint configurable
 KS_API = os.environ.get("KETASERVER_API_URL", "http://127.0.0.1:5000")
-KS_ENABLED = False
+STANDALONE_MODE = os.environ.get("STANDALONE_MODE", "0") == "1"
+KS_ENABLED = STANDALONE_MODE
 PROFILE_META_PREFIX = "ketamon-profile:"
 
 # ─── Config AdMob locale ─────────────────────────────────────────────────────
@@ -90,11 +91,12 @@ def _ks_background_ping(interval=15):
         KS_ENABLED = _ks_ping_once(timeout=2)
         time.sleep(interval)
 
-try:
-    t = threading.Thread(target=_ks_background_ping, args=(15,), daemon=True)
-    t.start()
-except Exception:
-    KS_ENABLED = _ks_ping_once()
+if not STANDALONE_MODE:
+    try:
+        t = threading.Thread(target=_ks_background_ping, args=(15,), daemon=True)
+        t.start()
+    except Exception:
+        KS_ENABLED = _ks_ping_once()
 
 def ks_post(path, data, token=None):
     """POST vers KetaServer API. Retourne (dict, None) ou (None, erreur_str)."""
