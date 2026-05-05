@@ -266,7 +266,7 @@
 {% endif %}
 {% endwith %}
 
-{% if session.get('logged_in') and not ks_enabled %}
+{% if session.get('logged_in') and not ks_enabled and not standalone_mode %}
 <div class="flash-container">
 <div class="flash flash-warning">Mode degrade : KetaServer est indisponible. Les fonctions cloud sont limitees tant que le service ne repond pas.</div>
 </div>

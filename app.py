@@ -26,8 +26,8 @@ import database as db_mod
 
 # KetaServer endpoint configurable
 KS_API = os.environ.get("KETASERVER_API_URL", "http://127.0.0.1:5000")
-STANDALONE_MODE = os.environ.get("STANDALONE_MODE", "0") == "1"
-KS_ENABLED = STANDALONE_MODE
+STANDALONE_MODE = "127.0.0.1" in KS_API or "localhost" in KS_API
+KS_ENABLED = False
 PROFILE_META_PREFIX = "ketamon-profile:"
 
 # ─── Config AdMob locale ─────────────────────────────────────────────────────
@@ -264,7 +264,7 @@ def inject_csrf_token():
     return dict(
         csrf_token=session.get("csrf_token", ""),
         ks_enabled=KS_ENABLED,
-        # ks_api intentionnellement retiré — URL interne non exposée aux templates
+        standalone_mode=STANDALONE_MODE,
         ticket_logo_url=logo["url"],
         ticket_logo_name=logo["name"],
         ticket_logo_is_custom=logo["is_custom"],
