@@ -1381,10 +1381,15 @@ def db_claim_next_router_relay_command(router_id: str):
         WHERE router_id=? AND status='queued'
         ORDER BY
           CASE
-            WHEN command='routeros-script' AND payload LIKE '%/ip hotspot user add name=%' THEN 0
-            WHEN command='ping' THEN 1
-            WHEN command='routeros-script' AND payload LIKE '%restored-from-database%' THEN 3
-            ELSE 2
+            WHEN command='routeros-script' AND payload LIKE '%KETAMON_EXPIRE_ENFORCE%' THEN 0
+            WHEN command='routeros-script' AND payload LIKE '%ketamon-ticket-login%' THEN 1
+            WHEN command='routeros-script' AND payload LIKE '%ketamon-ticket-expiry%' THEN 1
+            WHEN command='routeros-script' AND payload LIKE '%ketamon-ticket-expiry-runner%' THEN 1
+            WHEN command='routeros-script' AND payload LIKE '%on-login=%' THEN 1
+            WHEN command='routeros-script' AND payload LIKE '%/ip hotspot user add name=%' THEN 2
+            WHEN command='ping' THEN 3
+            WHEN command='routeros-script' AND payload LIKE '%restored-from-database%' THEN 5
+            ELSE 4
           END,
           created_at ASC
         LIMIT 1

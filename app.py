@@ -1932,7 +1932,7 @@ def _cleanup_expired_active_from_database(api, router_id, active_rows, first_use
         if not meta:
             continue
         limit_seconds = parse_routeros_duration(coerce_ticket_time_limit_router(_ticket_meta_time_limit(meta), empty="0", prefer_legacy_routeros=False) or "0")
-        first_dt = _parse_first_used_datetime(first_used_map.get(username))
+        first_dt = _effective_first_used_datetime(first_used_map.get(username), active, now=now)
         if not first_dt or not limit_seconds or limit_seconds <= 0:
             continue
         if now < first_dt + timedelta(seconds=limit_seconds):
@@ -1942,6 +1942,7 @@ def _cleanup_expired_active_from_database(api, router_id, active_rows, first_use
         try:
             if hasattr(api, "queue_routeros_script"):
                 source = "\n".join([
+                    ':put "KETAMON_EXPIRE_ENFORCE";',
                     f"/ip hotspot active remove [find where user={_relay_routeros_quote(username)}];",
                     f"/ip hotspot cookie remove [find where user={_relay_routeros_quote(username)}];",
                     f"/ip hotspot user remove [find where name={_relay_routeros_quote(username)}];",
@@ -1964,6 +1965,127 @@ def _cleanup_expired_active_from_database(api, router_id, active_rows, first_use
         except Exception:
             pass
     return cleaned
+
+
+def _relay_snapshot_rows_from_db(router_id, resource):
+    try:
+        snapshots = db_mod.db_get_router_relay_snapshot(router_id)
+        meta = snapshots.get(resource) if isinstance(snapshots, dict) else None
+        rows = (meta or {}).get("data") or []
+        return [dict(row) for row in rows if isinstance(row, dict)]
+    except Exception:
+        return []
+
+
+def _relay_expired_cleanup_source(expired_rows):
+    lines = [':put "KETAMON_EXPIRE_ENFORCE";']
+    seen = set()
+    for row in expired_rows or []:
+        username = str(row.get("username") or row.get("name") or row.get("user") or "").strip()
+        if not username or username in seen:
+            continue
+        seen.add(username)
+        address = str(row.get("address") or "").strip()
+        mac = str(row.get("mac-address") or row.get("mac") or "").strip()
+        lines.extend([
+            f':do {{ /ip hotspot active remove [find where user={_relay_routeros_quote(username)}]; }} on-error={{}}',
+            f':do {{ /ip hotspot cookie remove [find where user={_relay_routeros_quote(username)}]; }} on-error={{}}',
+            f':do {{ /ip hotspot user remove [find where name={_relay_routeros_quote(username)}]; }} on-error={{}}',
+        ])
+        if address:
+            lines.append(
+                f':do {{ /ip hotspot host remove [find where address={_relay_routeros_quote(address)}]; }} on-error={{}}'
+            )
+        if mac and mac != "00:00:00:00:00:00":
+            lines.append(
+                f':do {{ /ip hotspot host remove [find where mac-address={_relay_routeros_quote(mac)}]; }} on-error={{}}'
+            )
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _enforce_relay_snapshot_expirations(router):
+    router = dict(router or {})
+    router_id = str(router.get("id") or router.get("host") or "").strip()
+    if not router_id:
+        return {"expired": 0, "patched": 0, "cleaned": 0, "recorded": 0}
+
+    users = _relay_snapshot_rows_from_db(router_id, "/ip/hotspot/user")
+    active = _relay_snapshot_rows_from_db(router_id, "/ip/hotspot/active")
+    fresh_active, _updated_at, _age = _relay_snapshot_state(router_id, "/ip/hotspot/active")
+    active = active if fresh_active else []
+
+    recorded = 0
+    if active:
+        try:
+            recorded = _record_active_revenues_from_database(router_id, active)
+        except Exception:
+            recorded = 0
+
+    first_used_map = _build_first_used_map(router_id)
+    relay_api = RelaySnapshotApi(router)
+    cleaned = 0
+    patched = 0
+    if active:
+        try:
+            cleaned = _cleanup_expired_active_from_database(relay_api, router_id, active, first_used_map)
+        except Exception:
+            cleaned = 0
+        if not cleaned:
+            try:
+                users_map = {str(row.get("name") or "").strip(): dict(row) for row in users if str(row.get("name") or "").strip()}
+                patched = _repair_active_ticket_epochs(
+                    relay_api,
+                    router_id,
+                    active_rows=active,
+                    users_map=users_map,
+                    first_used_map=first_used_map,
+                )
+            except Exception:
+                patched = 0
+        else:
+            patched = 0
+        try:
+            patched = int(patched or 0)
+        except Exception:
+            patched = 0
+
+    now = datetime.now()
+    active_by_user = {
+        str(row.get("user") or "").strip(): row
+        for row in active
+        if str(row.get("user") or "").strip()
+    }
+    expired = []
+    for user in users:
+        username = str(user.get("name") or "").strip()
+        if not username:
+            continue
+        expire_dt = _extract_ketamon_expire_datetime(user.get("comment"))
+        if not expire_dt or now < expire_dt:
+            continue
+        merged = dict(user)
+        merged["username"] = username
+        active_row = active_by_user.get(username) or {}
+        if active_row:
+            merged.setdefault("address", active_row.get("address"))
+            merged.setdefault("mac-address", active_row.get("mac-address"))
+        expired.append(merged)
+
+    if expired:
+        source = _relay_expired_cleanup_source(expired[:200])
+        if source:
+            db_mod.db_enqueue_router_relay_command(
+                router_id,
+                router.get("owner_id", ""),
+                "routeros-script",
+                {"source": source},
+            )
+            try:
+                db_mod.db_delete_ticket_pricing(router_id, [row.get("username") for row in expired])
+            except Exception:
+                pass
+
+    return {"expired": len(expired), "patched": patched, "cleaned": cleaned, "recorded": recorded}
 
 
 def _record_active_revenues_from_database(router_id, active_rows):
@@ -2020,6 +2142,22 @@ def _parse_first_used_datetime(first_used_raw):
         return datetime.strptime(text[:16], "%Y-%m-%d %H:%M")
     except Exception:
         return None
+
+
+def _active_started_datetime(active_row, now=None):
+    active_row = dict(active_row or {})
+    now = now if isinstance(now, datetime) else datetime.now()
+    uptime_seconds = parse_routeros_duration(active_row.get("uptime"))
+    if uptime_seconds is None or uptime_seconds < 0:
+        return None
+    return now - timedelta(seconds=uptime_seconds)
+
+
+def _effective_first_used_datetime(first_used_raw, active_row=None, now=None):
+    first_dt = _parse_first_used_datetime(first_used_raw)
+    active_dt = _active_started_datetime(active_row, now=now)
+    candidates = [dt for dt in (first_dt, active_dt) if isinstance(dt, datetime)]
+    return min(candidates) if candidates else None
 
 
 def _compose_active_ticket_comment(comment, expire_epoch):
@@ -2094,7 +2232,7 @@ def _repair_active_ticket_epochs(api, router_id, active_rows=None, users_map=Non
         if limit_seconds is None or limit_seconds <= 0:
             continue
 
-        first_used_dt = _parse_first_used_datetime(first_used_map.get(username))
+        first_used_dt = _effective_first_used_datetime(first_used_map.get(username), active_row, now=server_now)
         if first_used_dt:
             expire_dt = first_used_dt + timedelta(seconds=limit_seconds)
         else:
@@ -5687,10 +5825,12 @@ def api_relay_snapshot():
         resources = _parse_relay_snapshot_text(request.get_data(as_text=True))
     saved = db_mod.db_upsert_router_relay_snapshots(router["id"], resources)
     db_mod.db_touch_router_relay(router["id"], "snapshot")
+    expiry = _enforce_relay_snapshot_expirations(router)
     return jsonify({
         "ok": True,
         "saved": saved,
         "router_id": router["id"],
+        "expiry": expiry,
         "server_time": datetime.now().isoformat(),
     })
 
