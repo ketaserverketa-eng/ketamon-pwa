@@ -76,6 +76,22 @@
 
     <!-- Résumé anti-fraude -->
     <div class="card">
+      <div class="card-header"><h3><i class="fa fa-gift"></i> Essai gratuit</h3></div>
+      <div class="card-body">
+        <form method="POST">
+          <input type="hidden" name="action" value="trial">
+          <div class="form-group">
+            <label>Duree d'essai par nouvel utilisateur</label>
+            <input type="number" name="trial_days" class="form-control" min="0" max="3650"
+                   value="{{ cfg.get('trial_days', 45) }}">
+            <small style="color:#64748b">0 = pas d'essai automatique. Par defaut : 45 jours.</small>
+          </div>
+          <button type="submit" class="btn btn-primary btn-sm"><i class="fa fa-save"></i> Enregistrer l'essai</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-header"><h3><i class="fa fa-shield"></i> Anti-fraude actif</h3></div>
       <div class="card-body" style="font-size:13px;display:flex;flex-direction:column;gap:6px">
         <div style="color:#22c55e"><i class="fa fa-check"></i> Montant zéro bloqué</div>

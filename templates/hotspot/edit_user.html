@@ -44,8 +44,8 @@
       </div>
       <div class="form-row">
         <div class="form-group col-6">
-          <label>Limite de temps</label>
-          <input type="text" name="time_limit" class="form-control" value="{{ user.get('limit-uptime','0') }}">
+          <label>Limite de temps <small class="text-muted">(ex: 2H, 30mn, 7D, 1M, 0 = illimité)</small></label>
+          <input type="text" name="time_limit" class="form-control" value="{{ user.get('limit-uptime','0') }}" placeholder="0 = illimité">
         </div>
         <div class="form-group col-6">
           <label>Limite de données (octets)</label>

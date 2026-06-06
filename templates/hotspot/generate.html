@@ -204,7 +204,7 @@
            data-price="{{ pr }}"
            data-currency="{{ cur }}">
         <div class="vch-hdr">
-          <span class="vch-wifi">{{ u.network or 'WiFi' }}</span>
+          <span class="vch-wifi">{{ u.network or '' }}</span>
           <span class="vch-num">[{{ loop.index }}]</span>
         </div>
         <div class="vch-lbl">ketaserver</div>
@@ -285,7 +285,7 @@ function lancerImpression(){
   var cards = Array.from(grid.querySelectorAll('.voucher-card'));
   if(!cards.length) return;
   var wifiEl = cards[0].querySelector('.vch-wifi');
-  var wifiName = wifiEl ? wifiEl.textContent.trim() : 'WiFi';
+  var wifiName = wifiEl ? wifiEl.textContent.trim() : '';
   var d = new Date();
   var pad = function(n){ return n<10?'0'+n:''+n; };
   var dateStr = pad(d.getDate())+'/'+pad(d.getMonth()+1)+'/'+d.getFullYear()

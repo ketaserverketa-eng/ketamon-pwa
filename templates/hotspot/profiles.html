@@ -42,7 +42,7 @@
         <tr>
           <td style="text-align:center;">
             <input type="checkbox" class="chk-profil"
-                   data-id="{{ p.get('id','') }}"
+                   data-id="{{ p.get('id','') or p.get('.id','') or p.get('name','') }}"
                    data-nom="{{ p.get('name','') }}"
                    onchange="majSelection()">
           </td>
@@ -72,7 +72,7 @@
                 style="background:#1e3a5f;color:#93c5fd;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
                 <i class="fa fa-edit"></i> Modifier
               </button>
-              <button onclick="supprimerProfil('{{ p.get('id','') }}','{{ p.get('name','') }}')"
+              <button onclick="supprimerProfil('{{ p.get('id','') or p.get('.id','') or p.get('name','') }}','{{ p.get('name','') }}')"
                 style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
                 <i class="fa fa-trash"></i> Supprimer
               </button>
@@ -108,7 +108,7 @@
       </select>
     </div>
     <div class="form-group">
-      <label>Durée ticket (ex: 1h, 30m, 1d, 0=illimité)</label>
+      <label>Durée ticket (ex: 2H, 30mn, 7D, 1M, 0=illimité)</label>
       <input type="text" id="ed-timelimit" class="form-control" placeholder="0">
     </div>
     <div class="form-group">
@@ -174,7 +174,7 @@ function supprimerProfil(id, nom){
       fetch("{{ url_for('reseau_supprimer_profil') }}", {
         method:"POST",
         headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF},
-        body:JSON.stringify({id})
+        body:JSON.stringify({id, name: nom})
       }).then(r=>r.json()).then(d=>{
         if(d.ok) location.reload();
         else afficherNotif(d.msg || "Erreur.","danger");
@@ -215,7 +215,7 @@ function supprimerSelection(){
           var r = await fetch("{{ url_for('reseau_supprimer_profil') }}", {
             method:"POST",
             headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF},
-            body:JSON.stringify({id: c.dataset.id})
+            body:JSON.stringify({id: c.dataset.id, name: c.dataset.nom})
           });
           var d = await r.json();
           if(!d.ok) erreurs.push(c.dataset.nom);

@@ -9,11 +9,8 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="KetaMon">
 <title>KetaMon — Connexion</title>
-<link rel="manifest" href="/static/manifest.json">
-<link rel="apple-touch-icon" href="/static/img/default-ticket-logo.png">
-{% if adsense_pub_id %}
-<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={{ adsense_pub_id }}" crossorigin="anonymous"></script>
-{% endif %}
+<link rel="manifest" href="/static/manifest.json?v={{ _pwa_ver }}">
+<link rel="apple-touch-icon" href="/static/img/default-ticket-logo.png?v={{ _pwa_ver }}">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0f172a;font-family:system-ui,sans-serif;color:#f8fafc;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
@@ -73,7 +70,7 @@ input:focus{outline:none;border-color:#0ea5e9}
   </div>
 
   <!-- ── HINT ── -->
-  <p id="hint-user" class="hint">Connectez-vous avec votre Gmail. Première fois → créez un compte.</p>
+  <p id="hint-user" class="hint">Connectez-vous avec votre Gmail. Première fois → créez un compte, puis attendez l'activation du concepteur.</p>
   <p id="hint-dev"  class="hint yellow hidden">Accès réservé au Concepteur Développeur</p>
 
   <!-- ══════════════════════════════════════════
@@ -106,7 +103,7 @@ input:focus{outline:none;border-color:#0ea5e9}
     <input type="hidden" name="mode" value="email">
     <input type="hidden" name="submode" value="register">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p style="font-size:13px;color:#94a3b8;text-align:center">Créer votre compte KetaServer</p>
+    <p style="font-size:13px;color:#94a3b8;text-align:center">Créer votre compte KetaServer. Le concepteur devra l'activer avant utilisation.</p>
     <div class="fg">
       <label>Adresse Gmail / Email *</label>
       <input type="email" name="email" placeholder="vous@gmail.com" value="{{ prefill_email or '' }}" required>
@@ -183,7 +180,8 @@ input:focus{outline:none;border-color:#0ea5e9}
     <button type="submit" class="btn">Accéder</button>
   </form>
 
-  <div class="footer"><span>KetaServer Cloud</span><span>•</span><span>Port 5001</span></div>
+  <div class="footer"><span>Gestion MikroTik</span><span>•</span><span>Hotspot & tickets</span></div>
+
 </div>
 
 <script>
@@ -241,18 +239,62 @@ document.querySelectorAll("form").forEach(function(form){
 })();
 </script>
 
-<!-- Footer légal -->
 <footer style="position:fixed;bottom:0;left:0;right:0;text-align:center;padding:8px 16px;font-size:11px;color:#475569;background:#0b1220;border-top:1px solid #1e293b;z-index:100;">
-  <i class="fa fa-wifi" style="color:#0ea5e9"></i> KetaMon &nbsp;|&nbsp;
-  <a href="/a-propos" style="color:#64748b;text-decoration:none;">À propos</a> &nbsp;|&nbsp;
-  <a href="/contact" style="color:#64748b;text-decoration:none;">Contact</a> &nbsp;|&nbsp;
-  <a href="/politique-de-confidentialite" style="color:#64748b;text-decoration:none;">Confidentialité</a>
+  <i class="fa fa-wifi" style="color:#0ea5e9"></i> KetaMon
 </footer>
 
 <script>
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(function(){});
-}
+(function(){
+if (!('serviceWorker' in navigator)) return;
+  var pwaVersion = {{ _pwa_ver|tojson }};
+  var currentCache = 'ketamon-v' + pwaVersion;
+  function storageGet(key) {
+    try { return sessionStorage.getItem(key); } catch(e) { return window[key] || ''; }
+  }
+  function storageSet(key, value) {
+    try { sessionStorage.setItem(key, value); } catch(e) { window[key] = value; }
+  }
+  function clearKetaMonCaches() {
+    if (!('caches' in window)) return Promise.resolve();
+    return caches.keys().then(function(keys){
+      return Promise.all(keys.filter(function(k){
+        return /^ketamon-v/.test(k);
+      }).map(function(k){ return caches.delete(k); }));
+    }).catch(function(){});
+  }
+  window.KetaMonClearPwaCache = function(){
+    return Promise.all([
+      clearKetaMonCaches(),
+      navigator.serviceWorker.getRegistrations
+        ? navigator.serviceWorker.getRegistrations().then(function(regs){
+            return Promise.all(regs.map(function(reg){ return reg.unregister(); }));
+          }).catch(function(){})
+        : Promise.resolve()
+    ]).then(function(){
+      window.location.replace('/login?cache=cleaned&t=' + Date.now());
+    });
+  };
+  if (/[?&]pwa_reset=1\b/.test(window.location.search) || window.location.hash === '#pwa-reset') {
+    window.KetaMonClearPwaCache();
+    return;
+  }
+  if ('caches' in window) {
+    caches.keys().then(function(keys){
+      return Promise.all(keys.filter(function(k){
+        return /^ketamon-v/.test(k) && k !== currentCache;
+      }).map(function(k){ return caches.delete(k); }));
+    }).catch(function(){});
+  }
+  navigator.serviceWorker.register('/sw.js?v=' + encodeURIComponent(pwaVersion)).then(function(reg){
+    if (reg && reg.update) reg.update();
+  }).catch(function(){});
+  navigator.serviceWorker.addEventListener('controllerchange', function(){
+    var reloadKey = 'ktm_sw_reloaded_' + pwaVersion;
+    if (storageGet(reloadKey)) return;
+    storageSet(reloadKey, '1');
+    setTimeout(function(){ window.location.reload(); }, 100);
+  });
+})();
 </script>
 </body>
 </html>

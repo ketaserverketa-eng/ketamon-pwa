@@ -7,7 +7,7 @@ import json
 import os
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 DB_PATH = os.path.join(DATA_DIR, "ketamon.db")
@@ -32,6 +32,15 @@ class DuplicateLocalUserError(ValueError):
         super().__init__(f"Local user already exists: {identity}")
 
 
+class RouterLimitExceededError(ValueError):
+    """Raised when a user tries to own more routers than allowed."""
+
+    def __init__(self, owner_id: str, limit: int = 1):
+        self.owner_id = owner_id
+        self.limit = limit
+        super().__init__(f"Router limit exceeded for {owner_id}: max {limit}")
+
+
 def _load_json_file(path, default):
     if os.path.exists(path):
         with open(path, encoding="utf-8") as fh:
@@ -54,15 +63,26 @@ except Exception:
 
 def get_conn():
     """Connexion SQLite par thread (thread-local) avec WAL activé."""
-    if not hasattr(_local, "conn") or _local.conn is None:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")   # lectures non bloquantes
-        conn.execute("PRAGMA synchronous=NORMAL") # bon compromis perf/sécurité
-        conn.execute("PRAGMA cache_size=-8000")   # 8 Mo de cache
-        conn.execute("PRAGMA foreign_keys=ON")
-        _local.conn = conn
-    return _local.conn
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _local.conn = None
+
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")   # lectures non bloquantes
+    conn.execute("PRAGMA synchronous=NORMAL") # bon compromis perf/sécurité
+    conn.execute("PRAGMA cache_size=-8000")   # 8 Mo de cache
+    conn.execute("PRAGMA foreign_keys=ON")
+    _local.conn = conn
+    return conn
 
 
 def _decrypt_router_password(value):
@@ -103,9 +123,31 @@ def _normalize_router_driver(value):
     return "mikrotik"
 
 
+def _sanitize_router_host(value):
+    host = str(value or "").strip()
+    if any(ch.isspace() for ch in host):
+        return ""
+    return host
+
+
 def _normalize_local_user(user):
     username = str(user.get("username") or user.get("email") or "").strip()
     email = str(user.get("email") or (username if "@" in username else "")).strip()
+    role = str(user.get("role") or "utilisateur").strip() or "utilisateur"
+    approved_raw = user.get("approved", 1)
+    try:
+        approved = 1 if int(approved_raw or 0) else 0
+    except Exception:
+        approved = 1 if str(approved_raw).strip().lower() in {"yes", "true", "on"} else 0
+    disabled_default = 0 if approved else 1
+    disabled_raw = user.get("disabled", disabled_default)
+    try:
+        disabled = 1 if int(disabled_raw or 0) else 0
+    except Exception:
+        disabled = 1 if str(disabled_raw).strip().lower() in {"yes", "true", "on"} else 0
+    approved_at = str(user.get("approved_at") or "").strip()
+    if approved and not approved_at:
+        approved_at = datetime.now().isoformat()
     return {
         "id": str(user.get("id") or uuid.uuid4()),
         "username": username,
@@ -114,22 +156,32 @@ def _normalize_local_user(user):
         "display_name": str(
             user.get("display_name") or user.get("displayName") or username
         ).strip(),
-        "role": str(user.get("role") or "utilisateur").strip() or "utilisateur",
+        "role": role,
         "created_at": str(user.get("created_at") or datetime.now().isoformat()),
+        "disabled": disabled,
+        "approved": approved,
+        "approved_at": approved_at,
     }
 
 
 def _normalize_router(router):
     password = _decrypt_router_password(router.get("password") or "")
+    relay_token = str(router.get("relay_token") or "").strip()
     return {
         "id": str(router.get("id") or uuid.uuid4()),
         "name": str(router.get("name") or "").strip(),
-        "host": str(router.get("host") or "").strip(),
+        "host": _sanitize_router_host(router.get("host")),
+        "fallback_host": _sanitize_router_host(router.get("fallback_host")),
         "port": _normalize_port(router.get("port")),
         "user": str(router.get("user") or "admin").strip() or "admin",
         "password": _encrypt_router_password(password),
         "currency": str(router.get("currency") or "FCFA").strip() or "FCFA",
         "driver": _normalize_router_driver(router.get("driver")),
+        "wifi_name": str(router.get("wifi_name") or "").strip(),
+        "relay_enabled": 1 if int(router.get("relay_enabled") or 0) else 0,
+        "relay_token": relay_token,
+        "relay_last_seen": str(router.get("relay_last_seen") or "").strip(),
+        "relay_status": str(router.get("relay_status") or "").strip(),
         "created_at": str(router.get("created_at") or datetime.now().isoformat()),
     }
 
@@ -151,8 +203,8 @@ def _migrate_legacy_local_users(conn):
             continue
         conn.execute("""
             INSERT OR IGNORE INTO local_users
-            (id, username, email, password, display_name, role, created_at)
-            VALUES (:id, :username, :email, :password, :display_name, :role, :created_at)
+            (id, username, email, password, display_name, role, created_at, disabled, approved, approved_at)
+            VALUES (:id, :username, :email, :password, :display_name, :role, :created_at, :disabled, :approved, :approved_at)
         """, normalized)
         seen.add(key)
 
@@ -245,6 +297,15 @@ def _ensure_hotspot_profile_metadata_columns(conn):
         )
 
 
+def _ensure_ticket_pricing_columns(conn):
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(ticket_pricing)").fetchall()}
+    if not columns:
+        return
+    if "password" not in columns:
+        conn.execute("ALTER TABLE ticket_pricing ADD COLUMN password TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE ticket_pricing SET password=user WHERE TRIM(password)=''")
+
+
 def _migrate_ventes_v1(conn):
     """Migration v1 : supprime les ventes enregistrées à la CRÉATION du ticket.
     Migration v2 : supprime les ventes avec prix=0 (sync sans ticket_pricing).
@@ -277,6 +338,39 @@ def _migrate_ventes_v1(conn):
             ON ventes(router_id, user)
         """)
         conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+    if version < 5:
+        # Migration v5 : ticket_key = identifiant unique du ticket
+        # (username + timestamp d'expiration) pour permettre le recomptage
+        # d'un même username recyclé après expiration d'un ancien ticket.
+        try:
+            conn.execute("ALTER TABLE ventes ADD COLUMN ticket_key TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+        conn.execute("UPDATE ventes SET ticket_key = user WHERE ticket_key = ''")
+        conn.execute("DROP INDEX IF EXISTS idx_ventes_unique_user")
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ventes_unique_ticket
+            ON ventes(router_id, ticket_key)
+        """)
+        conn.execute("PRAGMA user_version = 5")
+        conn.commit()
+    if version < 6:
+        # Migration v6 : nom WiFi par routeur (affiché sur les tickets imprimés)
+        try:
+            conn.execute("ALTER TABLE routers ADD COLUMN wifi_name TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+        conn.execute("PRAGMA user_version = 6")
+        conn.commit()
+
+    if version < 7:
+        # Migration v7 : hote de secours pour VPN prioritaire + fallback auto
+        try:
+            conn.execute("ALTER TABLE routers ADD COLUMN fallback_host TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+        conn.execute("PRAGMA user_version = 7")
         conn.commit()
 
 
@@ -329,7 +423,10 @@ def init_db():
         password     TEXT NOT NULL DEFAULT '',
         display_name TEXT NOT NULL DEFAULT '',
         role         TEXT NOT NULL DEFAULT 'utilisateur',
-        created_at   TEXT DEFAULT (datetime('now'))
+        created_at   TEXT DEFAULT (datetime('now')),
+        disabled     INTEGER NOT NULL DEFAULT 0,
+        approved     INTEGER NOT NULL DEFAULT 1,
+        approved_at  TEXT NOT NULL DEFAULT ''
     );
     CREATE UNIQUE INDEX IF NOT EXISTS uq_local_users_username
         ON local_users(username);
@@ -341,15 +438,44 @@ def init_db():
         id         TEXT PRIMARY KEY,
         name       TEXT NOT NULL,
         host       TEXT NOT NULL,
+        fallback_host TEXT NOT NULL DEFAULT '',
         port       INTEGER NOT NULL DEFAULT 8728,
         user       TEXT NOT NULL DEFAULT 'admin',
         password   TEXT NOT NULL DEFAULT '',
         currency   TEXT NOT NULL DEFAULT 'FCFA',
         driver     TEXT NOT NULL DEFAULT 'mikrotik',
         owner_id   TEXT NOT NULL DEFAULT '',
+        wifi_name  TEXT NOT NULL DEFAULT '',
+        relay_enabled INTEGER NOT NULL DEFAULT 0,
+        relay_token TEXT NOT NULL DEFAULT '',
+        relay_last_seen TEXT NOT NULL DEFAULT '',
+        relay_status TEXT NOT NULL DEFAULT '',
         created_at TEXT DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_routers_name    ON routers(name);
+
+    CREATE TABLE IF NOT EXISTS router_relay_commands (
+        id           TEXT PRIMARY KEY,
+        router_id    TEXT NOT NULL,
+        owner_id     TEXT NOT NULL DEFAULT '',
+        command      TEXT NOT NULL,
+        payload      TEXT NOT NULL DEFAULT '{}',
+        status       TEXT NOT NULL DEFAULT 'queued',
+        result       TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        claimed_at   TEXT NOT NULL DEFAULT '',
+        completed_at TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_relay_commands_router_status
+        ON router_relay_commands(router_id, status, created_at);
+
+    CREATE TABLE IF NOT EXISTS router_relay_snapshots (
+        router_id  TEXT NOT NULL,
+        resource   TEXT NOT NULL,
+        data       TEXT NOT NULL DEFAULT '[]',
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (router_id, resource)
+    );
 
     CREATE TABLE IF NOT EXISTS pay_config (
         key   TEXT PRIMARY KEY,
@@ -389,6 +515,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS ticket_pricing (
         router_id  TEXT NOT NULL,
         user       TEXT NOT NULL,
+        password   TEXT NOT NULL DEFAULT '',
         prix       REAL NOT NULL DEFAULT 0,
         devise     TEXT NOT NULL DEFAULT 'FCFA',
         profil     TEXT NOT NULL DEFAULT '',
@@ -396,16 +523,99 @@ def init_db():
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         PRIMARY KEY (router_id, user)
     );
+
+    CREATE TABLE IF NOT EXISTS agent_incidents (
+        id          TEXT PRIMARY KEY,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+        level       TEXT NOT NULL DEFAULT 'warning',
+        category    TEXT NOT NULL DEFAULT 'general',
+        title       TEXT NOT NULL,
+        description TEXT,
+        router_id   TEXT,
+        router_name TEXT,
+        auto_fixed  INTEGER NOT NULL DEFAULT 0,
+        fix_status  TEXT NOT NULL DEFAULT 'pending',
+        fix_action  TEXT,
+        fix_result  TEXT,
+        resolved    INTEGER NOT NULL DEFAULT 0,
+        resolved_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_incidents_resolved ON agent_incidents(resolved, created_at);
     """)
     _ensure_subscription_reference_constraint(conn)
     _ensure_hotspot_profile_metadata_columns(conn)
+    _ensure_ticket_pricing_columns(conn)
     _migrate_legacy_local_users(conn)
     _migrate_legacy_routers(conn)
     _migrate_ventes_v1(conn)
     _migrate_routers_owner_id(conn)
+    try:
+        conn.execute("ALTER TABLE routers ADD COLUMN fallback_host TEXT NOT NULL DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE routers ADD COLUMN wifi_name TEXT NOT NULL DEFAULT ''")
+    except Exception:
+        pass
+    for sql in (
+        "ALTER TABLE routers ADD COLUMN relay_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE routers ADD COLUMN relay_token TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE routers ADD COLUMN relay_last_seen TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE routers ADD COLUMN relay_status TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            conn.execute(sql)
+        except Exception:
+            pass
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_routers_relay_token ON routers(relay_token)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS router_relay_commands (
+            id           TEXT PRIMARY KEY,
+            router_id    TEXT NOT NULL,
+            owner_id     TEXT NOT NULL DEFAULT '',
+            command      TEXT NOT NULL,
+            payload      TEXT NOT NULL DEFAULT '{}',
+            status       TEXT NOT NULL DEFAULT 'queued',
+            result       TEXT NOT NULL DEFAULT '',
+            created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            claimed_at   TEXT NOT NULL DEFAULT '',
+            completed_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_relay_commands_router_status
+        ON router_relay_commands(router_id, status, created_at)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS router_relay_snapshots (
+            router_id  TEXT NOT NULL,
+            resource   TEXT NOT NULL,
+            data       TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (router_id, resource)
+        )
+    """)
+    conn.commit()
     # Ajoute la colonne disabled si absente (migration non destructive)
     try:
         conn.execute("ALTER TABLE local_users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE local_users ADD COLUMN approved INTEGER NOT NULL DEFAULT 1")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE local_users ADD COLUMN approved_at TEXT NOT NULL DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("""
+            UPDATE local_users
+            SET approved_at = COALESCE(NULLIF(approved_at, ''), created_at, datetime('now'))
+            WHERE CAST(COALESCE(approved, 1) AS INTEGER) = 1
+              AND TRIM(COALESCE(approved_at, '')) = ''
+        """)
     except Exception:
         pass
     conn.commit()
@@ -461,8 +671,8 @@ def db_insert_local_user(user: dict):
         conn = get_conn()
         conn.execute("""
             INSERT INTO local_users
-            (id, username, email, password, display_name, role, created_at)
-            VALUES (:id, :username, :email, :password, :display_name, :role, :created_at)
+            (id, username, email, password, display_name, role, created_at, disabled, approved, approved_at)
+            VALUES (:id, :username, :email, :password, :display_name, :role, :created_at, :disabled, :approved, :approved_at)
         """, record)
         conn.commit()
         return db_get_local_user(record["id"])
@@ -485,6 +695,83 @@ def db_update_local_user_password(identity: str, password_hash: str) -> bool:
     return True
 
 
+def db_upsert_local_email_user(
+    email: str,
+    *,
+    password_hash: str | None = None,
+    display_name: str | None = None,
+    role: str | None = "utilisateur",
+    approved: int | None = None,
+    disabled: int | None = None,
+) -> dict | None:
+    email = str(email or "").strip()
+    if not email:
+        return None
+
+    existing = db_get_local_user(email)
+    conn = get_conn()
+    if existing:
+        fields = []
+        params = []
+        if password_hash is not None:
+            fields.append("password=?")
+            params.append(str(password_hash or ""))
+        if display_name is not None and str(display_name).strip():
+            fields.append("display_name=?")
+            params.append(str(display_name).strip())
+        if role is not None and str(role).strip():
+            fields.append("role=?")
+            params.append(str(role).strip())
+        if approved is not None:
+            approved_val = 1 if int(approved or 0) else 0
+            fields.append("approved=?")
+            params.append(approved_val)
+            if approved_val and not str(existing.get("approved_at") or "").strip():
+                fields.append("approved_at=?")
+                params.append(datetime.now().isoformat())
+        if disabled is not None:
+            fields.append("disabled=?")
+            params.append(1 if int(disabled or 0) else 0)
+        if fields:
+            params.append(existing["id"])
+            conn.execute(
+                f"UPDATE local_users SET {', '.join(fields)} WHERE id=?",
+                tuple(params)
+            )
+            conn.commit()
+        return db_get_local_user(existing["id"])
+
+    record = _normalize_local_user({
+        "id": str(uuid.uuid4()),
+        "username": email,
+        "email": email,
+        "password": str(password_hash or ""),
+        "display_name": display_name or email,
+        "role": role or "utilisateur",
+        "approved": 0 if approved is None else approved,
+        "disabled": 1 if disabled is None else disabled,
+        "approved_at": datetime.now().isoformat() if int(approved or 0) else "",
+    })
+    return db_insert_local_user(record)
+
+
+def db_set_local_user_active(identity: str, active: bool) -> dict | None:
+    user = db_get_local_user(identity)
+    if not user:
+        return None
+    conn = get_conn()
+    if active:
+        approved_at = str(user.get("approved_at") or "").strip() or datetime.now().isoformat()
+        conn.execute(
+            "UPDATE local_users SET disabled=0, approved=1, approved_at=? WHERE id=?",
+            (approved_at, user["id"])
+        )
+    else:
+        conn.execute("UPDATE local_users SET disabled=1 WHERE id=?", (user["id"],))
+    conn.commit()
+    return db_get_local_user(user["id"])
+
+
 def db_get_routers(owner_id=None):
     """Retourne les routeurs. Si owner_id fourni, filtre sur ce propriétaire."""
     conn = get_conn()
@@ -501,8 +788,289 @@ def db_get_routers(owner_id=None):
     for row in rows:
         router = dict(row)
         router["password"] = _decrypt_router_password(router.get("password", ""))
+        router["host"] = _sanitize_router_host(router.get("host"))
+        router["fallback_host"] = _sanitize_router_host(router.get("fallback_host"))
         routers.append(router)
     return routers
+
+
+def db_count_routers(owner_id: str | None) -> int:
+    owner = str(owner_id or "").strip()
+    if not owner:
+        return 0
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM routers WHERE owner_id=?",
+        (owner,)
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def db_get_router(router_id: str, owner_id: str | None = None):
+    router_id = str(router_id or "").strip()
+    if not router_id:
+        return None
+    conn = get_conn()
+    if owner_id:
+        row = conn.execute(
+            "SELECT * FROM routers WHERE id=? AND owner_id=?",
+            (router_id, str(owner_id))
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM routers WHERE id=?", (router_id,)).fetchone()
+    if not row:
+        return None
+    router = dict(row)
+    router["password"] = _decrypt_router_password(router.get("password", ""))
+    router["host"] = _sanitize_router_host(router.get("host"))
+    router["fallback_host"] = _sanitize_router_host(router.get("fallback_host"))
+    return router
+
+
+def db_set_router_relay(router_id: str, owner_id: str | None, *, enabled=None, token=None):
+    router = db_get_router(router_id, owner_id)
+    if not router:
+        return None
+    fields = []
+    params = []
+    if enabled is not None:
+        fields.append("relay_enabled=?")
+        params.append(1 if enabled else 0)
+    if token is not None:
+        fields.append("relay_token=?")
+        params.append(str(token or "").strip())
+    if not fields:
+        return router
+    params.append(str(router_id))
+    if owner_id:
+        params.append(str(owner_id))
+        where = "id=? AND owner_id=?"
+    else:
+        where = "id=?"
+    conn = get_conn()
+    conn.execute(f"UPDATE routers SET {', '.join(fields)} WHERE {where}", tuple(params))
+    conn.commit()
+    return db_get_router(router_id, owner_id)
+
+
+def db_get_router_by_relay_token(token: str):
+    token = str(token or "").strip()
+    if not token:
+        return None
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM routers WHERE relay_enabled=1 AND relay_token=?",
+        (token,)
+    ).fetchone()
+    if not row:
+        return None
+    router = dict(row)
+    router["password"] = _decrypt_router_password(router.get("password", ""))
+    router["host"] = _sanitize_router_host(router.get("host"))
+    router["fallback_host"] = _sanitize_router_host(router.get("fallback_host"))
+    return router
+
+
+def db_touch_router_relay(router_id: str, status: str = "online"):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE routers SET relay_last_seen=?, relay_status=? WHERE id=?",
+        (datetime.now().isoformat(), str(status or "online"), str(router_id or ""))
+    )
+    conn.commit()
+
+
+def db_enqueue_router_relay_command(router_id: str, owner_id: str | None, command: str, payload=None):
+    payload_text = json.dumps(payload or {}, ensure_ascii=False)
+    row = {
+        "id": str(uuid.uuid4()),
+        "router_id": str(router_id or ""),
+        "owner_id": str(owner_id or ""),
+        "command": str(command or "").strip(),
+        "payload": payload_text,
+        "created_at": datetime.now().isoformat(),
+    }
+    if not row["router_id"] or not row["command"]:
+        return None
+    conn = get_conn()
+    existing = conn.execute("""
+        SELECT *
+        FROM router_relay_commands
+        WHERE router_id=? AND command=? AND payload=? AND status='queued'
+        ORDER BY created_at ASC
+        LIMIT 1
+    """, (row["router_id"], row["command"], row["payload"])).fetchone()
+    if existing:
+        return dict(existing)
+    conn.execute("""
+        INSERT INTO router_relay_commands
+        (id, router_id, owner_id, command, payload, status, created_at)
+        VALUES (:id, :router_id, :owner_id, :command, :payload, 'queued', :created_at)
+    """, row)
+    conn.commit()
+    return db_get_router_relay_command(row["id"])
+
+
+def db_get_router_relay_command(command_id: str):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM router_relay_commands WHERE id=?",
+        (str(command_id or ""),)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def db_claim_next_router_relay_command(router_id: str):
+    conn = get_conn()
+    threshold = (datetime.now() - timedelta(minutes=10)).isoformat()
+    conn.execute("""
+        UPDATE router_relay_commands
+        SET status='queued', claimed_at=''
+        WHERE router_id=?
+          AND status='claimed'
+          AND COALESCE(completed_at, '')=''
+          AND COALESCE(claimed_at, '') < ?
+    """, (str(router_id or ""), threshold))
+    row = conn.execute("""
+        SELECT *
+        FROM router_relay_commands
+        WHERE router_id=? AND status='queued'
+        ORDER BY
+          CASE
+            WHEN command='routeros-script' AND payload LIKE '%/ip hotspot user add name=%' THEN 0
+            WHEN command='ping' THEN 1
+            WHEN command='routeros-script' AND payload LIKE '%restored-from-database%' THEN 3
+            ELSE 2
+          END,
+          created_at ASC
+        LIMIT 1
+    """, (str(router_id or ""),)).fetchone()
+    if not row:
+        return None
+    command_id = row["id"]
+    conn.execute(
+        "UPDATE router_relay_commands SET status='claimed', claimed_at=? WHERE id=? AND status='queued'",
+        (datetime.now().isoformat(), command_id)
+    )
+    conn.commit()
+    return db_get_router_relay_command(command_id)
+
+
+def db_complete_router_relay_command(command_id: str, router_id: str, ok: bool, result=None):
+    status = "done" if ok else "error"
+    if isinstance(result, str):
+        result_text = result
+    else:
+        result_text = json.dumps(result or {}, ensure_ascii=False)
+    conn = get_conn()
+    cur = conn.execute("""
+        UPDATE router_relay_commands
+        SET status=?, result=?, completed_at=?
+        WHERE id=? AND router_id=?
+    """, (
+        status,
+        result_text[:10000],
+        datetime.now().isoformat(),
+        str(command_id or ""),
+        str(router_id or ""),
+    ))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def db_get_router_relay_commands(router_id: str, limit: int = 10):
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT *
+        FROM router_relay_commands
+        WHERE router_id=?
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (str(router_id or ""), max(1, min(int(limit or 10), 100)))).fetchall()
+    return [dict(r) for r in rows]
+
+
+def db_upsert_router_relay_snapshots(router_id: str, resources: dict):
+    router_id = str(router_id or "").strip()
+    if not router_id or not isinstance(resources, dict):
+        return 0
+    now = datetime.now().isoformat()
+    rows = []
+    for resource, data in resources.items():
+        resource = str(resource or "").strip()
+        if not resource:
+            continue
+        if isinstance(data, dict):
+            normalized = [data]
+        elif isinstance(data, list):
+            normalized = [dict(item) for item in data if isinstance(item, dict)]
+        else:
+            normalized = []
+        rows.append({
+            "router_id": router_id,
+            "resource": resource,
+            "data": json.dumps(normalized, ensure_ascii=False),
+            "updated_at": now,
+        })
+    if not rows:
+        return 0
+    conn = get_conn()
+    conn.executemany("""
+        INSERT INTO router_relay_snapshots(router_id, resource, data, updated_at)
+        VALUES(:router_id, :resource, :data, :updated_at)
+        ON CONFLICT(router_id, resource)
+        DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at
+    """, rows)
+    conn.commit()
+    return len(rows)
+
+
+def db_get_router_relay_snapshot(router_id: str, resource: str | None = None):
+    router_id = str(router_id or "").strip()
+    if not router_id:
+        return {} if resource is None else []
+    conn = get_conn()
+    if resource is not None:
+        row = conn.execute("""
+            SELECT data
+            FROM router_relay_snapshots
+            WHERE router_id=? AND resource=?
+            LIMIT 1
+        """, (router_id, str(resource or "").strip())).fetchone()
+        if not row:
+            return []
+        try:
+            data = json.loads(row["data"] or "[]")
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+    rows = conn.execute("""
+        SELECT resource, data, updated_at
+        FROM router_relay_snapshots
+        WHERE router_id=?
+    """, (router_id,)).fetchall()
+    out = {}
+    for row in rows:
+        try:
+            data = json.loads(row["data"] or "[]")
+        except Exception:
+            data = []
+        out[str(row["resource"])] = {
+            "data": data if isinstance(data, list) else [],
+            "updated_at": row["updated_at"],
+        }
+    return out
+
+
+def db_get_router_counts_by_owner() -> dict:
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT owner_id, COUNT(*) AS count
+        FROM routers
+        WHERE TRIM(COALESCE(owner_id, '')) <> ''
+        GROUP BY owner_id
+    """).fetchall()
+    return {str(r["owner_id"] or ""): int(r["count"] or 0) for r in rows}
 
 
 def db_replace_routers(routers, owner_id=None):
@@ -522,8 +1090,10 @@ def db_replace_routers(routers, owner_id=None):
             conn.execute("DELETE FROM routers")
         conn.executemany("""
             INSERT INTO routers
-            (id, name, host, port, user, password, currency, driver, owner_id, created_at)
-            VALUES (:id, :name, :host, :port, :user, :password, :currency, :driver, :owner_id, :created_at)
+            (id, name, host, fallback_host, port, user, password, currency, driver, owner_id,
+             relay_enabled, relay_token, relay_last_seen, relay_status, created_at)
+            VALUES (:id, :name, :host, :fallback_host, :port, :user, :password, :currency, :driver, :owner_id,
+                    :relay_enabled, :relay_token, :relay_last_seen, :relay_status, :created_at)
         """, normalized)
 
 
@@ -531,11 +1101,15 @@ def db_add_router(router_data: dict, owner_id: str) -> dict:
     """Ajoute un routeur appartenant à owner_id et retourne l'enregistrement créé."""
     record = _normalize_router(router_data)
     record["owner_id"] = str(owner_id or "")
+    if record["owner_id"] and db_count_routers(record["owner_id"]) >= 1:
+        raise RouterLimitExceededError(record["owner_id"], limit=1)
     conn = get_conn()
     conn.execute("""
         INSERT INTO routers
-        (id, name, host, port, user, password, currency, driver, owner_id, created_at)
-        VALUES (:id, :name, :host, :port, :user, :password, :currency, :driver, :owner_id, :created_at)
+        (id, name, host, fallback_host, port, user, password, currency, driver, owner_id,
+         relay_enabled, relay_token, relay_last_seen, relay_status, created_at)
+        VALUES (:id, :name, :host, :fallback_host, :port, :user, :password, :currency, :driver, :owner_id,
+                :relay_enabled, :relay_token, :relay_last_seen, :relay_status, :created_at)
     """, record)
     conn.commit()
     record["password"] = _decrypt_router_password(record["password"])
@@ -558,7 +1132,7 @@ def db_delete_router(router_id: str, owner_id: str | None = None) -> bool:
 
 def db_update_router(router_id: str, owner_id: str | None, fields: dict) -> bool:
     """Met à jour les champs d'un routeur. Retourne True si une ligne a été modifiée."""
-    allowed = {"name", "host", "port", "user", "password", "currency", "driver"}
+    allowed = {"name", "host", "fallback_host", "port", "user", "password", "currency", "driver", "wifi_name"}
     updates = {}
     for k, v in fields.items():
         if k not in allowed:
@@ -569,6 +1143,8 @@ def db_update_router(router_id: str, owner_id: str | None, fields: dict) -> bool
             updates[k] = _normalize_port(v)
         elif k == "driver":
             updates[k] = _normalize_router_driver(v)
+        elif k in {"host", "fallback_host"}:
+            updates[k] = _sanitize_router_host(v)
         else:
             updates[k] = str(v or "").strip()
     if not updates:
@@ -695,7 +1271,17 @@ def db_delete_plan(plan_id: str):
 
 # ── Abonnements ───────────────────────────────────────────────────────────────
 
+def db_expire_old_subscriptions():
+    conn = get_conn()
+    conn.execute("""
+        UPDATE subscriptions SET statut='expire'
+        WHERE statut='actif' AND expire_le IS NOT NULL AND expire_le < ?
+    """, (datetime.utcnow().isoformat(),))
+    conn.commit()
+
+
 def db_get_subscriptions(user_id=None):
+    db_expire_old_subscriptions()
     conn = get_conn()
     if user_id:
         rows = conn.execute(
@@ -719,6 +1305,7 @@ def db_get_subscriptions(user_id=None):
 
 def db_get_active_sub(user_id: str):
     """Retourne l'abonnement actif de l'utilisateur ou None."""
+    db_expire_old_subscriptions()
     now  = datetime.utcnow().isoformat()
     conn = get_conn()
     row  = conn.execute("""
@@ -795,6 +1382,7 @@ def db_delete_sub(sub_id: str):
 
 _DEFAULT_PAY_CFG = {
     "devise_base": "FCFA",
+    "trial_days": 45,
     "taux_change": {"USD": 606.0, "EUR": 655.0, "FCFA": 1.0, "XOF": 1.0},
     "tolerance_pct": 0,
     "methodes": [
@@ -831,8 +1419,8 @@ def db_save_pay_config(cfg: dict):
 def db_insert_vente(vente: dict):
     conn = get_conn()
     conn.execute(
-        """INSERT OR IGNORE INTO ventes(id,router_id,date,heure,user,profil,prix,devise,reseau,data_limit)
-           VALUES(:id,:router_id,:date,:heure,:user,:profil,:prix,:devise,:reseau,:data_limit)""",
+        """INSERT OR IGNORE INTO ventes(id,router_id,date,heure,user,profil,prix,devise,reseau,data_limit,ticket_key)
+           VALUES(:id,:router_id,:date,:heure,:user,:profil,:prix,:devise,:reseau,:data_limit,:ticket_key)""",
         vente
     )
     conn.commit()
@@ -852,6 +1440,7 @@ def db_batch_upsert_ticket_pricing(data_list: list):
         {
             "router_id": d.get("router_id", ""),
             "user":      d.get("user", ""),
+            "password":  d.get("password", "") or d.get("pass", "") or d.get("user", "") or "",
             "prix":      float(d.get("prix", 0) or 0),
             "devise":    d.get("devise", "FCFA") or "FCFA",
             "profil":    d.get("profil", "") or "",
@@ -860,24 +1449,81 @@ def db_batch_upsert_ticket_pricing(data_list: list):
         for d in data_list
     ]
     conn.executemany(
-        """INSERT INTO ticket_pricing(router_id,user,prix,devise,profil,reseau)
-           VALUES(:router_id,:user,:prix,:devise,:profil,:reseau)
+        """INSERT INTO ticket_pricing(router_id,user,password,prix,devise,profil,reseau)
+           VALUES(:router_id,:user,:password,:prix,:devise,:profil,:reseau)
            ON CONFLICT(router_id,user) DO UPDATE SET
-               prix=excluded.prix, devise=excluded.devise,
+               password=excluded.password, prix=excluded.prix, devise=excluded.devise,
                profil=excluded.profil, reseau=excluded.reseau""",
         rows
     )
     conn.commit()
 
 
-def db_get_ventes(router_id: str, date_from: str = "", date_to: str = "",
-                  jour: str = "", mois: str = "", annee: str = "", q: str = "", profil: str = ""):
+def db_delete_ticket_pricing(router_id: str, users) -> int:
+    """Supprime de la DB les tickets/prix qui n'existent plus sur le MikroTik."""
+    router_id = str(router_id or "").strip()
+    usernames = sorted({
+        str(user or "").strip()
+        for user in (users or [])
+        if str(user or "").strip()
+    })
+    if not router_id or not usernames:
+        return 0
+
     conn = get_conn()
-    clauses = ["router_id = ?"]
-    params  = [router_id]
-    # Utilise LIKE prefix quand c'est possible pour que idx_ventes_router_date soit utilisé
+    before = conn.total_changes
+    conn.executemany(
+        "DELETE FROM ticket_pricing WHERE router_id=? AND user=?",
+        [(router_id, username) for username in usernames],
+    )
+    conn.commit()
+    return max(conn.total_changes - before, 0)
+
+
+def db_prune_missing_ticket_pricing(router_id: str, existing_users) -> int:
+    """Nettoie les tickets/prix DB absents de /ip/hotspot/user pour ce routeur."""
+    router_id = str(router_id or "").strip()
+    if not router_id:
+        return 0
+
+    existing = {
+        str(user or "").strip()
+        for user in (existing_users or [])
+        if str(user or "").strip()
+    }
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT user FROM ticket_pricing WHERE router_id=?",
+        (router_id,),
+    ).fetchall()
+    missing = [
+        str(row["user"] or "").strip()
+        for row in rows
+        if str(row["user"] or "").strip() and str(row["user"] or "").strip() not in existing
+    ]
+    return db_delete_ticket_pricing(router_id, missing)
+
+
+def _router_clause(router_ids):
+    """Retourne (clause SQL, params) pour filtrer par un ou plusieurs router_ids."""
+    if isinstance(router_ids, str):
+        router_ids = [router_ids]
+    router_ids = [r for r in router_ids if r]
+    if not router_ids:
+        return "1=0", []
+    if len(router_ids) == 1:
+        return "router_id = ?", [router_ids[0]]
+    placeholders = ",".join("?" * len(router_ids))
+    return f"router_id IN ({placeholders})", list(router_ids)
+
+
+def db_get_ventes(router_id, date_from: str = "",
+                  jour: str = "", mois: str = "", annee: str = "", q: str = "", profil: str = ""):
+    """router_id peut être un str ou une liste de str."""
+    conn = get_conn()
+    rid_clause, params = _router_clause(router_id)
+    clauses = [rid_clause]
     if annee and mois:
-        # Range exact mois — utilise l'index sur date
         try:
             y, m = int(annee), int(mois)
             nm, ny = (m + 1, y) if m < 12 else (1, y + 1)
@@ -906,15 +1552,18 @@ def db_get_ventes(router_id: str, date_from: str = "", date_to: str = "",
     sql = "SELECT * FROM ventes WHERE " + " AND ".join(clauses) + " ORDER BY date DESC, heure DESC"
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
-def db_get_ventes_summary(router_id: str, today_str: str, month_str: str):
+
+def db_get_ventes_summary(router_id, today_str: str, month_str: str):
+    """router_id peut être un str ou une liste de str (tous les routeurs de l'utilisateur)."""
     conn = get_conn()
+    rid_clause, base_params = _router_clause(router_id)
     today = conn.execute(
-        "SELECT COUNT(*) cnt, COALESCE(SUM(prix),0) tot, devise FROM ventes WHERE router_id=? AND date=? GROUP BY devise ORDER BY tot DESC LIMIT 1",
-        (router_id, today_str)
+        f"SELECT COUNT(*) cnt, COALESCE(SUM(prix),0) tot, devise FROM ventes WHERE {rid_clause} AND date=? GROUP BY devise ORDER BY tot DESC LIMIT 1",
+        base_params + [today_str]
     ).fetchone()
     month = conn.execute(
-        "SELECT COUNT(*) cnt, COALESCE(SUM(prix),0) tot, devise FROM ventes WHERE router_id=? AND date LIKE ? GROUP BY devise ORDER BY tot DESC LIMIT 1",
-        (router_id, f"{month_str}-%")
+        f"SELECT COUNT(*) cnt, COALESCE(SUM(prix),0) tot, devise FROM ventes WHERE {rid_clause} AND date LIKE ? GROUP BY devise ORDER BY tot DESC LIMIT 1",
+        base_params + [f"{month_str}-%"]
     ).fetchone()
     today = dict(today) if today else {}
     month = dict(month) if month else {}
@@ -939,5 +1588,126 @@ def db_delete_ventes_mois(router_id: str, mois: str) -> int:
         "DELETE FROM ventes WHERE router_id=? AND date LIKE ?",
         (router_id, f"{mois}-%")
     )
+    conn.commit()
+    return cur.rowcount
+
+
+# ── Agent incidents ────────────────────────────────────────────────────────────
+
+def db_agent_create_incident(level: str, category: str, title: str,
+                              description: str = "", router_id: str = "",
+                              router_name: str = "", fix_action: str = "",
+                              auto_fixed: bool = False) -> str:
+    conn = get_conn()
+    inc_id = str(uuid.uuid4())
+    fix_status = "auto_fixed" if auto_fixed else "pending"
+    conn.execute(
+        """INSERT INTO agent_incidents
+           (id, level, category, title, description, router_id, router_name,
+            auto_fixed, fix_status, fix_action)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (inc_id, level, category, title, description,
+         router_id or "", router_name or "",
+         1 if auto_fixed else 0, fix_status, fix_action or "")
+    )
+    conn.commit()
+    return inc_id
+
+
+def db_agent_incident_exists(category: str, router_id: str = "", title: str = "") -> bool:
+    """Vérifie si un incident non résolu du même type existe déjà (évite les doublons)."""
+    conn = get_conn()
+    if router_id:
+        row = conn.execute(
+            "SELECT id FROM agent_incidents WHERE category=? AND router_id=? AND title=? AND resolved=0",
+            (category, router_id, title)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id FROM agent_incidents WHERE category=? AND title=? AND resolved=0",
+            (category, title)
+        ).fetchone()
+    return row is not None
+
+
+def db_agent_get_incidents(resolved: bool = False, limit: int = 100) -> list:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM agent_incidents WHERE resolved=? ORDER BY created_at DESC LIMIT ?",
+        (1 if resolved else 0, limit)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def db_agent_count_open() -> int:
+    conn = get_conn()
+    row = conn.execute("SELECT COUNT(*) FROM agent_incidents WHERE resolved=0").fetchone()
+    return row[0] if row else 0
+
+
+def db_agent_get_incident(inc_id: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM agent_incidents WHERE id=?", (inc_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def db_agent_approve_incident(inc_id: str) -> bool:
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE agent_incidents SET fix_status='approved' WHERE id=? AND resolved=0",
+        (inc_id,)
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def db_agent_reject_incident(inc_id: str) -> bool:
+    conn = get_conn()
+    cur = conn.execute(
+        """UPDATE agent_incidents SET fix_status='rejected', resolved=1,
+           resolved_at=datetime('now','localtime') WHERE id=?""",
+        (inc_id,)
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def db_agent_resolve_incident(inc_id: str, fix_result: str = "") -> bool:
+    conn = get_conn()
+    cur = conn.execute(
+        """UPDATE agent_incidents SET resolved=1, fix_status='done',
+           fix_result=?, resolved_at=datetime('now','localtime') WHERE id=?""",
+        (fix_result, inc_id)
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def db_agent_requeue_incident(inc_id: str, fix_result: str = "") -> bool:
+    conn = get_conn()
+    cur = conn.execute(
+        """UPDATE agent_incidents
+           SET fix_status='pending', fix_result=?, resolved=0, resolved_at=NULL
+           WHERE id=? AND resolved=0""",
+        (fix_result, inc_id)
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def db_agent_resolve_by_category(category: str, router_id: str = "") -> int:
+    conn = get_conn()
+    if router_id:
+        cur = conn.execute(
+            """UPDATE agent_incidents SET resolved=1, resolved_at=datetime('now','localtime')
+               WHERE category=? AND router_id=? AND resolved=0""",
+            (category, router_id)
+        )
+    else:
+        cur = conn.execute(
+            """UPDATE agent_incidents SET resolved=1, resolved_at=datetime('now','localtime')
+               WHERE category=? AND resolved=0""",
+            (category,)
+        )
     conn.commit()
     return cur.rowcount

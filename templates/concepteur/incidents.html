@@ -1,0 +1,338 @@
+{% extends "base.html" %}
+{% block title %}- Agent KetaMon{% endblock %}
+{% block page_title %}Agent KetaMon — Contrôle & Incidents{% endblock %}
+
+{% block content %}
+<style>
+.agent-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:16px}
+.agent-stat{background:#0f172a;border:1px solid #1e2d42;border-radius:10px;padding:14px;text-align:center}
+.agent-stat .val{font-size:22px;font-weight:700;color:#38bdf8}
+.agent-stat .lbl{font-size:11px;color:#64748b;margin-top:2px}
+.inc-card{background:#0f172a;border:1px solid #1e2d42;border-radius:10px;padding:16px;margin-bottom:10px}
+.inc-card.critical{border-left:4px solid #ef4444}
+.inc-card.warning{border-left:4px solid #f59e0b}
+.inc-card.info{border-left:4px solid #3b82f6}
+.badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700}
+.badge.critical{background:rgba(239,68,68,.2);color:#f87171}
+.badge.warning{background:rgba(245,158,11,.2);color:#fbbf24}
+.badge.info{background:rgba(59,130,246,.2);color:#60a5fa}
+.badge.pending{background:rgba(100,116,139,.2);color:#94a3b8}
+.badge.approved{background:rgba(34,197,94,.2);color:#4ade80}
+.badge.rejected{background:rgba(239,68,68,.2);color:#f87171}
+.badge.done{background:rgba(34,197,94,.15);color:#86efac}
+.badge.auto_fixed{background:rgba(139,92,246,.2);color:#a78bfa}
+.inc-title{font-size:14px;font-weight:600;color:#f1f5f9;margin:6px 0 4px}
+.inc-desc{font-size:12px;color:#94a3b8;white-space:pre-wrap;word-break:break-word;max-height:80px;overflow:hidden;transition:max-height .3s}
+.inc-desc.expanded{max-height:400px}
+.inc-fix-result{margin-top:8px;padding:8px 10px;background:#0a1120;border:1px solid #1e2d42;border-radius:8px;font-size:12px;color:#fbbf24;white-space:pre-wrap;word-break:break-word}
+.inc-meta{font-size:11px;color:#64748b;margin-top:6px}
+.tab-btn{padding:7px 18px;border-radius:8px;border:none;cursor:pointer;font-size:13px;font-weight:600;transition:all .2s}
+.tab-btn.active{background:#0ea5e9;color:#fff}
+.tab-btn.inactive{background:#1e2d42;color:#94a3b8}
+.ctrl-btn{padding:7px 14px;border:none;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s}
+.pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+</style>
+
+<!-- ═══ PANNEAU DE CONTROLE ═══ -->
+<div class="card" style="margin-bottom:16px">
+  <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+    <h3 style="margin:0"><i class="fa fa-cogs"></i> Contrôle Agent
+      <span id="agent-status-dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#22c55e;margin-left:8px;vertical-align:middle"></span>
+      <span id="agent-status-label" style="font-size:12px;color:#22c55e;margin-left:4px">Actif</span>
+    </h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="ctrl-btn" style="background:#0ea5e9;color:#fff" onclick="forceRun()">
+        <i class="fa fa-bolt"></i> Forcer cycle
+      </button>
+      <button id="btn-pause" class="ctrl-btn" style="background:#f59e0b;color:#000" onclick="togglePause()">
+        <i class="fa fa-pause"></i> Pause agent
+      </button>
+      <a href="{{ url_for('concepteur_incidents') }}" class="ctrl-btn" style="background:#1e2d42;color:#94a3b8;text-decoration:none">
+        <i class="fa fa-refresh"></i> Rafraîchir
+      </a>
+    </div>
+  </div>
+
+  <!-- Stats temps-réel -->
+  <div style="padding:14px">
+    <div class="agent-grid" id="agent-stats-grid">
+      <div class="agent-stat"><div class="val" id="st-tickets-expired">—</div><div class="lbl">Tickets expirés</div></div>
+      <div class="agent-stat"><div class="val" id="st-epochs-written">—</div><div class="lbl">Epochs écrits</div></div>
+      <div class="agent-stat"><div class="val" id="st-ventes-synced">—</div><div class="lbl">Ventes synchro</div></div>
+      <div class="agent-stat"><div class="val" id="st-expiry-cycles">—</div><div class="lbl">Cycles expiration</div></div>
+      <div class="agent-stat"><div class="val" id="st-monitor-cycles">—</div><div class="lbl">Cycles moniteur</div></div>
+      <div class="agent-stat"><div class="val" id="st-revenue-cycles">—</div><div class="lbl">Cycles revenus</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px;font-size:12px;color:#64748b">
+      <div><i class="fa fa-clock-o"></i> Dernier cycle expiration : <span id="st-last-exp" style="color:#94a3b8">—</span></div>
+      <div><i class="fa fa-clock-o"></i> Dernier cycle moniteur : <span id="st-last-mon" style="color:#94a3b8">—</span></div>
+      <div><i class="fa fa-clock-o"></i> Dernier cycle revenus : <span id="st-last-rev" style="color:#94a3b8">—</span></div>
+      <div><i class="fa fa-calendar"></i> Démarré le : <span id="st-started" style="color:#94a3b8">—</span></div>
+    </div>
+
+    <!-- Erreurs récentes -->
+    <div id="agent-errors-wrap" style="display:none;margin-top:10px">
+      <div style="font-size:12px;color:#f87171;font-weight:600;margin-bottom:4px"><i class="fa fa-exclamation-triangle"></i> Dernières erreurs agent :</div>
+      <div id="agent-errors" style="font-size:11px;color:#94a3b8;background:#0a1120;border-radius:6px;padding:8px;font-family:monospace;max-height:100px;overflow-y:auto"></div>
+    </div>
+  </div>
+
+  <!-- Configuration -->
+  <div style="padding:0 14px 14px">
+    <details style="border:1px solid #1e2d42;border-radius:8px">
+      <summary style="padding:10px 14px;cursor:pointer;font-size:13px;color:#94a3b8;font-weight:600">
+        <i class="fa fa-sliders"></i> Configuration des intervalles
+      </summary>
+      <div style="padding:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px">
+        <div>
+          <label style="font-size:12px;color:#64748b;display:block;margin-bottom:4px">Expiration (secondes)</label>
+          <input type="number" id="cfg-expiry" min="10" value="60"
+            style="width:100%;background:#0a1120;border:1px solid #1e2d42;color:#f1f5f9;border-radius:6px;padding:6px 10px;font-size:13px">
+        </div>
+        <div>
+          <label style="font-size:12px;color:#64748b;display:block;margin-bottom:4px">Moniteur (secondes)</label>
+          <input type="number" id="cfg-monitor" min="10" value="90"
+            style="width:100%;background:#0a1120;border:1px solid #1e2d42;color:#f1f5f9;border-radius:6px;padding:6px 10px;font-size:13px">
+        </div>
+        <div>
+          <label style="font-size:12px;color:#64748b;display:block;margin-bottom:4px">Revenus (secondes)</label>
+          <input type="number" id="cfg-revenue" min="10" value="45"
+            style="width:100%;background:#0a1120;border:1px solid #1e2d42;color:#f1f5f9;border-radius:6px;padding:6px 10px;font-size:13px">
+        </div>
+        <div>
+          <label style="font-size:12px;color:#64748b;display:block;margin-bottom:4px">Alerte sync retard (min)</label>
+          <input type="number" id="cfg-stale" min="1" value="10"
+            style="width:100%;background:#0a1120;border:1px solid #1e2d42;color:#f1f5f9;border-radius:6px;padding:6px 10px;font-size:13px">
+        </div>
+      </div>
+      <div style="padding:0 14px 14px">
+        <button onclick="saveConfig()" class="ctrl-btn" style="background:#22c55e;color:#fff">
+          <i class="fa fa-save"></i> Enregistrer la configuration
+        </button>
+      </div>
+    </details>
+  </div>
+</div>
+
+<!-- ═══ INCIDENTS ═══ -->
+<div class="card" style="margin-bottom:12px">
+  <div class="card-header">
+    <h3 style="margin:0"><i class="fa fa-bell"></i> Incidents
+      {% if open_incidents %}
+      <span style="background:#ef4444;color:#fff;border-radius:20px;padding:2px 10px;font-size:13px;margin-left:8px">{{ open_incidents|length }}</span>
+      {% endif %}
+    </h3>
+  </div>
+</div>
+
+<!-- Onglets -->
+<div style="display:flex;gap:8px;margin-bottom:14px">
+  <button id="tab-open" class="tab-btn active" onclick="showTab('open')">
+    Ouverts ({{ open_incidents|length }})
+  </button>
+  <button id="tab-closed" class="tab-btn inactive" onclick="showTab('closed')">
+    Résolus ({{ closed_incidents|length }})
+  </button>
+</div>
+
+<!-- Incidents ouverts -->
+<div id="panel-open">
+  {% if not open_incidents %}
+  <div style="text-align:center;padding:40px;color:#64748b">
+    <i class="fa fa-check-circle" style="font-size:36px;color:#22c55e;display:block;margin-bottom:10px"></i>
+    <strong style="color:#e2e8f0">Aucun incident — système fonctionnel.</strong>
+  </div>
+  {% endif %}
+  {% for inc in open_incidents %}
+  <div class="inc-card {{ inc.level }}" id="inc-{{ inc.id }}">
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <span class="badge {{ inc.level }}">{{ inc.level }}</span>
+      <span class="badge" style="background:rgba(14,165,233,.15);color:#38bdf8">{{ inc.category }}</span>
+      {% if inc.router_name %}<span class="badge" style="background:rgba(139,92,246,.15);color:#a78bfa"><i class="fa fa-wifi"></i> {{ inc.router_name }}</span>{% endif %}
+      <span class="badge {{ inc.fix_status }}">{{ inc.fix_status }}</span>
+    </div>
+    <div class="inc-title">{{ inc.title }}</div>
+    {% if inc.description %}
+    <div class="inc-desc" id="desc-{{ inc.id }}">{{ inc.description }}</div>
+    {% if inc.description|length > 100 %}
+    <a href="#" onclick="toggleDesc('{{ inc.id }}');return false" style="font-size:11px;color:#0ea5e9">Voir plus/moins</a>
+    {% endif %}
+    {% endif %}
+    <div class="inc-meta">
+      <i class="fa fa-clock-o"></i> {{ inc.created_at }}
+      {% if inc.fix_action %} &nbsp;|&nbsp; <i class="fa fa-wrench"></i> <code style="font-size:10px">{{ inc.fix_action }}</code>{% endif %}
+    </div>
+    {% if inc.fix_result %}
+    <div class="inc-fix-result"><i class="fa fa-info-circle"></i> Dernier resultat fix : {{ inc.fix_result }}</div>
+    {% endif %}
+    {% if inc.fix_status == 'pending' and inc.fix_action and inc.fix_action != 'view_logs' %}
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <button onclick="approuver('{{ inc.id }}')"
+        style="background:#22c55e;color:#fff;border:none;border-radius:6px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer">
+        <i class="fa fa-check"></i> Approuver le fix
+      </button>
+      <button onclick="rejeter('{{ inc.id }}')"
+        style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:6px;padding:6px 14px;font-size:12px;cursor:pointer">
+        <i class="fa fa-times"></i> Rejeter
+      </button>
+    </div>
+    {% elif inc.fix_status == 'pending' and inc.fix_action == 'view_logs' %}
+    <div style="margin-top:8px;font-size:12px;color:#fbbf24">
+      <i class="fa fa-info-circle"></i> Action manuelle requise : consulter les logs Flask.
+    </div>
+    {% elif inc.fix_status == 'approved' %}
+    <div style="margin-top:8px;font-size:12px;color:#4ade80 " class="pulse">
+      <i class="fa fa-hourglass-half"></i> Fix approuvé — agent en cours d'exécution...
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+
+<!-- Incidents résolus -->
+<div id="panel-closed" style="display:none">
+  {% if not closed_incidents %}
+  <div style="text-align:center;padding:40px;color:#64748b">Aucun incident résolu.</div>
+  {% endif %}
+  {% for inc in closed_incidents %}
+  <div class="inc-card" style="opacity:.65">
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <span class="badge {{ inc.level }}">{{ inc.level }}</span>
+      <span class="badge" style="background:rgba(14,165,233,.1);color:#38bdf8">{{ inc.category }}</span>
+      {% if inc.router_name %}<span class="badge" style="background:rgba(139,92,246,.1);color:#a78bfa">{{ inc.router_name }}</span>{% endif %}
+      <span class="badge {{ inc.fix_status }}">{{ inc.fix_status }}</span>
+    </div>
+    <div class="inc-title" style="color:#94a3b8">{{ inc.title }}</div>
+    <div class="inc-meta">
+      <i class="fa fa-clock-o"></i> {{ inc.created_at }}
+      {% if inc.resolved_at %} → résolu {{ inc.resolved_at }}{% endif %}
+      {% if inc.fix_result %} | {{ inc.fix_result[:80] }}{% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<!-- Légende surveillance -->
+<div style="margin-top:20px;padding:14px;background:#0f172a;border-radius:10px;border:1px solid #1e2d42;font-size:12px;color:#64748b">
+  <strong style="color:#94a3b8;display:block;margin-bottom:8px">Ce que surveille l'agent en temps réel :</strong>
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:6px">
+    <div><i class="fa fa-ticket" style="color:#22c55e"></i> <strong style="color:#4ade80">Expiration absolue</strong> — heure locale routeur</div>
+    <div><i class="fa fa-money" style="color:#22c55e"></i> <strong style="color:#4ade80">Revenus</strong> — sync ventes tous les utilisateurs</div>
+    <div><i class="fa fa-server" style="color:#0ea5e9"></i> Serveur KetaMon (port actif)</div>
+    <div><i class="fa fa-wifi" style="color:#0ea5e9"></i> Connectivité routers MikroTik</div>
+    <div><i class="fa fa-refresh" style="color:#0ea5e9"></i> Synchronisation (retard > seuil config)</div>
+    <div><i class="fa fa-database" style="color:#0ea5e9"></i> Intégrité base de données</div>
+    <div><i class="fa fa-exclamation-triangle" style="color:#f59e0b"></i> Erreurs Flask dans les logs</div>
+  </div>
+</div>
+
+<script>
+function showTab(t){
+  document.getElementById('panel-open').style.display   = t==='open'   ? '' : 'none';
+  document.getElementById('panel-closed').style.display = t==='closed' ? '' : 'none';
+  document.getElementById('tab-open').className   = 'tab-btn ' + (t==='open'   ? 'active':'inactive');
+  document.getElementById('tab-closed').className = 'tab-btn ' + (t==='closed' ? 'active':'inactive');
+}
+function toggleDesc(id){
+  document.getElementById('desc-'+id).classList.toggle('expanded');
+}
+function approuver(id){
+  ouvrirModal('Approuver le fix ?','L\'agent exécutera l\'action dans les 90 prochaines secondes.',function(){
+    fetch('/api/agent/incidents/'+id+'/approve',{method:'POST'})
+      .then(r=>r.json()).then(d=>{
+        if(d.ok){afficherNotif('Fix approuvé.','success');setTimeout(()=>location.reload(),1200);}
+        else afficherNotif('Erreur.','danger');
+      });
+  });
+}
+function rejeter(id){
+  ouvrirModal('Rejeter ?','L\'incident sera fermé.',function(){
+    fetch('/api/agent/incidents/'+id+'/reject',{method:'POST'})
+      .then(r=>r.json()).then(d=>{
+        if(d.ok){afficherNotif('Rejeté.','warning');setTimeout(()=>location.reload(),1200);}
+        else afficherNotif('Erreur.','danger');
+      });
+  });
+}
+function forceRun(){
+  fetch('/api/agent/force-run',{method:'POST'})
+    .then(r=>r.json()).then(d=>{
+      afficherNotif('Cycle forcé — agent en cours d\'exécution...','success');
+    });
+}
+function togglePause(){
+  fetch('/api/agent/status').then(r=>r.json()).then(d=>{
+    var paused = d.status && d.status.running === false;
+    fetch('/api/agent/config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({paused: !d.config.paused})
+    }).then(r=>r.json()).then(d2=>{
+      afficherNotif(d2.ok ? 'Config mise à jour.' : 'Erreur.', d2.ok?'success':'danger');
+      setTimeout(loadStatus,500);
+    });
+  });
+}
+function saveConfig(){
+  var data = {
+    expiry_interval:  parseInt(document.getElementById('cfg-expiry').value)||60,
+    monitor_interval: parseInt(document.getElementById('cfg-monitor').value)||90,
+    revenue_interval: parseInt(document.getElementById('cfg-revenue').value)||45,
+    sync_stale_min:   parseInt(document.getElementById('cfg-stale').value)||10,
+  };
+  fetch('/api/agent/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(data)
+  }).then(r=>r.json()).then(d=>{
+    afficherNotif(d.ok ? 'Configuration enregistrée.' : 'Erreur.', d.ok?'success':'danger');
+  });
+}
+
+function loadStatus(){
+  fetch('/api/agent/status').then(r=>r.json()).then(d=>{
+    if(!d.ok) return;
+    var s = d.status, c = d.config;
+    document.getElementById('st-tickets-expired').textContent = s.tickets_expired||0;
+    document.getElementById('st-epochs-written').textContent  = s.epochs_written||0;
+    document.getElementById('st-ventes-synced').textContent   = s.ventes_synced||0;
+    document.getElementById('st-expiry-cycles').textContent   = s.expiry_cycles||0;
+    document.getElementById('st-monitor-cycles').textContent  = s.monitor_cycles||0;
+    document.getElementById('st-revenue-cycles').textContent  = s.revenue_cycles||0;
+    document.getElementById('st-last-exp').textContent  = s.last_expiry_run  || 'Aucun';
+    document.getElementById('st-last-mon').textContent  = s.last_monitor_run || 'Aucun';
+    document.getElementById('st-last-rev').textContent  = s.last_revenue_run || 'Aucun';
+    document.getElementById('st-started').textContent   = s.started_at       || '—';
+    // Erreurs
+    if(s.errors && s.errors.length > 0){
+      document.getElementById('agent-errors-wrap').style.display = '';
+      document.getElementById('agent-errors').textContent = s.errors.join('\n');
+    }
+    // Statut pause
+    var paused = c && c.paused;
+    var dot    = document.getElementById('agent-status-dot');
+    var lbl    = document.getElementById('agent-status-label');
+    var btn    = document.getElementById('btn-pause');
+    if(paused){
+      dot.style.background = '#f59e0b';
+      lbl.textContent = 'En pause'; lbl.style.color = '#f59e0b';
+      btn.innerHTML = '<i class="fa fa-play"></i> Reprendre';
+    } else {
+      dot.style.background = '#22c55e';
+      lbl.textContent = 'Actif'; lbl.style.color = '#22c55e';
+      btn.innerHTML = '<i class="fa fa-pause"></i> Pause agent';
+    }
+    // Remplir champs config
+    if(c){
+      document.getElementById('cfg-expiry').value  = c.expiry_interval||60;
+      document.getElementById('cfg-monitor').value = c.monitor_interval||90;
+      document.getElementById('cfg-revenue').value = c.revenue_interval||45;
+      document.getElementById('cfg-stale').value   = c.sync_stale_min||10;
+    }
+  }).catch(function(){});
+}
+
+// Charger le statut au chargement + toutes les 15s
+loadStatus();
+setInterval(loadStatus, 15000);
+// Rafraichir la page toutes les 60s
+setInterval(function(){ location.reload(); }, 60000);
+</script>
+{% endblock %}

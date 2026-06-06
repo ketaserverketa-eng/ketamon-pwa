@@ -7,10 +7,13 @@ import secrets
 import random
 import string
 import sqlite3
+import socket
 import threading
 import time
-from datetime import datetime
+import unicodedata
+from datetime import datetime, timedelta
 from functools import wraps
+from urllib.parse import quote, urlsplit
 
 import requests as http_req
 
@@ -23,6 +26,7 @@ from werkzeug.utils import secure_filename
 
 import mikrotik as mk
 import database as db_mod
+import ketamon_agent as agent_mod
 
 # KetaServer endpoint configurable
 KS_API = os.environ.get("KETASERVER_API_URL", "http://127.0.0.1:5000")
@@ -73,9 +77,21 @@ def save_ad_views(data: dict) -> None:
     except Exception:
         pass
 KETAMON_TICKET_COMMENT_MARKER = " ##KETAMON## exp="
+KETAMON_TICKET_COMMENT_MARKERS = (
+    KETAMON_TICKET_COMMENT_MARKER,
+    KETAMON_TICKET_COMMENT_MARKER.strip(),
+)
 KETAMON_TICKET_LOGIN_SCRIPT = "ketamon-ticket-login"
 KETAMON_TICKET_EXPIRY_SCRIPT = "ketamon-ticket-expiry"
 KETAMON_TICKET_EXPIRY_SCHEDULER = "ketamon-ticket-expiry-runner"
+MAX_TICKET_GENERATION_QTY = 500
+TICKET_GENERATION_BATCH_SIZE = int(os.environ.get("KETAMON_TICKET_BATCH_SIZE", "100"))
+TICKET_GENERATION_BATCH_PAUSE = float(os.environ.get("KETAMON_TICKET_BATCH_PAUSE", "0.05"))
+BG_REVENUE_SYNC_INTERVAL = int(os.environ.get("KETAMON_REVENUE_SYNC_INTERVAL", "180"))
+
+_TICKET_GENERATION_LOCKS = {}
+_TICKET_GENERATION_STATUS = {}
+_TICKET_GENERATION_GUARD = threading.Lock()
 
 def _ks_ping_once(timeout=1):
     try:
@@ -164,6 +180,21 @@ def ks_patch(path, token, data=None):
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, root_path=APP_DIR, template_folder="templates", static_folder="static")
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+# ── Compression gzip automatique (HTML/JSON/CSS/JS) ──────────────────────────
+try:
+    from flask_compress import Compress as _Compress
+    app.config["COMPRESS_MIMETYPES"] = [
+        "text/html", "text/css", "text/plain",
+        "application/json", "application/javascript",
+    ]
+    app.config["COMPRESS_LEVEL"]    = 6
+    app.config["COMPRESS_MIN_SIZE"] = 500
+    _Compress(app)
+except ImportError:
+    pass
 KETAMON_ENV = (os.environ.get("KETAMON_ENV") or "development").strip().lower()
 SECRET_KEY = os.environ.get("KETAMON_SECRET_KEY")
 if not SECRET_KEY:
@@ -192,6 +223,7 @@ app.secret_key = SECRET_KEY
 app.config["SESSION_COOKIE_HTTPONLY"] = True   # Inaccessible au JS (anti XSS)
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"  # Anti CSRF cross-origin
 app.config["SESSION_COOKIE_SECURE"]   = KETAMON_ENV in {"prod", "production"}  # HTTPS only en prod
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 
 # Upload limits and allowed logo extensions
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5 MB
@@ -229,7 +261,7 @@ def _ensure_csrf_and_protect():
         session["csrf_token"] = secrets.token_hex(16)
     if request.method == "POST":
         # Exclure les webhooks internes et les endpoints appelés par l'app Android sans session
-        _csrf_exempt_prefixes = ("/api/internal/", "/api/ads/report", "/api/vouchers", "/api/hotspot/")
+        _csrf_exempt_prefixes = ("/api/internal/", "/api/ads/report", "/api/vouchers", "/api/hotspot/", "/api/relay/")
         if any(request.path.startswith(p) for p in _csrf_exempt_prefixes):
             return
         token = session.get("csrf_token")
@@ -239,24 +271,90 @@ def _ensure_csrf_and_protect():
                 return jsonify({"ok": False, "msg": "Token de sécurité invalide"}), 400
             abort(400)
 
+
+@app.before_request
+def _subscription_access_guard():
+    if not session.get("logged_in"):
+        return
+    if session.get("role") in {"concepteur", "admin"}:
+        return
+
+    path = request.path or "/"
+    if path.startswith("/static/"):
+        return
+    if path in {
+        "/login", "/logout", "/abonnement", "/abonnement/souscrire",
+        "/privacy", "/health", "/sw.js", "/static/manifest.json",
+    }:
+        return
+
+    protected_prefixes = (
+        "/hotspot", "/reseau", "/impression-rapide", "/bons",
+        "/report", "/traffic", "/dhcp", "/systeme", "/parametres",
+        "/api/hotspot", "/api/vouchers", "/api/tickets",
+    )
+    if path != "/" and not path.startswith(protected_prefixes):
+        return
+
+    if subscription_is_active_for_current_user():
+        return
+
+    msg = "Abonnement expire. Renouvelez votre abonnement pour continuer a gerer le Hotspot."
+    if path.startswith("/api/") or request.is_json or "application/json" in request.headers.get("Accept", ""):
+        return jsonify({"ok": False, "msg": msg, "subscription_required": True}), 402
+    flash(msg, "warning")
+    return redirect(url_for("abonnement"))
+
 # ── Headers de sécurité HTTP ──────────────────────────────────────────────────
 @app.after_request
 def _add_security_headers(response):
-    response.headers["X-Frame-Options"]        = "SAMEORIGIN"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"]        = "strict-origin-when-cross-origin"
-    response.headers["X-XSS-Protection"]       = "1; mode=block"
-    # CSP permissif mais fonctionnel (CDN font-awesome + data: URI pour canvas)
+    response.headers["X-Frame-Options"]              = "SAMEORIGIN"
+    response.headers["X-Content-Type-Options"]       = "nosniff"
+    response.headers["Referrer-Policy"]              = "strict-origin-when-cross-origin"
+    response.headers["X-XSS-Protection"]             = "1; mode=block"
+    # CSP permissif mais fonctionnel (CDN font-awesome)
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
-        "font-src 'self' https://cdnjs.cloudflare.com data:; "
-        "img-src 'self' data: blob:; "
-        "connect-src 'self'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com; "
+        "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https:; "
+        "font-src 'self' https://cdnjs.cloudflare.com data: https:; "
+        "img-src 'self' data: blob: https:; "
+        "connect-src 'self' https:; "
+        "frame-src 'self' https:; "
         "frame-ancestors 'self';"
     )
+    # Cache long pour les fichiers statiques (CSS/JS/images) — évite les rechargements inutiles
+    if request.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "public, max-age=604800, immutable"
+    dynamic_prefixes = (
+        "/api/",
+        "/reseau/",
+        "/hotspot/",
+        "/settings/",
+        "/concepteur/",
+        "/journaux/",
+        "/system/",
+        "/dhcp/",
+        "/traffic",
+        "/report",
+        "/impression-rapide",
+        "/bons",
+    )
+    if (
+        request.path in {"/", "/login", "/logout", "/sw.js", "/static/manifest.json"}
+        or request.path.startswith(dynamic_prefixes)
+    ):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
     return response
+
+
+@app.teardown_request
+def _close_request_mikrotik_apis(_exc=None):
+    for api in getattr(g, "_mikrotik_apis", []) or []:
+        _close_api_quietly(api)
+    g._mikrotik_apis = []
 
 @app.context_processor
 def inject_csrf_token():
@@ -358,6 +456,70 @@ def get_pay_config():         return db_mod.db_get_pay_config()
 def save_pay_config(cfg):     db_mod.db_save_pay_config(cfg)
 def get_user_subscription(u): return db_mod.db_get_active_sub(u)
 
+
+def get_trial_days():
+    cfg = get_pay_config()
+    return safe_int(cfg.get("trial_days", 45), default=45, min_val=0, max_val=3650)
+
+
+def _subscription_user_id_from_session():
+    if session.get("role") in {"concepteur", "admin"}:
+        return ""
+    return str(session.get("user_id") or "").strip()
+
+
+def ensure_trial_subscription_for_user(user_id=None, username=None):
+    user_id = str(user_id or _subscription_user_id_from_session() or "").strip()
+    if not user_id:
+        return None
+
+    active = db_mod.db_get_active_sub(user_id)
+    if active:
+        return active
+
+    existing = db_mod.db_get_subscriptions(user_id=user_id)
+    if existing:
+        return None
+
+    days = get_trial_days()
+    if days <= 0:
+        return None
+
+    now = datetime.utcnow()
+    expire_at = now + timedelta(days=days)
+    trial = {
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "username": username or session.get("username", user_id),
+        "plan_id": "trial-auto",
+        "plan_nom": f"Essai gratuit {days} jours",
+        "prix_plan": 0,
+        "devise_plan": "FCFA",
+        "prix_plan_base": 0,
+        "montant_paye": 0,
+        "devise_paye": "FCFA",
+        "montant_base": 0,
+        "devise_base": "FCFA",
+        "duree_jours": days,
+        "methode": "essai",
+        "reference": "",
+        "fraude_flags": [],
+        "fraude_detail": "OK",
+        "statut": "actif",
+        "demande_le": now.isoformat(),
+        "active_le": now.isoformat(),
+        "expire_le": expire_at.isoformat(),
+    }
+    db_mod.db_insert_subscription(trial)
+    return db_mod.db_get_active_sub(user_id)
+
+
+def subscription_is_active_for_current_user():
+    user_id = _subscription_user_id_from_session()
+    if not user_id:
+        return True
+    return ensure_trial_subscription_for_user(user_id) is not None
+
 def to_base(montant, devise, cfg):
     taux = cfg.get("taux_change", {})
     return float(montant or 0) * float(taux.get(devise, 1.0))
@@ -410,14 +572,14 @@ def verifier_paiement_antifraude(plan, montant_paye, devise_paye, reference, met
 def _current_owner_id():
     """Retourne l'owner_id de l'utilisateur connecté, ou None pour le concepteur (voit tout)."""
     # Contexte session (web)
-    if session.get("role") == "concepteur":
+    if session.get("role") in {"concepteur", "admin"}:
         return None
     if session.get("user_id"):
         return session["user_id"]
     # Contexte API Basic Auth (mobile)
     basic_user = getattr(g, "basic_auth_user", None)
     if basic_user:
-        if basic_user.get("role") == "concepteur":
+        if basic_user.get("role") in {"concepteur", "admin"}:
             return None
         return basic_user.get("email") or basic_user.get("username") or None
     return None
@@ -484,17 +646,55 @@ def get_active_router():
             return r
     return None
 
+
+def _get_requested_router(payload=None):
+    routers = get_routers()
+    if not routers:
+        return None
+
+    payload = payload if isinstance(payload, dict) else {}
+    preferred_values = [
+        session.get("router_id"),
+        payload.get("router_id"),
+        payload.get("routerId"),
+        payload.get("router"),
+        payload.get("router_host"),
+        payload.get("routerHost"),
+        request.args.get("router_id", ""),
+        request.args.get("routerId", ""),
+        request.args.get("router", ""),
+        request.args.get("host", ""),
+        request.headers.get("X-Router-Id", ""),
+        request.headers.get("X-Router-Host", ""),
+    ]
+    for value in preferred_values:
+        probe = str(value or "").strip()
+        if not probe:
+            continue
+        for router in routers:
+            candidates = {
+                str(router.get("id") or "").strip(),
+                str(router.get("host") or "").strip(),
+                str(router.get("name") or "").strip(),
+            }
+            if probe in candidates:
+                return router
+    active_router = get_active_router()
+    if active_router:
+        return active_router
+    return routers[0]
+
 def local_register(email, password, display_name=None):
     """Enregistre un utilisateur local dans SQLite. Retourne user dict."""
     try:
-        user = db_mod.db_insert_local_user({
-            "id": str(uuid.uuid4()),
-            "username": email,
-            "email": email,
-            "password": generate_password_hash(password),
-            "display_name": display_name or email,
-            "role": "utilisateur",
-        })
+        user = db_mod.db_upsert_local_email_user(
+            email,
+            password_hash=generate_password_hash(password),
+            display_name=display_name or email,
+            role="utilisateur",
+            approved=0,
+            disabled=1,
+        )
         if user:
             user["displayName"] = user.get("display_name") or user.get("displayName") or email
         return user
@@ -518,6 +718,51 @@ def authenticate_local_user(email, password):
     return None
 
 
+def _local_user_is_approved(user) -> bool:
+    try:
+        return int((user or {}).get("approved", 1) or 0) == 1
+    except Exception:
+        return False
+
+
+def _local_user_is_active(user) -> bool:
+    try:
+        return int((user or {}).get("disabled", 0) or 0) == 0
+    except Exception:
+        return False
+
+
+def _local_user_access_message(user) -> str:
+    if not user:
+        return "Compte Gmail introuvable."
+    if not _local_user_is_approved(user):
+        return "Votre compte Gmail est en attente d'activation par le concepteur."
+    if not _local_user_is_active(user):
+        return "Votre compte Gmail a ete desactive par le concepteur."
+    return ""
+
+
+def _ensure_local_email_shadow(email, password=None, display_name=None, role="utilisateur"):
+    email = str(email or "").strip()
+    if not is_valid_email(email):
+        return None
+    existing = db_mod.db_get_local_user(email)
+    password_hash = generate_password_hash(password) if password else None
+    approved = None
+    disabled = None
+    if not existing:
+        approved = 0
+        disabled = 1
+    return db_mod.db_upsert_local_email_user(
+        email,
+        password_hash=password_hash,
+        display_name=display_name or email,
+        role=role or "utilisateur",
+        approved=approved,
+        disabled=disabled,
+    )
+
+
 def _check_basic_auth():
     """Vérifie l'en-tête Authorization: Basic pour les endpoints API Android.
     Retourne (ok: bool, user_dict|None). Stocke l'user dans g.basic_auth_user."""
@@ -528,9 +773,10 @@ def _check_basic_auth():
         decoded = base64.b64decode(auth[6:]).decode("utf-8")
         username, _, password = decoded.partition(":")
         user = authenticate_local_user(username, password)
-        if user:
+        if user and _local_user_is_approved(user) and _local_user_is_active(user):
             g.basic_auth_user = user
-        return (user is not None), user
+            return True, user
+        return False, user
     except Exception:
         return False, None
 
@@ -576,6 +822,361 @@ def safe_int(value, default=0, min_val=None, max_val=None):
     except (ValueError, TypeError):
         return default
 
+
+class TicketGenerationBusyError(RuntimeError):
+    pass
+
+
+def _ticket_generation_key(router_id):
+    key = str(router_id or "").strip()
+    return key or "default-router"
+
+
+def _get_ticket_generation_lock(router_id):
+    key = _ticket_generation_key(router_id)
+    with _TICKET_GENERATION_GUARD:
+        lock = _TICKET_GENERATION_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _TICKET_GENERATION_LOCKS[key] = lock
+        return lock
+
+
+def _set_ticket_generation_status(router_id, **updates):
+    key = _ticket_generation_key(router_id)
+    now = datetime.now().isoformat(timespec="seconds")
+    with _TICKET_GENERATION_GUARD:
+        status = dict(_TICKET_GENERATION_STATUS.get(key) or {})
+        status.update(updates)
+        status["router_id"] = key
+        status["updated_at"] = now
+        _TICKET_GENERATION_STATUS[key] = status
+        return dict(status)
+
+
+def get_ticket_generation_status(router_id):
+    key = _ticket_generation_key(router_id)
+    with _TICKET_GENERATION_GUARD:
+        return dict(_TICKET_GENERATION_STATUS.get(key) or {
+            "router_id": key,
+            "status": "idle",
+            "requested": 0,
+            "created": 0,
+            "profile": "",
+            "error": "",
+        })
+
+
+def _ticket_generation_busy_message(router_id):
+    status = get_ticket_generation_status(router_id)
+    created = int(status.get("created") or 0)
+    requested = int(status.get("requested") or 0)
+    profile = str(status.get("profile") or "").strip()
+    suffix = f" ({created}/{requested} ticket(s)" if requested else ""
+    if profile:
+        suffix += f", profil {profile}"
+    if suffix:
+        suffix += ")"
+    return f"Une generation est deja en cours sur ce routeur{suffix}. Patiente la fin avant de relancer."
+
+
+class TicketGenerationJob:
+    def __init__(self, router_id, requested, profile="", source="web"):
+        self.router_id = _ticket_generation_key(router_id)
+        self.requested = int(requested or 0)
+        self.profile = str(profile or "").strip()
+        self.source = str(source or "web").strip()
+        self.lock = _get_ticket_generation_lock(self.router_id)
+        self.created = 0
+        self.errors = []
+        self._finished = False
+
+    def __enter__(self):
+        if not self.lock.acquire(blocking=False):
+            raise TicketGenerationBusyError(_ticket_generation_busy_message(self.router_id))
+        _set_ticket_generation_status(
+            self.router_id,
+            status="running",
+            requested=self.requested,
+            created=0,
+            profile=self.profile,
+            source=self.source,
+            started_at=datetime.now().isoformat(timespec="seconds"),
+            finished_at="",
+            error="",
+        )
+        return self
+
+    def progress(self, created=None, error=None):
+        if created is not None:
+            self.created = int(created or 0)
+        if error:
+            self.errors.append(str(error))
+        _set_ticket_generation_status(
+            self.router_id,
+            status="running",
+            requested=self.requested,
+            created=self.created,
+            profile=self.profile,
+            source=self.source,
+            error=str(error or ""),
+        )
+
+    def finish(self, created=None, errors=None):
+        if created is not None:
+            self.created = int(created or 0)
+        if errors:
+            self.errors.extend(str(e) for e in errors if e)
+        ok = self.created >= self.requested
+        status = "completed" if ok else ("partial" if self.created else "failed")
+        last_error = "" if ok else (self.errors[-1] if self.errors else "")
+        _set_ticket_generation_status(
+            self.router_id,
+            status=status,
+            requested=self.requested,
+            created=self.created,
+            profile=self.profile,
+            source=self.source,
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+            error=last_error,
+        )
+        self._finished = True
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None and not self._finished:
+            _set_ticket_generation_status(
+                self.router_id,
+                status="failed",
+                requested=self.requested,
+                created=self.created,
+                profile=self.profile,
+                source=self.source,
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+                error=str(exc or "Generation interrompue"),
+            )
+        elif not self._finished:
+            self.finish(self.created, self.errors)
+        try:
+            self.lock.release()
+        except RuntimeError:
+            pass
+        return False
+
+
+def _ticket_charset(mode):
+    if mode == "chiffres":
+        return string.digits
+    if mode == "lettres":
+        return string.ascii_lowercase
+    return string.ascii_lowercase + string.digits
+
+
+def _load_existing_hotspot_user_names(hotspot_resource):
+    try:
+        return {
+            str(row.get("name") or "").strip()
+            for row in hotspot_resource.get()
+            if str(row.get("name") or "").strip()
+        }
+    except Exception:
+        return set()
+
+
+def _next_unique_ticket_name(existing_names, charset, length, prefix):
+    for _ in range(250):
+        name = prefix + "".join(random.choices(charset, k=length))
+        if name not in existing_names:
+            existing_names.add(name)
+            return name
+    raise ValueError("Impossible de generer assez de codes uniques. Augmente la longueur du code ou change le prefixe.")
+
+
+def _looks_like_duplicate_ticket_error(error):
+    text = str(error or "").lower()
+    return any(token in text for token in (
+        "already",
+        "duplicate",
+        "existe",
+        "exist",
+        "same name",
+        "with this name",
+        "have such",
+    ))
+
+
+def _hotspot_ticket_upsert_source(params):
+    params = dict(params or {})
+    name = str(params.get("name") or "").strip()
+    if not name:
+        return ""
+    profile = str(params.get("profile") or "default").strip() or "default"
+    user_assignments = []
+    for key in ("password", "profile", "disabled", "comment", "limit-uptime", "limit-bytes-total", "server"):
+        if key in params and str(params.get(key) if params.get(key) is not None else "").strip() != "":
+            user_assignments.append(f"{key}={_relay_routeros_quote(params.get(key))}")
+    add_assignments = [f"name={_relay_routeros_quote(name)}"] + user_assignments
+    return "\n".join([
+        f":local ktmProfile [/ip hotspot user profile find where name={_relay_routeros_quote(profile)}];",
+        ":if ([:len $ktmProfile] = 0) do={",
+        f"  :do {{ /ip hotspot user profile add name={_relay_routeros_quote(profile)}; }} on-error={{}}",
+        "}",
+        f":local ktmUser [/ip hotspot user find where name={_relay_routeros_quote(name)}];",
+        ":if ([:len $ktmUser] > 0) do={",
+        f"  /ip hotspot user set $ktmUser {' '.join(user_assignments)};",
+        "} else={",
+        f"  /ip hotspot user add {' '.join(add_assignments)};",
+        "}",
+    ])
+
+
+def _add_or_repair_hotspot_ticket(api, hotspot_resource, params):
+    params = dict(params or {})
+    if getattr(api, "is_relay_snapshot", False):
+        source = _hotspot_ticket_upsert_source(params)
+        if not source:
+            raise ValueError("Nom ticket manquant.")
+        return api.queue_routeros_script(source)
+    try:
+        return hotspot_resource.add(**params)
+    except Exception as ex:
+        if not _looks_like_duplicate_ticket_error(ex):
+            raise
+        name = str(params.get("name") or "").strip()
+        if not name:
+            raise
+        repair_params = dict(params)
+        repair_params.pop("name", None)
+        item_id = name
+        try:
+            rows = hotspot_resource.get(name=name)
+            if rows:
+                item_id = router_action_ref(rows[0])
+        except Exception:
+            pass
+        return hotspot_resource.set(id=item_id, **repair_params)
+
+
+def create_hotspot_ticket_batch(api, router_id, qty, profile, *,
+                                server="", mode="aleatoire", length=8,
+                                prefix="", password_mode="identique",
+                                comment="", network_name="", data_limit="0",
+                                price="0", currency="FCFA",
+                                ticket_time_limit="0",
+                                ticket_time_limit_label="0",
+                                charset_override=None,
+                                job=None,
+                                source="web"):
+    router_id = _ticket_generation_key(router_id)
+    qty = safe_int(qty, default=1, min_val=1, max_val=MAX_TICKET_GENERATION_QTY)
+    profile = str(profile or "default").strip() or "default"
+    if job is None:
+        with TicketGenerationJob(router_id, qty, profile, source=source) as local_job:
+            return create_hotspot_ticket_batch(
+                api, router_id, qty, profile,
+                server=server, mode=mode, length=length, prefix=prefix,
+                password_mode=password_mode, comment=comment,
+                network_name=network_name, data_limit=data_limit,
+                price=price, currency=currency,
+                ticket_time_limit=ticket_time_limit,
+                ticket_time_limit_label=ticket_time_limit_label,
+                charset_override=charset_override,
+                job=local_job,
+                source=source,
+            )
+
+    hotspot_resource = api.get_resource("/ip/hotspot/user")
+    # Ne jamais charger tous les users du routeur avant generation:
+    # sur les gros hotspots, cette lecture peut bloquer la PWA.
+    existing_names = set()
+    charset = charset_override or _ticket_charset(mode)
+    now_dt = datetime.now()
+    date_str = now_dt.strftime("%Y-%m-%d")
+    generated = []
+    pricing_batch = []
+    errors = []
+    data_limit_bytes = None
+    if data_limit and data_limit != "0":
+        data_limit_bytes = str(int(float(data_limit) * 1024 * 1024))
+
+    batch_size = max(1, int(TICKET_GENERATION_BATCH_SIZE or 100))
+    batch_pause = max(0.0, float(TICKET_GENERATION_BATCH_PAUSE or 0))
+    max_attempts = max(qty * 5, qty + 50)
+    attempts = 0
+
+    def flush_pricing():
+        nonlocal pricing_batch
+        if pricing_batch:
+            db_mod.db_batch_upsert_ticket_pricing(pricing_batch)
+            pricing_batch = []
+
+    try:
+        while len(generated) < qty and attempts < max_attempts:
+            attempts += 1
+            try:
+                name = _next_unique_ticket_name(existing_names, charset, length, prefix)
+            except ValueError as e:
+                errors.append(str(e))
+                job.progress(len(generated), str(e))
+                break
+
+            password = "".join(random.choices(charset, k=length)) if password_mode == "different" else name
+            params = {
+                "name": name,
+                "password": password,
+                "profile": profile,
+                "disabled": "no",
+                "comment": build_hotspot_user_comment(comment, "vc-"),
+                "limit-uptime": ticket_time_limit,
+            }
+            if data_limit_bytes:
+                params["limit-bytes-total"] = data_limit_bytes
+            if server:
+                params["server"] = server
+
+            try:
+                _add_or_repair_hotspot_ticket(api, hotspot_resource, params)
+            except Exception as ex:
+                errors.append(str(ex))
+                job.progress(len(generated), str(ex))
+                if _looks_like_duplicate_ticket_error(ex):
+                    continue
+                break
+
+            generated.append({
+                "name": name,
+                "password": password,
+                "profile": profile,
+                "price": price,
+                "currency": currency,
+                "network": network_name,
+                "date": date_str,
+                "data_limit": data_limit,
+                "time_limit": ticket_time_limit_label,
+            })
+            pricing_batch.append({
+                "router_id": router_id,
+                "user": name,
+                "password": password,
+                "prix": float(price) if price and price != "0" else 0.0,
+                "devise": currency,
+                "profil": profile,
+                "reseau": network_name,
+            })
+
+            if len(generated) % batch_size == 0:
+                flush_pricing()
+                job.progress(len(generated))
+                if batch_pause:
+                    time.sleep(batch_pause)
+
+        flush_pricing()
+        job.finish(len(generated), errors)
+        return generated, errors
+    except Exception as ex:
+        errors.append(str(ex))
+        job.progress(len(generated), str(ex))
+        raise
+
 _EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 
 def is_valid_email(email: str) -> bool:
@@ -595,6 +1196,113 @@ def router_item_id(item):
     if not isinstance(item, dict):
         return ""
     return str(item.get("id") or item.get(".id") or "").strip()
+
+
+def _is_real_router_item_id(value):
+    text = str(value or "").strip()
+    return bool(text.startswith("*") and not text.startswith("*db-"))
+
+
+def router_action_ref(item, name_key="name"):
+    if not isinstance(item, dict):
+        return ""
+    item_id = router_item_id(item)
+    if _is_real_router_item_id(item_id):
+        return item_id
+    return str(item.get(name_key) or "").strip() or item_id
+
+
+def _routeros_find_target(path, name, name_key="name"):
+    path_cmd = _relay_routeros_path(path)
+    key = _relay_routeros_key(name_key or "name")
+    return f"{path_cmd} find where {key}={_relay_routeros_quote(name)}"
+
+
+def _routeros_set_by_name_source(path, name, params, name_key="name"):
+    path_cmd = _relay_routeros_path(path)
+    find_cmd = _routeros_find_target(path, name, name_key=name_key)
+    assignments = []
+    for key, value in dict(params or {}).items():
+        key = _relay_routeros_key(key)
+        if not key or key in {"id", ".id"}:
+            continue
+        assignments.append(f"{key}={_relay_routeros_quote(value)}")
+    return "\n".join([
+        f":local ktmIds [{find_cmd}];",
+        ":if ([:len $ktmIds] > 0) do={",
+        f"  {path_cmd} set $ktmIds {' '.join(assignments)};",
+        "}",
+    ])
+
+
+def _resource_rows_by_id_or_name(resource, item_id="", name="", name_key="name"):
+    item_id = str(item_id or "").strip()
+    name = str(name or "").strip()
+    rows = []
+    if item_id:
+        try:
+            rows = resource.get(id=item_id)
+        except Exception:
+            rows = []
+    if not rows and name:
+        try:
+            rows = resource.get(**{name_key: name})
+        except Exception:
+            rows = []
+    if not rows and item_id and not _is_real_router_item_id(item_id):
+        try:
+            rows = resource.get(**{name_key: item_id})
+        except Exception:
+            rows = []
+    return rows or []
+
+
+def router_resource_remove_by_id_or_name(api, path, item_id="", name="", name_key="name"):
+    resource = api.get_resource(path)
+    item_id = str(item_id or "").strip()
+    name = str(name or "").strip()
+    if _is_real_router_item_id(item_id):
+        resource.remove(id=item_id)
+        return True
+    target_name = name or item_id
+    if not target_name:
+        return False
+    if hasattr(api, "queue_routeros_script"):
+        source = f"{_relay_routeros_path(path)} remove [{_routeros_find_target(path, target_name, name_key=name_key)}];"
+        api.queue_routeros_script(source)
+        return True
+    rows = _resource_rows_by_id_or_name(resource, item_id=item_id, name=target_name, name_key=name_key)
+    removed = False
+    for row in rows:
+        rid = router_item_id(row)
+        if rid:
+            resource.remove(id=rid)
+            removed = True
+    return removed
+
+
+def router_resource_set_by_id_or_name(api, path, params, item_id="", name="", name_key="name"):
+    resource = api.get_resource(path)
+    item_id = str(item_id or "").strip()
+    name = str(name or "").strip()
+    params = dict(params or {})
+    if _is_real_router_item_id(item_id):
+        resource.set(id=item_id, **params)
+        return True
+    target_name = name or item_id
+    if not target_name:
+        return False
+    if hasattr(api, "queue_routeros_script"):
+        api.queue_routeros_script(_routeros_set_by_name_source(path, target_name, params, name_key=name_key))
+        return True
+    rows = _resource_rows_by_id_or_name(resource, item_id=item_id, name=target_name, name_key=name_key)
+    updated = False
+    for row in rows:
+        rid = router_item_id(row)
+        if rid:
+            resource.set(id=rid, **params)
+            updated = True
+    return updated
 
 
 def parse_routeros_duration(value):
@@ -713,6 +1421,10 @@ def disconnect_hotspot_entities(api, usernames=None, addresses=None, mac_address
                 or address in addresses
                 or (mac_address and mac_address in mac_addresses)
             ):
+                if address:
+                    addresses.add(address)
+                if mac_address:
+                    mac_addresses.add(mac_address)
                 if active_id:
                     active_resource.remove(id=active_id)
                     removed["active_sessions"] += 1
@@ -726,6 +1438,8 @@ def disconnect_hotspot_entities(api, usernames=None, addresses=None, mac_address
             username = str(cookie.get("user") or "").strip()
             mac_address = str(cookie.get("mac-address") or "").strip().lower()
             if username in usernames or (mac_address and mac_address in mac_addresses):
+                if mac_address:
+                    mac_addresses.add(mac_address)
                 if cookie_id:
                     cookie_resource.remove(id=cookie_id)
                     removed["cookies"] += 1
@@ -749,6 +1463,12 @@ def disconnect_hotspot_entities(api, usernames=None, addresses=None, mac_address
 
 
 def compute_active_time_left(active_row, user_row):
+    comment = str(user_row.get("comment") or active_row.get("user_comment") or "").strip()
+    expire_dt = _extract_ketamon_expire_datetime(comment)
+    if expire_dt:
+        remaining = int((expire_dt - datetime.now()).total_seconds())
+        return format_duration_compact(remaining) if remaining > 0 else "Expiré"
+
     direct_left = parse_routeros_duration(active_row.get("session-time-left"))
     if direct_left is not None:
         return format_duration_compact(direct_left)
@@ -778,6 +1498,14 @@ def _fmt_bytes(val):
     return f"{b/1024/1024/1024:.2f} GB"
 
 
+def _traffic_client_bytes(active_row):
+    """RouterOS active bytes-out = recu par le client, bytes-in = envoye par le client."""
+    active_row = dict(active_row or {})
+    download = active_row.get("bytes-out", 0)
+    upload = active_row.get("bytes-in", 0)
+    return download, upload
+
+
 def normalize_active_sessions(api, active_rows, users_map=None):
     if users_map is None:
         try:
@@ -794,14 +1522,18 @@ def normalize_active_sessions(api, active_rows, users_map=None):
         row["id"] = router_item_id(active)
         user_row = users_map.get(str(row.get("user") or "").strip(), {})
         row["temps-restant"] = compute_active_time_left(row, user_row)
-        row["debit-down"] = _fmt_bytes(row.get("bytes-in",  0))
-        row["debit-up"]   = _fmt_bytes(row.get("bytes-out", 0))
+        download_bytes, upload_bytes = _traffic_client_bytes(row)
+        row["debit-down"] = _fmt_bytes(download_bytes)
+        row["debit-up"]   = _fmt_bytes(upload_bytes)
+        row["download-bytes"] = str(download_bytes or "0")
+        row["upload-bytes"] = str(upload_bytes or "0")
         row["user_hotspot_id"] = router_item_id(user_row) if user_row else ""
         row["profile"] = str(user_row.get("profile") or "-")
         row["limit-uptime"] = str(user_row.get("limit-uptime") or "0")
         row["bytes-in-total"]  = str(user_row.get("bytes-in",  row.get("bytes-in",  0)))
         row["bytes-out-total"] = str(user_row.get("bytes-out", row.get("bytes-out", 0)))
         row["user_disabled"] = str(user_row.get("disabled", "no")).strip().lower() == "yes"
+        row["user_comment"] = str(user_row.get("comment") or "")
         normalized.append(row)
     return normalized
 
@@ -810,9 +1542,172 @@ def normalize_ticket_time_limit(value):
     text = str(value or "").strip()
     if not text:
         return ""
-    if text.lower() in {"0", "0s", "none", "illimite", "unlimited", "infinite", "inf"}:
+    seconds = _parse_ticket_time_limit_seconds(text, prefer_legacy_routeros=True)
+    if seconds is None:
+        return text
+    if seconds <= 0:
         return "0"
-    return text
+    return _seconds_to_user_time_limit(seconds)
+
+
+def normalize_profile_time_limit(value):
+    """Normalise une durée stockée dans les métadonnées KetaMon d'un profil."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    compact = _compact_time_limit_text(text)
+    if not compact:
+        return ""
+    prefer_legacy = compact.lower() == compact and _looks_like_legacy_routeros_time_limit(compact)
+    seconds = _parse_ticket_time_limit_seconds(text, prefer_legacy_routeros=prefer_legacy)
+    if seconds is None:
+        return text
+    if seconds <= 0:
+        return "0"
+    return _seconds_to_user_time_limit(seconds)
+
+
+_TIME_LIMIT_ZERO_ALIASES = {
+    "0", "0s", "0mn", "0m", "none", "illimite", "illimitee", "illimitee",
+    "unlimited", "infinite", "inf", "no-limit", "nolimit",
+}
+_TIME_LIMIT_ERROR = "Durée invalide. Exemples acceptés : 2H, 30mn, 7D, 1M, 0."
+_USER_TIME_LIMIT_PATTERN = re.compile(
+    r"(\d+)(mn|min|minutes?|minute|heures?|heure|hours?|hour|jours?|jour|days?|day|"
+    r"months?|month|mois|weeks?|week|semaines?|semaine|sem|secs?|seconds?|secondes?|"
+    r"seconde|[MHDWhdwsmj])",
+    re.IGNORECASE,
+)
+
+
+def _normalize_ascii_text(value):
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def _compact_time_limit_text(value):
+    return re.sub(r"[\s,;]+", "", str(value or "").strip())
+
+
+def _looks_like_legacy_routeros_time_limit(value):
+    compact = _compact_time_limit_text(value).lower()
+    if not compact or compact in _TIME_LIMIT_ZERO_ALIASES:
+        return False
+    return bool(
+        re.fullmatch(r"(?:\d+[wdhms])+", compact)
+        or re.fullmatch(r"(?:\d+[wdhs])*(?:\d+:\d+(?::\d+)?)", compact)
+        or compact.isdigit()
+    )
+
+
+def _parse_user_time_limit_seconds(value):
+    compact = _compact_time_limit_text(value)
+    normalized = _normalize_ascii_text(compact).lower()
+    if not normalized:
+        return None
+    if normalized in _TIME_LIMIT_ZERO_ALIASES:
+        return 0
+    if normalized.isdigit():
+        return int(normalized)
+
+    total = 0
+    pos = 0
+    matched = False
+    for match in _USER_TIME_LIMIT_PATTERN.finditer(compact):
+        if match.start() != pos:
+            return None
+        matched = True
+        amount = int(match.group(1))
+        unit = _normalize_ascii_text(match.group(2)).lower()
+        if unit in {"mn", "min", "minute", "minutes"}:
+            total += amount * 60
+        elif unit in {"h", "heure", "heures", "hour", "hours"}:
+            total += amount * 3600
+        elif unit in {"d", "j", "jour", "jours", "day", "days"}:
+            total += amount * 86400
+        elif unit in {"w", "week", "weeks", "sem", "semaine", "semaines"}:
+            total += amount * 7 * 86400
+        elif unit in {"m", "mois", "month", "months"}:
+            total += amount * 30 * 86400
+        elif unit in {"s", "sec", "secs", "second", "seconds", "seconde", "secondes"}:
+            total += amount
+        else:
+            return None
+        pos = match.end()
+
+    if not matched or pos != len(compact):
+        return None
+    return total
+
+
+def _parse_ticket_time_limit_seconds(value, prefer_legacy_routeros=False):
+    compact = _compact_time_limit_text(value)
+    normalized = _normalize_ascii_text(compact).lower()
+    if not compact:
+        return None
+    if normalized in _TIME_LIMIT_ZERO_ALIASES:
+        return 0
+
+    if prefer_legacy_routeros and _looks_like_legacy_routeros_time_limit(compact):
+        legacy_seconds = parse_routeros_duration(compact)
+        if legacy_seconds is not None:
+            return legacy_seconds
+
+    user_seconds = _parse_user_time_limit_seconds(compact)
+    if user_seconds is not None:
+        return user_seconds
+
+    if ":" in compact:
+        return parse_routeros_duration(compact)
+    return None
+
+
+def _seconds_to_routeros_time_limit(seconds):
+    seconds = max(0, int(seconds or 0))
+    if seconds == 0:
+        return "0"
+    chunks = []
+    for suffix, unit in (("w", 7 * 24 * 3600), ("d", 24 * 3600), ("h", 3600), ("m", 60), ("s", 1)):
+        value, seconds = divmod(seconds, unit)
+        if value:
+            chunks.append(f"{value}{suffix}")
+    return "".join(chunks) or "0"
+
+
+def _seconds_to_user_time_limit(seconds):
+    seconds = max(0, int(seconds or 0))
+    if seconds == 0:
+        return "0"
+    chunks = []
+    for suffix, unit in (("M", 30 * 24 * 3600), ("w", 7 * 24 * 3600), ("d", 24 * 3600), ("h", 3600), ("mn", 60), ("s", 1)):
+        value, seconds = divmod(seconds, unit)
+        if value:
+            chunks.append(f"{value}{suffix}")
+    return "".join(chunks) or "0"
+
+
+def coerce_ticket_time_limit_user(value, empty="", prefer_legacy_routeros=False):
+    text = str(value or "").strip()
+    if not text:
+        return empty
+    seconds = _parse_ticket_time_limit_seconds(text, prefer_legacy_routeros=prefer_legacy_routeros)
+    if seconds is None:
+        raise ValueError(_TIME_LIMIT_ERROR)
+    if seconds <= 0:
+        return "0"
+    return _seconds_to_user_time_limit(seconds)
+
+
+def coerce_ticket_time_limit_router(value, empty="", prefer_legacy_routeros=False):
+    text = str(value or "").strip()
+    if not text:
+        return empty
+    seconds = _parse_ticket_time_limit_seconds(text, prefer_legacy_routeros=prefer_legacy_routeros)
+    if seconds is None:
+        raise ValueError(_TIME_LIMIT_ERROR)
+    if seconds <= 0:
+        return "0"
+    return _seconds_to_routeros_time_limit(seconds)
 
 
 def build_profile_comment_metadata(price, currency, expire_mode, lock_user, time_limit="0"):
@@ -821,7 +1716,7 @@ def build_profile_comment_metadata(price, currency, expire_mode, lock_user, time
         "currency": str(currency or "FCFA"),
         "expire_mode": str(expire_mode or "none"),
         "lock_user": str(lock_user or "yes"),
-        "time_limit": normalize_ticket_time_limit(time_limit) or "0",
+        "time_limit": coerce_ticket_time_limit_user(time_limit, empty="0", prefer_legacy_routeros=False) or "0",
     }
     return PROFILE_META_PREFIX + json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
@@ -850,50 +1745,509 @@ def get_hotspot_profile_metadata_map(router_id):
     return mapping
 
 
-def _sync_ventes_for_router(router_info, timeout=8):
-    """Sync tickets UTILISÉS (bytes-in>0) pour un routeur → SQLite.
-    Chaque ticket compté exactement 1 fois, jamais re-compté."""
-    host      = router_info.get("host", "")
-    ruser     = router_info.get("user") or router_info.get("username") or "admin"
-    password  = router_info.get("password", "")
-    port      = int(router_info.get("port") or 8728)
-    router_id = router_info.get("id") or host
+def _split_ticket_runtime_comment(comment):
+    raw_comment = str(comment or "").strip()
+    for marker in KETAMON_TICKET_COMMENT_MARKERS:
+        pos = raw_comment.find(marker)
+        if pos != -1:
+            return raw_comment[:pos].rstrip(), raw_comment[pos + len(marker):].strip()
+    return raw_comment, None
 
-    api, err = mk.safe_connect(host, ruser, password, port, timeout=timeout)
+
+_ROS_MONTH_MAP = {
+    "jan": "01", "feb": "02", "mar": "03", "apr": "04",
+    "may": "05", "jun": "06", "jul": "07", "aug": "08",
+    "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+}
+
+def _ros_date_to_iso(ros_date):
+    """Convertit 'may/12/2026' → '2026-05-12'. Retourne '' si invalide."""
+    try:
+        parts = str(ros_date).strip().split("/")
+        if len(parts) == 3:
+            mon = _ROS_MONTH_MAP.get(parts[0].lower()[:3])
+            if mon:
+                return f"{parts[2]}-{mon}-{int(parts[1]):02d}"
+    except Exception:
+        pass
+    return ""
+
+def _extract_ticket_key(username, comment):
+    """Construit la clé unique d'un ticket : 'username:expiry' ou 'username' si pas de marqueur."""
+    _base_comment, expiry = _split_ticket_runtime_comment(comment)
+    if expiry:
+        return f"{username}:{expiry}"
+    return username
+
+
+def _parse_ketamon_expire(expire_raw):
+    """Parse la valeur d'expiry depuis un commentaire KetaMon.
+
+    Nouveau format (epoch entier, survivant aux reboots) : "1735000000"
+    Ancien format (RouterOS datetime, boot-relatif) : "jan/27/2026 15:30:00"
+    Retourne un datetime naïf comparable à datetime.now(), ou None si invalide.
+    """
+    s = (expire_raw or "").strip()
+    if s.isdigit() and len(s) >= 9:
+        return datetime(1970, 1, 1) + timedelta(seconds=int(s))
+    for fmt, size in (
+        ("%b/%d/%Y %H:%M:%S", 20),
+        ("%Y-%m-%d %H:%M:%S", 19),
+        ("%Y-%m-%d %H:%M", 16),
+    ):
+        try:
+            return datetime.strptime(s[:size], fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _extract_ketamon_expire_datetime(comment):
+    """Extrait l'expiration absolue KetaMon depuis un commentaire user."""
+    _base_comment, expire_raw = _split_ticket_runtime_comment(comment)
+    if expire_raw is None:
+        return None
+    if not expire_raw:
+        return None
+    return _parse_ketamon_expire(expire_raw)
+
+
+def _is_ketamon_ticket_comment(comment):
+    base_comment = str(comment or "").strip()
+    return (
+        base_comment.startswith("vc-")
+        or base_comment.startswith("up-")
+        or any(marker in base_comment for marker in KETAMON_TICKET_COMMENT_MARKERS)
+    )
+
+
+def _build_first_used_map(router_id):
+    first_used_map = {}
+    if not router_id:
+        return first_used_map
+    try:
+        all_v = db_mod.db_get_ventes(router_id)
+        for v in reversed(all_v):
+            uname = str(v.get("user") or "").strip()
+            if uname:
+                first_used_map[uname] = f"{v.get('date', '')} {v.get('heure', '')[:5]}"
+    except Exception:
+        pass
+    return first_used_map
+
+
+def _ticket_db_meta(router_id, username):
+    router_id = str(router_id or "").strip()
+    username = str(username or "").strip()
+    if not router_id or not username:
+        return {}
+    try:
+        conn = db_mod.get_conn()
+        row = conn.execute("""
+            SELECT tp.user, tp.profil, tp.reseau, hp.time_limit, hp.expire_mode
+            FROM ticket_pricing tp
+            LEFT JOIN hotspot_profile_metadata hp
+              ON hp.router_id=tp.router_id AND hp.profile_name=tp.profil
+            WHERE tp.router_id=? AND tp.user=?
+            LIMIT 1
+        """, (router_id, username)).fetchone()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _infer_time_limit_from_profile_name(profile_name):
+    text = str(profile_name or "").strip()
+    if not text:
+        return ""
+    try:
+        return coerce_ticket_time_limit_user(text, empty="", prefer_legacy_routeros=False) or ""
+    except Exception:
+        pass
+    match = _USER_TIME_LIMIT_PATTERN.search(text)
+    if not match:
+        return ""
+    try:
+        return coerce_ticket_time_limit_user(match.group(0), empty="", prefer_legacy_routeros=False) or ""
+    except Exception:
+        return ""
+
+
+def _ticket_meta_time_limit(meta):
+    if not meta:
+        return ""
+    raw = str(meta.get("time_limit") or "").strip()
+    if raw and raw.lower() not in {"0", "0s", "none"}:
+        return raw
+    return _infer_time_limit_from_profile_name(meta.get("profil") or meta.get("profile") or "")
+
+
+def _enrich_active_users_from_database(router_id, active_rows, users_map):
+    users_map = dict(users_map or {})
+    for active in active_rows or []:
+        username = str((active or {}).get("user") or "").strip()
+        if not username:
+            continue
+        meta = _ticket_db_meta(router_id, username)
+        if not meta:
+            continue
+        limit_source = _ticket_meta_time_limit(meta)
+        limit_uptime = coerce_ticket_time_limit_router(limit_source, empty="0", prefer_legacy_routeros=False) or "0"
+        existing = users_map.get(username)
+        if existing:
+            # Relay/database fallback can restore a ticket before the router sends full user rows.
+            # Never keep "0" as unlimited when KetaMon knows the real profile duration.
+            if limit_uptime and limit_uptime not in {"0", "0s", "none"}:
+                current_limit = str(existing.get("limit-uptime") or "").strip().lower()
+                if current_limit in {"", "0", "0s", "none"}:
+                    existing["limit-uptime"] = limit_uptime
+            if not str(existing.get("profile") or "").strip() or str(existing.get("profile") or "").strip() == "-":
+                existing["profile"] = meta.get("profil") or "default"
+            if not existing.get("comment"):
+                existing["comment"] = "restored-from-database"
+            users_map[username] = existing
+            continue
+        users_map[username] = {
+            "name": username,
+            "profile": meta.get("profil") or "default",
+            "limit-uptime": limit_uptime,
+            "uptime": "0",
+            "bytes-in": (active or {}).get("bytes-in", "0"),
+            "bytes-out": (active or {}).get("bytes-out", "0"),
+            "disabled": "no",
+            "comment": "restored-from-database",
+            "_source": "database",
+        }
+    return users_map
+
+
+def _cleanup_expired_active_from_database(api, router_id, active_rows, first_used_map):
+    cleaned = 0
+    now = datetime.now()
+    for active in active_rows or []:
+        username = str((active or {}).get("user") or "").strip()
+        if not username:
+            continue
+        meta = _ticket_db_meta(router_id, username)
+        if not meta:
+            continue
+        limit_seconds = parse_routeros_duration(coerce_ticket_time_limit_router(_ticket_meta_time_limit(meta), empty="0", prefer_legacy_routeros=False) or "0")
+        first_dt = _parse_first_used_datetime(first_used_map.get(username))
+        if not first_dt or not limit_seconds or limit_seconds <= 0:
+            continue
+        if now < first_dt + timedelta(seconds=limit_seconds):
+            continue
+        address = str((active or {}).get("address") or "").strip()
+        mac = str((active or {}).get("mac-address") or "").strip()
+        try:
+            if hasattr(api, "queue_routeros_script"):
+                source = "\n".join([
+                    f"/ip hotspot active remove [find where user={_relay_routeros_quote(username)}];",
+                    f"/ip hotspot cookie remove [find where user={_relay_routeros_quote(username)}];",
+                    f"/ip hotspot user remove [find where name={_relay_routeros_quote(username)}];",
+                    f"/ip hotspot host remove [find where address={_relay_routeros_quote(address)}];" if address else "",
+                    f"/ip hotspot host remove [find where mac-address={_relay_routeros_quote(mac)}];" if mac else "",
+                ])
+                api.queue_routeros_script(source)
+            else:
+                disconnect_hotspot_entities(api, usernames=[username], addresses=[address], mac_addresses=[mac])
+                rows = api.get_resource("/ip/hotspot/user").get(name=username)
+                for row in rows or []:
+                    uid = router_item_id(row)
+                    if uid:
+                        api.get_resource("/ip/hotspot/user").remove(id=uid)
+            try:
+                db_mod.db_delete_ticket_pricing(router_id, [username])
+            except Exception:
+                pass
+            cleaned += 1
+        except Exception:
+            pass
+    return cleaned
+
+
+def _record_active_revenues_from_database(router_id, active_rows):
+    router_id = str(router_id or "").strip()
+    if not router_id:
+        return 0
+    conn = db_mod.get_conn()
+    now = datetime.now()
+    inserted = 0
+    for active in active_rows or []:
+        username = str((active or {}).get("user") or "").strip()
+        if not username:
+            continue
+        exists = conn.execute(
+            "SELECT 1 FROM ventes WHERE router_id=? AND user=? LIMIT 1",
+            (router_id, username),
+        ).fetchone()
+        if exists:
+            continue
+        pricing = conn.execute(
+            "SELECT prix, devise, profil, reseau FROM ticket_pricing WHERE router_id=? AND user=? LIMIT 1",
+            (router_id, username),
+        ).fetchone()
+        if not pricing:
+            continue
+        price = float(pricing["prix"] or 0)
+        if price <= 0:
+            continue
+        try:
+            db_mod.db_insert_vente({
+                "id": uuid.uuid4().hex,
+                "router_id": router_id,
+                "date": now.strftime("%Y-%m-%d"),
+                "heure": now.strftime("%H:%M:%S"),
+                "user": username,
+                "profil": pricing["profil"] or "",
+                "prix": price,
+                "devise": pricing["devise"] or "FCFA",
+                "reseau": pricing["reseau"] or "",
+                "data_limit": "0",
+                "ticket_key": f"{username}:{int(now.timestamp())}",
+            })
+            inserted += 1
+        except Exception:
+            pass
+    return inserted
+
+
+def _parse_first_used_datetime(first_used_raw):
+    text = str(first_used_raw or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text[:16], "%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
+
+def _compose_active_ticket_comment(comment, expire_epoch):
+    base_comment, _expire_raw = _split_ticket_runtime_comment(comment)
+    if base_comment:
+        return f"{base_comment}{KETAMON_TICKET_COMMENT_MARKER}{int(expire_epoch)}"
+    return f"{KETAMON_TICKET_COMMENT_MARKER.strip()}{int(expire_epoch)}"
+
+
+def _datetime_to_ketamon_epoch(dt):
+    if not isinstance(dt, datetime):
+        return 0
+    return int((dt - datetime(1970, 1, 1)).total_seconds())
+
+
+def _repair_active_ticket_epochs(api, router_id, active_rows=None, users_map=None, first_used_map=None):
+    """
+    Répare l'expiration absolue des tickets déjà utilisés.
+    Ne touche jamais aux tickets non utilisés.
+    """
+    active_rows = list(active_rows or [])
+    if not router_id:
+        return 0
+
+    if users_map is None:
+        try:
+            users_map = {
+                str(user.get("name") or "").strip(): dict(user)
+                for user in api.get_resource("/ip/hotspot/user").get()
+            }
+        except Exception:
+            users_map = {}
+
+    if first_used_map is None:
+        first_used_map = _build_first_used_map(router_id)
+
+    if not users_map:
+        return 0
+
+    active_by_username = {}
+    for active_row in active_rows:
+        active_username = str(active_row.get("user") or "").strip()
+        if active_username:
+            active_by_username[active_username] = active_row
+
+    user_resource = api.get_resource("/ip/hotspot/user")
+    server_now = datetime.now()
+    patched = 0
+
+    for username, user_row in users_map.items():
+        username = str(username or "").strip()
+        if not username:
+            continue
+
+        active_row = active_by_username.get(username)
+
+        current_comment = str(user_row.get("comment") or "").strip()
+        current_expire_dt = _extract_ketamon_expire_datetime(current_comment)
+
+        if not (_is_ketamon_ticket_comment(current_comment) or current_expire_dt or username in first_used_map or active_row):
+            continue
+
+        limit_seconds = parse_routeros_duration(user_row.get("limit-uptime"))
+        if limit_seconds is None or limit_seconds <= 0:
+            meta = _ticket_db_meta(router_id, username)
+            try:
+                limit_seconds = parse_routeros_duration(
+                    coerce_ticket_time_limit_router(_ticket_meta_time_limit(meta), empty="0", prefer_legacy_routeros=False) or "0"
+                )
+            except Exception:
+                limit_seconds = None
+        if limit_seconds is None or limit_seconds <= 0:
+            continue
+
+        first_used_dt = _parse_first_used_datetime(first_used_map.get(username))
+        if first_used_dt:
+            expire_dt = first_used_dt + timedelta(seconds=limit_seconds)
+        else:
+            if not active_row:
+                continue
+            used_seconds = parse_routeros_duration(user_row.get("uptime-used"))
+            if used_seconds is None:
+                used_seconds = parse_routeros_duration(active_row.get("uptime")) or 0
+            expire_dt = server_now + timedelta(seconds=max(limit_seconds - used_seconds, 0))
+
+        if current_expire_dt:
+            drift = abs(int((current_expire_dt - expire_dt).total_seconds()))
+            if drift <= 120:
+                continue
+
+        expire_epoch = _datetime_to_ketamon_epoch(expire_dt)
+        if expire_epoch <= 0:
+            continue
+        user_id = router_item_id(user_row)
+
+        new_comment = _compose_active_ticket_comment(current_comment, expire_epoch)
+        try:
+            user_id_text = str(user_id or "").strip()
+            if hasattr(api, "queue_routeros_script") and (not user_id_text or user_id_text.startswith("*db-")):
+                source = "\n".join([
+                    f":local uid [/ip hotspot user find where name={_relay_routeros_quote(username)}];",
+                    ":if ([:len $uid] > 0) do={",
+                    f"    /ip hotspot user set $uid comment={_relay_routeros_quote(new_comment)} limit-uptime=0;",
+                    "}",
+                ])
+                api.queue_routeros_script(source)
+            else:
+                if not user_id_text:
+                    continue
+                user_resource.set(id=user_id_text, comment=new_comment, **{"limit-uptime": "0"})
+            user_row["comment"] = new_comment
+            user_row["limit-uptime"] = "0"
+            if active_row is not None:
+                active_row["user_comment"] = new_comment
+            patched += 1
+        except Exception:
+            continue
+
+    return patched
+
+
+def _close_api_quietly(api):
+    try:
+        if api:
+            api.close()
+    except Exception:
+        pass
+
+
+def _sync_ventes_for_router(router_info, timeout=8):
+    """Sync tickets actifs (bytes-in>0) pour un routeur → SQLite.
+    Un ticket est compté comme revenu uniquement quand il est utilisé.
+    La date de vente = date de la sync (jour où le client s'est connecté).
+    Chaque ticket identifié par ticket_key = username:expiry_timestamp."""
+    host      = router_info.get("host", "")
+    router_id = router_info.get("id") or host
+    api, err = mk.safe_connect_router(router_info, timeout=timeout)
     if err or not api:
         return 0
 
+    conn = None
     try:
         profiles_meta = get_hotspot_profile_metadata_map(router_id)
         conn = db_mod.get_conn()
 
-        existing = set(
-            r[0] for r in conn.execute(
-                "SELECT user FROM ventes WHERE router_id=?", (router_id,)
-            ).fetchall()
-        )
+        # Charge les ticket_keys ET les usernames déjà enregistrés
+        existing_rows = conn.execute(
+            "SELECT user, ticket_key FROM ventes WHERE router_id=?", (router_id,)
+        ).fetchall()
+        existing_keys  = set(r[1] for r in existing_rows)
+        existing_users = set(r[0] for r in existing_rows)
 
-        all_users = api.get_resource("/ip/hotspot/user").get()
+        # Date/heure de la sync = date réelle d'utilisation du ticket
         now_dt   = datetime.now()
         date_str = now_dt.strftime("%Y-%m-%d")
         time_str = now_dt.strftime("%H:%M:%S")
+
+        all_users = api.get_resource("/ip/hotspot/user").get()
         new_count = 0
+
+        # Sessions actives : bytes-in en temps réel (user account bytes-in = 0 pendant session active)
+        try:
+            active_sessions = api.get_resource("/ip/hotspot/active").get()
+            users_map = {
+                str(user.get("name") or "").strip(): dict(user)
+                for user in all_users
+                if str(user.get("name") or "").strip()
+            }
+            _repair_active_ticket_epochs(
+                api,
+                router_id,
+                active_rows=active_sessions,
+                users_map=users_map,
+                first_used_map=_build_first_used_map(router_id),
+            )
+            active_with_traffic = set()
+            for sess in active_sessions:
+                try:
+                    b = int(sess.get("bytes-in", 0) or 0)
+                except (ValueError, TypeError):
+                    b = 0
+                if b > 0:
+                    active_with_traffic.add(str(sess.get("user", "") or "").strip())
+        except Exception:
+            active_with_traffic = set()
 
         import uuid as _uuid
         for u in all_users:
+            username = str(u.get("name", "") or "").strip()
+            if not username:
+                continue
+
+            comment = str(u.get("comment", "") or "")
+
             try:
                 bytes_in = int(u.get("bytes-in", 0) or 0)
             except (ValueError, TypeError):
                 bytes_in = 0
-            if bytes_in == 0:
-                continue  # jamais connecté → ne pas compter
-            username = str(u.get("name", "") or "").strip()
-            if not username or username in existing:
-                continue  # déjà enregistré → pas de doublon
+
+            # Un ticket est "utilisé" si :
+            # - bytes-in > 0 sur le compte (sessions passées, mis à jour à la déconnexion)
+            # - OU bytes-in > 0 dans une session active (trafic en cours, non encore flush sur le compte)
+            if bytes_in == 0 and username not in active_with_traffic:
+                continue
+
+            ticket_key = _extract_ticket_key(username, comment)
+
+            # Ticket déjà enregistré avec cette clé exacte → skip
+            if ticket_key in existing_keys:
+                continue
+
+            # Username déjà comptabilisé (quelle que soit la clé) → pas de doublon
+            # Si le ticket a maintenant un marqueur epoch, on met à jour la clé ancien format
+            if username in existing_users:
+                if ticket_key != username:
+                    # Ticket a maintenant un marqueur → migrer l'ancienne clé (format=username)
+                    conn.execute(
+                        "UPDATE ventes SET ticket_key=? WHERE router_id=? AND user=? AND ticket_key=?",
+                        (ticket_key, router_id, username, username)
+                    )
+                    conn.commit()
+                    existing_keys.add(ticket_key)
+                    existing_keys.discard(username)
+                continue  # déjà compté, jamais créer de doublon
 
             profile = str(u.get("profile", "default") or "default")
 
-            # Priorité 1 : prix enregistré à la création du ticket dans KetaMon
+            # Priorité 1 : prix enregistré à la création dans KetaMon
             pricing = conn.execute(
                 "SELECT prix, devise, profil, reseau FROM ticket_pricing WHERE router_id=? AND user=?",
                 (router_id, username)
@@ -904,13 +2258,17 @@ def _sync_ventes_for_router(router_info, timeout=8):
                 profile  = pricing[2] or profile
                 reseau   = pricing[3] or ""
             elif profile in profiles_meta:
-                # Priorité 2 : profil configuré dans KetaMon (métadonnées)
+                # Priorité 2 : métadonnées du profil KetaMon
                 meta     = profiles_meta[profile]
                 price    = float(meta.get("price", "0") or "0")
                 currency = meta.get("currency", "FCFA") or "FCFA"
                 reseau   = ""
             else:
-                # Ticket inconnu de KetaMon → ignorer pour ne pas polluer les revenus
+                # Ticket inconnu de KetaMon → ignorer
+                continue
+
+            # Profil sans prix (default, gratuit) → pas de revenu à comptabiliser
+            if price <= 0:
                 continue
 
             db_mod.db_insert_vente({
@@ -924,8 +2282,10 @@ def _sync_ventes_for_router(router_info, timeout=8):
                 "devise":     currency,
                 "reseau":     reseau,
                 "data_limit": "0",
+                "ticket_key": ticket_key,
             })
-            existing.add(username)
+            existing_keys.add(ticket_key)
+            existing_users.add(username)
             new_count += 1
 
         return new_count
@@ -934,55 +2294,114 @@ def _sync_ventes_for_router(router_info, timeout=8):
         print(f"[SYNC] ERREUR router {router_info.get('host','?')}: {_e}")
         traceback.print_exc()
         return 0
+    finally:
+        _close_api_quietly(api)
 
 
 # Suivi temps réel du statut de sync par routeur
 _sync_stats = {}  # {router_id: {"last_sync": "ISO", "new": N, "ok": bool, "error": str, "host": str}}
 
 
+def _write_missing_epochs_for_router(api, router_id, host="?"):
+    # Desactive ici: le secours Python actif vit dans ketamon_agent.py.
+    # app.py garde seulement la sync revenus et l'installation des scripts.
+    return 0
+
+
+def _expire_tickets_for_router(api, host="?"):
+    # Desactive ici: le secours Python actif vit dans ketamon_agent.py.
+    # Il coupe uniquement les tickets deja marques exp=... si MikroTik echoue.
+    return 0
+
+
 def _bg_ventes_loop():
-    """Thread daemon : sync toutes les 5s, timeout 5s/routeur — capture rapide des tickets."""
-    time.sleep(3)
+    """Thread daemon : sync revenus. Intervalle allonge pour les gros routeurs."""
+    time.sleep(120)
     while True:
         try:
             for router in db_mod.db_get_routers():
-                rid = router.get("id") or router.get("host", "")
+                rid  = router.get("id") or router.get("host", "")
+                host = router.get("host", "?")
                 try:
-                    n = _sync_ventes_for_router(router, timeout=5)
+                    n = _sync_ventes_for_router(router, timeout=6)
                     _sync_stats[rid] = {
                         "last_sync": datetime.now().isoformat(timespec="seconds"),
                         "new":       n,
                         "ok":        True,
                         "error":     "",
-                        "host":      router.get("host", ""),
+                        "host":      host,
                         "name":      router.get("name", ""),
                     }
                     if n:
-                        print(f"[SYNC] {router.get('host','?')} : {n} nouvelle(s) vente(s)")
+                        print(f"[SYNC] {host} : {n} nouvelle(s) vente(s)")
+                    # Partage des stats avec l'agent moniteur
+                    agent_mod.set_sync_stats({rid: {
+                        "last_ok":    datetime.now().isoformat(timespec="seconds"),
+                        "last_error": "",
+                        "host":       host,
+                        "name":       router.get("name",""),
+                    }})
                 except Exception as _e:
                     _sync_stats[rid] = {
                         "last_sync": datetime.now().isoformat(timespec="seconds"),
                         "new":       0,
                         "ok":        False,
                         "error":     str(_e),
-                        "host":      router.get("host", ""),
+                        "host":      host,
                         "name":      router.get("name", ""),
                     }
+                    agent_mod.set_sync_stats({rid: {
+                        "last_ok":    "",
+                        "last_error": str(_e),
+                        "host":       host,
+                        "name":       router.get("name",""),
+                    }})
         except Exception as _e:
             print(f"[SYNC] boucle erreur: {_e}")
-        time.sleep(5)  # cycle complet toutes les 5 secondes
+        time.sleep(max(60, BG_REVENUE_SYNC_INTERVAL))
+
+
+def _bg_runtime_support_loop():
+    """Thread daemon : aligne durablement les scripts ticket sur tous les routeurs/profils."""
+    time.sleep(12)
+    while True:
+        try:
+            for router in db_mod.db_get_routers():
+                api = None
+                try:
+                    api, err = mk.safe_connect_router(router, timeout=8)
+                    if err or not api:
+                        continue
+                    ensure_ticket_runtime_support(api)
+                except Exception as _e:
+                    print(f"[RUNTIME] erreur {router.get('host','?')}: {_e}")
+                finally:
+                    _close_api_quietly(api)
+        except Exception as _e:
+            print(f"[RUNTIME] boucle erreur: {_e}")
+        time.sleep(900)
 
 
 threading.Thread(target=_bg_ventes_loop, daemon=True).start()
+threading.Thread(target=_bg_runtime_support_loop, daemon=True).start()
+agent_mod.start()
 
 
 def get_profile_time_limit(router_id, profile_name):
     metadata = db_mod.db_get_hotspot_profile_metadata(router_id, profile_name) or {}
-    return normalize_ticket_time_limit(metadata.get("time_limit"))
+    return normalize_profile_time_limit(metadata.get("time_limit"))
 
 
 def resolve_ticket_time_limit(router_id, profile_name, requested_time_limit):
-    normalized_requested = normalize_ticket_time_limit(requested_time_limit)
+    normalized_requested = coerce_ticket_time_limit_router(requested_time_limit, empty="", prefer_legacy_routeros=False)
+    if normalized_requested != "":
+        return normalized_requested
+    profile_time_limit = get_profile_time_limit(router_id, profile_name)
+    return coerce_ticket_time_limit_router(profile_time_limit, empty="0", prefer_legacy_routeros=False) or "0"
+
+
+def resolve_ticket_time_limit_display(router_id, profile_name, requested_time_limit):
+    normalized_requested = coerce_ticket_time_limit_user(requested_time_limit, empty="", prefer_legacy_routeros=False)
     if normalized_requested != "":
         return normalized_requested
     profile_time_limit = get_profile_time_limit(router_id, profile_name)
@@ -990,11 +2409,8 @@ def resolve_ticket_time_limit(router_id, profile_name, requested_time_limit):
 
 
 def strip_ticket_runtime_comment(comment):
-    raw = str(comment or "").strip()
-    marker_pos = raw.find(KETAMON_TICKET_COMMENT_MARKER)
-    if marker_pos != -1:
-        raw = raw[:marker_pos].rstrip()
-    return raw
+    base_comment, _expire_raw = _split_ticket_runtime_comment(comment)
+    return base_comment
 
 
 def build_hotspot_user_comment(user_comment, mode="vc-"):
@@ -1017,7 +2433,68 @@ def build_ticket_login_wrapper_script(existing_script_name):
     ])
 
 
+def _build_routeros_local_epoch_lines(indent=""):
+    prefix = str(indent or "")
+    lines = [
+        ':local cdate [/system clock get date];',
+        ':local ctime [/system clock get time];',
+        ':local year 0;',
+        ':local month 0;',
+        ':local day 0;',
+        ':if ([:find $cdate "-"] != nil) do={',
+        '    :set year  [:tonum [:pick $cdate 0 4]];',
+        '    :set month [:tonum [:pick $cdate 5 7]];',
+        '    :set day   [:tonum [:pick $cdate 8 10]];',
+        '} else={',
+        '    :local monTxt [:pick $cdate 0 3];',
+        '    :set day  [:tonum [:pick $cdate 4 6]];',
+        '    :set year [:tonum [:pick $cdate 7 11]];',
+        '    :if ($monTxt = "jan") do={ :set month 1; }',
+        '    :if ($monTxt = "feb") do={ :set month 2; }',
+        '    :if ($monTxt = "mar") do={ :set month 3; }',
+        '    :if ($monTxt = "apr") do={ :set month 4; }',
+        '    :if ($monTxt = "may") do={ :set month 5; }',
+        '    :if ($monTxt = "jun") do={ :set month 6; }',
+        '    :if ($monTxt = "jul") do={ :set month 7; }',
+        '    :if ($monTxt = "aug") do={ :set month 8; }',
+        '    :if ($monTxt = "sep") do={ :set month 9; }',
+        '    :if ($monTxt = "oct") do={ :set month 10; }',
+        '    :if ($monTxt = "nov") do={ :set month 11; }',
+        '    :if ($monTxt = "dec") do={ :set month 12; }',
+        '}',
+        ':if (($year < 2020) || ($month < 1) || ($day < 1)) do={ :return; }',
+        ':local hh [:tonum [:pick $ctime 0 2]];',
+        ':local mm [:tonum [:pick $ctime 3 5]];',
+        ':local ss [:tonum [:pick $ctime 6 8]];',
+        ':local moff 0;',
+        ':if ($month > 1)  do={ :set moff ($moff + 31); }',
+        ':if ($month > 2)  do={ :set moff ($moff + 28); }',
+        ':if ($month > 3)  do={ :set moff ($moff + 31); }',
+        ':if ($month > 4)  do={ :set moff ($moff + 30); }',
+        ':if ($month > 5)  do={ :set moff ($moff + 31); }',
+        ':if ($month > 6)  do={ :set moff ($moff + 30); }',
+        ':if ($month > 7)  do={ :set moff ($moff + 31); }',
+        ':if ($month > 8)  do={ :set moff ($moff + 31); }',
+        ':if ($month > 9)  do={ :set moff ($moff + 30); }',
+        ':if ($month > 10) do={ :set moff ($moff + 31); }',
+        ':if ($month > 11) do={ :set moff ($moff + 30); }',
+        ':local y ($year - 1970);',
+        ':local leaps (($y + 1) / 4 - ($y + 69) / 100 + ($y + 369) / 400);',
+        ':local dse (($y * 365) + $leaps + $moff + ($day - 1));',
+        ':if ($month > 2) do={',
+        '    :if ($year % 4   = 0) do={ :set dse ($dse + 1); }',
+        '    :if ($year % 100 = 0) do={ :set dse ($dse - 1); }',
+        '    :if ($year % 400 = 0) do={ :set dse ($dse + 1); }',
+        '}',
+        ':local nowEpoch (($dse * 86400) + ($hh * 3600) + ($mm * 60) + $ss);',
+    ]
+    return [prefix + line for line in lines]
+
+
 def build_ketamon_ticket_login_script_source():
+    # Epoch computation — uses /system clock (NTP-synced) so expiry survives reboots.
+    # RouterOS 7 date format: "2026-05-12" (ISO yyyy-mm-dd), positions 0-3=year, 5-6=month, 8-9=day.
+    _epoch_lines = _build_routeros_local_epoch_lines(indent="    ")
     return "\n".join([
         ':local uname $user;',
         ':local loginMac $"mac-address";',
@@ -1030,13 +2507,52 @@ def build_ketamon_ticket_login_script_source():
         ':if (([:len $limitVal] = 0) || ($limitVal = "0") || ($limitVal = "0s") || ($limitVal = "none")) do={ :return; }',
         ':local currentComment [:tostr [/ip hotspot user get $userId comment]];',
         f':local marker "{KETAMON_TICKET_COMMENT_MARKER}";',
+        f':local markerAlt "{KETAMON_TICKET_COMMENT_MARKER.strip()}";',
         ':local markerPos [:find $currentComment $marker];',
+        ':if ($markerPos = nil) do={ :set markerPos [:find $currentComment $markerAlt]; }',
         ':if ($markerPos = nil) do={',
-        '    :local expireAt ([:timestamp] + [:totime $limitVal]);',
+        *_epoch_lines,
+        '    :if ($nowEpoch < 1000000000) do={ :return; }',
+        '    :local durSec 0;',
+        '    :local workVal $limitVal;',
+        '    :local wPos [:find $workVal "w"];',
+        '    :if ($wPos != nil) do={',
+        '        :set durSec ($durSec + ([:tonum [:pick $workVal 0 $wPos]] * 604800));',
+        '        :set workVal [:pick $workVal ($wPos + 1) [:len $workVal]];',
+        '    }',
+        '    :local dPos [:find $workVal "d"];',
+        '    :if ($dPos != nil) do={',
+        '        :set durSec ($durSec + ([:tonum [:pick $workVal 0 $dPos]] * 86400));',
+        '        :set workVal [:pick $workVal ($dPos + 1) [:len $workVal]];',
+        '    }',
+        '    :local colonPos [:find $workVal ":"];',
+        '    :if ($colonPos != nil) do={',
+        '        :local dHH [:tonum [:pick $workVal 0 2]];',
+        '        :local dMM [:tonum [:pick $workVal 3 5]];',
+        '        :local dSS [:tonum [:pick $workVal 6 8]];',
+        '        :set durSec ($durSec + ($dHH * 3600) + ($dMM * 60) + $dSS);',
+        '    } else={',
+        '        :local hPos [:find $workVal "h"];',
+        '        :if ($hPos != nil) do={',
+        '            :set durSec ($durSec + ([:tonum [:pick $workVal 0 $hPos]] * 3600));',
+        '            :set workVal [:pick $workVal ($hPos + 1) [:len $workVal]];',
+        '        }',
+        '        :local mPos [:find $workVal "m"];',
+        '        :if ($mPos != nil) do={',
+        '            :set durSec ($durSec + ([:tonum [:pick $workVal 0 $mPos]] * 60));',
+        '            :set workVal [:pick $workVal ($mPos + 1) [:len $workVal]];',
+        '        }',
+        '        :local sPos [:find $workVal "s"];',
+        '        :if ($sPos != nil) do={ :set durSec ($durSec + [:tonum [:pick $workVal 0 $sPos]]); }',
+        '    }',
+        '    :if ($durSec <= 0) do={ :return; }',
+        '    :local expireEpoch ($nowEpoch + $durSec);',
         '    :local baseComment $currentComment;',
-        '    :local oldMarkerPos [:find $baseComment " ##KETAMON## "];',
-        '    :if ($oldMarkerPos != nil) do={ :set baseComment [:pick $baseComment 0 $oldMarkerPos]; }',
-        '    /ip hotspot user set $userId comment=($baseComment . $marker . $expireAt) limit-uptime=0;',
+        '    :if ([:len $baseComment] > 0) do={',
+        '        /ip hotspot user set $userId comment=($baseComment . $marker . [:tostr $expireEpoch]) limit-uptime=0;',
+        '    } else={',
+        '        /ip hotspot user set $userId comment=($markerAlt . [:tostr $expireEpoch]) limit-uptime=0;',
+        '    }',
         '}',
     ])
 
@@ -1045,28 +2561,48 @@ def build_ketamon_ticket_expiry_script_source():
     # Seuls les tickets UTILISÉS ont le marqueur ##KETAMON## exp=...
     # Les tickets non utilisés (bytes-in=0, pas de marqueur) ne sont JAMAIS touchés.
     # Quand un ticket expiré est détecté : sessions/cookies/hosts coupés + ticket SUPPRIMÉ.
+    # L'expiry est stockée en secondes depuis epoch (Jan 1 1970 heure locale) pour survivre
+    # aux redémarrages du routeur ([:timestamp] était relatif au boot, inutilisable ici).
     return "\n".join([
         f':local marker "{KETAMON_TICKET_COMMENT_MARKER}";',
-        ':local nowNs [:tonsec value=[:timestamp]];',
+        f':local markerAlt "{KETAMON_TICKET_COMMENT_MARKER.strip()}";',
+        *_build_routeros_local_epoch_lines(),
         ':local expiredIds [:toarray ""];',
         '/ip hotspot user',
         ':foreach userId in=[find] do={',
         '    :local comment [:tostr [get $userId comment]];',
         '    :local markerPos [:find $comment $marker];',
-        '    :if ($markerPos = nil) do={ :continue; }',
-        '    :local startPos ($markerPos + [:len $marker]);',
-        '    :local expireRaw [:pick $comment $startPos [:len $comment]];',
-        '    :if ([:len $expireRaw] = 0) do={ :continue; }',
-        '    :local expireTime [:totime $expireRaw];',
-        '    :if ([:typeof $expireTime] = "nil") do={ :continue; }',
-        '    :local expireNs [:tonsec value=$expireTime];',
-        '    :if ($nowNs >= $expireNs) do={',
-        '        :local uname [:tostr [get $userId name]];',
-        '        :local lockedMac [:tostr [get $userId mac-address]];',
-        '        /ip hotspot active remove [find where user=$uname];',
-        '        /ip hotspot cookie remove [find where user=$uname];',
-        '        :if (([:len $lockedMac] > 0) && ($lockedMac != "00:00:00:00:00:00")) do={ /ip hotspot host remove [find where mac-address=$lockedMac]; }',
-        '        set $expiredIds ($expiredIds, $userId);',
+        '    :local markerLen [:len $marker];',
+        '    :if ($markerPos = nil) do={',
+        '        :set markerPos [:find $comment $markerAlt];',
+        '        :set markerLen [:len $markerAlt];',
+        '    }',
+        '    :if ($markerPos != nil) do={',
+        '        :local startPos ($markerPos + $markerLen);',
+        '        :local expireRaw [:pick $comment $startPos [:len $comment]];',
+        '        :if ([:len $expireRaw] > 0) do={',
+        '            :local expireEpoch [:tonum $expireRaw];',
+        '            :if ($expireEpoch >= 1000000000) do={',
+        '                :if ($nowEpoch >= $expireEpoch) do={',
+        '                    :local uname [:tostr [get $userId name]];',
+        '                    :local lockedMac [:tostr [get $userId mac-address]];',
+        '                    :foreach activeId in=[/ip hotspot active find where user=$uname] do={',
+        '                        :local activeAddress [:tostr [/ip hotspot active get $activeId address]];',
+        '                        :local activeMac [:tostr [/ip hotspot active get $activeId mac-address]];',
+        '                        :if ([:len $activeAddress] > 0) do={ /ip hotspot host remove [find where address=$activeAddress]; }',
+        '                        :if (([:len $activeMac] > 0) && ($activeMac != "00:00:00:00:00:00")) do={ /ip hotspot host remove [find where mac-address=$activeMac]; }',
+        '                        /ip hotspot active remove $activeId;',
+        '                    }',
+        '                    :foreach cookieId in=[/ip hotspot cookie find where user=$uname] do={',
+        '                        :local cookieMac [:tostr [/ip hotspot cookie get $cookieId mac-address]];',
+        '                        :if (([:len $cookieMac] > 0) && ($cookieMac != "00:00:00:00:00:00")) do={ /ip hotspot host remove [find where mac-address=$cookieMac]; }',
+        '                        /ip hotspot cookie remove $cookieId;',
+        '                    }',
+        '                    :if (([:len $lockedMac] > 0) && ($lockedMac != "00:00:00:00:00:00")) do={ /ip hotspot host remove [find where mac-address=$lockedMac]; }',
+        '                    :set expiredIds ($expiredIds, $userId);',
+        '                }',
+        '            }',
+        '        }',
         '    }',
         '}',
         ':foreach eid in=$expiredIds do={ /ip hotspot user remove $eid; }',
@@ -1104,21 +2640,42 @@ def upsert_router_scheduler(api, name, on_event, interval="30s", start_time="00:
         resource.add(**params)
 
 
-def ensure_ticket_runtime_support(api, profile_name=None):
-    upsert_router_script(api, KETAMON_TICKET_LOGIN_SCRIPT, build_ketamon_ticket_login_script_source())
-    upsert_router_script(api, KETAMON_TICKET_EXPIRY_SCRIPT, build_ketamon_ticket_expiry_script_source())
-    upsert_router_scheduler(api, KETAMON_TICKET_EXPIRY_SCHEDULER, KETAMON_TICKET_EXPIRY_SCRIPT)
+def _get_ros_major_version(api):
+    try:
+        rows = api.get_resource("/system/resource").get()
+        ver = str(rows[0].get("version", "6") if rows else "6")
+        return int(ver.split(".")[0])
+    except Exception:
+        return 6
 
-    profile_name = str(profile_name or "").strip()
+def ensure_ntp_configured(api):
+    # Google Public NTP — IPs stables, compatibles v6 (pas de DNS) et v7
+    NTP_V7_SERVER  = "pool.ntp.org"
+    NTP_V6_PRIMARY = "216.239.35.0"   # time1.google.com
+    NTP_V6_SECONDARY = "216.239.35.4" # time2.google.com
+    try:
+        major = _get_ros_major_version(api)
+        res = api.get_resource("/system/ntp/client")
+        rows = res.get()
+        current = rows[0] if rows else {}
+        enabled = str(current.get("enabled", "no")).strip().lower()
+
+        if major >= 7:
+            servers = str(current.get("servers", "")).strip()
+            if enabled != "yes" or NTP_V7_SERVER not in servers:
+                res.set(enabled="yes", servers=NTP_V7_SERVER)
+        else:
+            primary = str(current.get("primary-ntp", "")).strip()
+            if enabled != "yes" or primary != NTP_V6_PRIMARY:
+                res.set(**{"enabled": "yes", "primary-ntp": NTP_V6_PRIMARY, "secondary-ntp": NTP_V6_SECONDARY})
+    except Exception:
+        pass
+
+
+def _ensure_ticket_runtime_profile_binding(api, profile_resource, profile_row):
+    profile_name = str(profile_row.get("name") or "").strip()
     if not profile_name:
         return
-
-    profile_resource = api.get_resource("/ip/hotspot/user/profile")
-    profiles = profile_resource.get(name=profile_name)
-    if not profiles:
-        return
-
-    profile_row = profiles[0]
     current_on_login = str(profile_row.get("on-login") or "").strip()
     wrapper_name = sanitize_router_script_name("ketamon-login", profile_name)
     desired_on_login = KETAMON_TICKET_LOGIN_SCRIPT
@@ -1131,6 +2688,22 @@ def ensure_ticket_runtime_support(api, profile_name=None):
 
     if current_on_login != desired_on_login:
         profile_resource.set(id=router_item_id(profile_row), **{"on-login": desired_on_login})
+
+
+def ensure_ticket_runtime_support(api, profile_name=None):
+    ensure_ntp_configured(api)
+    upsert_router_script(api, KETAMON_TICKET_LOGIN_SCRIPT, build_ketamon_ticket_login_script_source())
+    upsert_router_script(api, KETAMON_TICKET_EXPIRY_SCRIPT, build_ketamon_ticket_expiry_script_source())
+    upsert_router_scheduler(api, KETAMON_TICKET_EXPIRY_SCHEDULER, KETAMON_TICKET_EXPIRY_SCRIPT)
+
+    profile_resource = api.get_resource("/ip/hotspot/user/profile")
+    profile_name = str(profile_name or "").strip()
+    profiles = profile_resource.get(name=profile_name) if profile_name else profile_resource.get()
+    if not profiles:
+        return
+
+    for profile_row in profiles:
+        _ensure_ticket_runtime_profile_binding(api, profile_resource, profile_row)
 
 
 def normalize_hotspot_profile(profile, metadata=None):
@@ -1146,19 +2719,366 @@ def normalize_hotspot_profile(profile, metadata=None):
         row["price"] = meta.get("price")
     if meta.get("currency"):
         row["currency"] = meta.get("currency")
-    row["time-limit"] = normalize_ticket_time_limit(meta.get("time_limit")) or "0"
+    row["time-limit"] = normalize_profile_time_limit(meta.get("time_limit")) or "0"
     row["_ketamon_meta"] = bool(meta)
     return row
+
+
+def _relay_fallback_rows(router_id, path):
+    router_id = str(router_id or "").strip()
+    path = str(path or "").rstrip("/")
+    if not router_id:
+        return []
+    conn = db_mod.get_conn()
+    if path == "/ip/hotspot/user/profile":
+        rows = conn.execute("""
+            SELECT profile_name, price, currency, expire_mode, lock_user, time_limit
+            FROM hotspot_profile_metadata
+            WHERE router_id=?
+            ORDER BY profile_name
+        """, (router_id,)).fetchall()
+        return [{
+            ".id": f"*db-prof-{idx}",
+            "name": row["profile_name"],
+            "rate-limit": "",
+            "shared-users": "1",
+            "address-pool": "",
+            "price": row["price"],
+            "currency": row["currency"],
+            "expire-mode": row["expire_mode"],
+            "add-mac-cookie": row["lock_user"],
+            "time-limit": row["time_limit"],
+            "_source": "database",
+        } for idx, row in enumerate(rows, start=1)]
+    if path == "/ip/hotspot/user":
+        rows = conn.execute("""
+            SELECT tp.user, tp.profil, tp.created_at, hp.time_limit
+            FROM ticket_pricing tp
+            LEFT JOIN hotspot_profile_metadata hp
+              ON hp.router_id=tp.router_id
+             AND hp.profile_name=tp.profil
+            WHERE tp.router_id=?
+            ORDER BY tp.created_at DESC, tp.user
+            LIMIT 1000
+        """, (router_id,)).fetchall()
+        restored = []
+        for idx, row in enumerate(rows, start=1):
+            limit_uptime = coerce_ticket_time_limit_router(row["time_limit"], empty="0", prefer_legacy_routeros=False) or "0"
+            restored.append({
+                ".id": f"*db-user-{idx}",
+                "name": row["user"],
+                "password": row["user"],
+                "profile": row["profil"] or "default",
+                "disabled": "no",
+                "limit-uptime": limit_uptime,
+                "uptime": "0",
+                "comment": "restored-from-database",
+                "_source": "database",
+            })
+        return restored
+    if path == "/ip/hotspot":
+        row = conn.execute("""
+            SELECT reseau
+            FROM ticket_pricing
+            WHERE router_id=? AND COALESCE(reseau,'')!=''
+            GROUP BY reseau
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+        """, (router_id,)).fetchone()
+        if row and row["reseau"]:
+            return [{".id": "*db-hotspot-1", "name": row["reseau"], "_source": "database"}]
+    return []
+
+
+def _relay_database_dashboard_data(router):
+    router = dict(router or {})
+    router_id = str(router.get("id") or router.get("host") or "").strip()
+    conn = db_mod.get_conn()
+    tickets = conn.execute("SELECT COUNT(*) FROM ticket_pricing WHERE router_id=?", (router_id,)).fetchone()[0]
+    profiles = conn.execute("SELECT COUNT(*) FROM hotspot_profile_metadata WHERE router_id=?", (router_id,)).fetchone()[0]
+    active = 0
+    fresh_active, _updated_at, _age = _relay_snapshot_state(router_id, "/ip/hotspot/active")
+    if fresh_active:
+        active = len(db_mod.db_get_router_relay_snapshot(router_id, "/ip/hotspot/active"))
+    server = conn.execute("""
+        SELECT reseau
+        FROM ticket_pricing
+        WHERE router_id=? AND COALESCE(reseau,'')!=''
+        GROUP BY reseau
+        ORDER BY COUNT(*) DESC
+        LIMIT 1
+    """, (router_id,)).fetchone()
+    return {
+        "identity": router.get("name") or "MikroTik",
+        "board": "Donnees restaurees",
+        "version": "Base KetaMon",
+        "uptime": "",
+        "cpu_load": "0",
+        "total_mem": "",
+        "free_mem": "",
+        "mem_pct": 0,
+        "total_hdd": "",
+        "free_hdd": "",
+        "time": "",
+        "date": router.get("relay_last_seen") or "",
+        "hs_users": tickets,
+        "hs_active": active,
+        "hs_profiles": profiles,
+        "hs_servers": [server["reseau"]] if server and server["reseau"] else [router.get("name", "")],
+        "router_host": router.get("host", ""),
+        "router_port": str(router.get("port", "8728")),
+        "restored_from_db": True,
+    }
+
+
+RELAY_ACTIVE_SNAPSHOT_TTL_SECONDS = safe_int(
+    os.environ.get("KETAMON_RELAY_ACTIVE_TTL", "120"),
+    default=120,
+    min_val=30,
+    max_val=3600,
+)
+RELAY_VOLATILE_RESOURCES = {"/ip/hotspot/active"}
+
+
+def _relay_snapshot_state(router_id, resource, ttl_seconds=RELAY_ACTIVE_SNAPSHOT_TTL_SECONDS):
+    router_id = str(router_id or "").strip()
+    resource = str(resource or "").rstrip("/") or "/"
+    if not router_id:
+        return False, "", None
+    try:
+        snapshots = db_mod.db_get_router_relay_snapshot(router_id)
+        meta = snapshots.get(resource) if isinstance(snapshots, dict) else None
+        updated_at = str((meta or {}).get("updated_at") or "")
+        if not updated_at:
+            return False, "", None
+        updated_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        if updated_dt.tzinfo is not None:
+            updated_dt = updated_dt.replace(tzinfo=None)
+        age = max(0, int((datetime.now() - updated_dt).total_seconds()))
+        return age <= int(ttl_seconds or 120), updated_at, age
+    except Exception:
+        return False, "", None
+
+
+class RelaySnapshotResource:
+    def __init__(self, relay_api, path):
+        self._api = relay_api
+        self._path = str(path or "").rstrip("/") or "/"
+
+    def _rows(self):
+        if self._path in RELAY_VOLATILE_RESOURCES:
+            fresh, updated_at, age = _relay_snapshot_state(self._api.router_id, self._path)
+            if not fresh:
+                self._api.stale_resources[self._path] = {
+                    "updated_at": updated_at,
+                    "age": age,
+                    "ttl": RELAY_ACTIVE_SNAPSHOT_TTL_SECONDS,
+                }
+                return []
+        rows = db_mod.db_get_router_relay_snapshot(self._api.router_id, self._path)
+        normalized = [dict(row) for row in (rows or []) if isinstance(row, dict)]
+        if self._path == "/ip/hotspot/user/profile":
+            metadata_map = get_hotspot_profile_metadata_map(self._api.router_id)
+            seen = set()
+            enriched = []
+            for row in normalized:
+                name = str(row.get("name") or "").strip()
+                if name:
+                    seen.add(name)
+                enriched.append(normalize_hotspot_profile(row, metadata_map.get(name, {})))
+            for name, meta in metadata_map.items():
+                if name not in seen:
+                    enriched.append(normalize_hotspot_profile({"name": name, "_source": "database"}, meta))
+            return enriched
+        if self._path == "/ip/hotspot/user":
+            metadata_map = get_hotspot_profile_metadata_map(self._api.router_id)
+            for row in normalized:
+                username = str(row.get("name") or "").strip()
+                if not username:
+                    continue
+                meta = _ticket_db_meta(self._api.router_id, username)
+                profile = str(row.get("profile") or meta.get("profil") or "").strip()
+                if profile and not row.get("profile"):
+                    row["profile"] = profile
+                if not str(row.get("limit-uptime") or "").strip() or str(row.get("limit-uptime") or "").strip() == "0":
+                    duration = metadata_map.get(profile, {}).get("time_limit") if profile else ""
+                    if not duration:
+                        duration = _ticket_meta_time_limit(meta)
+                    limit = coerce_ticket_time_limit_router(duration, empty="0", prefer_legacy_routeros=False) or "0"
+                    row["limit-uptime"] = limit
+        if normalized:
+            return normalized
+        return _relay_fallback_rows(self._api.router_id, self._path)
+
+    def get(self, **filters):
+        rows = self._rows()
+        if not filters:
+            return rows
+        filtered = []
+        for row in rows:
+            matched = True
+            for key, value in filters.items():
+                probe_keys = [key]
+                if key == "id":
+                    probe_keys.append(".id")
+                    if not str(value).strip().startswith("*"):
+                        probe_keys.append("name")
+                elif key == ".id":
+                    probe_keys.append("id")
+                expected = str(value)
+                if not any(str(row.get(k, "")) == expected for k in probe_keys):
+                    matched = False
+                    break
+            if matched:
+                filtered.append(row)
+        return filtered
+
+    def add(self, **params):
+        source = _relay_build_resource_command(self._path, "add", params)
+        return self._api.queue_routeros_script(source)
+
+    def set(self, **params):
+        params = dict(params or {})
+        item_id = params.pop("id", params.pop(".id", ""))
+        if item_id and not _is_real_router_item_id(item_id):
+            source = _routeros_set_by_name_source(self._path, item_id, params)
+        else:
+            source = _relay_build_resource_command(self._path, "set", params, item_id=item_id)
+        return self._api.queue_routeros_script(source)
+
+    def remove(self, id):
+        item_id = str(id or "").strip()
+        if item_id and not _is_real_router_item_id(item_id):
+            source = f"{_relay_routeros_path(self._path)} remove [{_routeros_find_target(self._path, item_id)}];"
+        else:
+            source = _relay_build_resource_command(self._path, "remove", {}, item_id=item_id)
+        return self._api.queue_routeros_script(source)
+
+    def call(self, command, extra_params=None):
+        command = str(command or "").strip()
+        extra_params = dict(extra_params or {})
+        if command == "print" and "count-only" in extra_params:
+            return len(self._rows())
+        source = _relay_build_resource_command(self._path, command, extra_params)
+        return self._api.queue_routeros_script(source)
+
+
+class RelaySnapshotApi:
+    def __init__(self, router):
+        self.router = dict(router or {})
+        self.router_id = str(self.router.get("id") or self.router.get("host") or "").strip()
+        self.owner_id = str(self.router.get("owner_id") or "").strip()
+        self.is_relay_snapshot = True
+        self.stale_resources = {}
+
+    def get_resource(self, path):
+        return RelaySnapshotResource(self, path)
+
+    def queue_routeros_script(self, source):
+        if not self.router_id:
+            raise RuntimeError("Routeur relais introuvable")
+        command = db_mod.db_enqueue_router_relay_command(
+            self.router_id,
+            self.owner_id,
+            "routeros-script",
+            {"source": str(source or "")},
+        )
+        if not command:
+            raise RuntimeError("Impossible de creer la commande relais")
+        return command["id"]
+
+    def close(self):
+        return None
+
+
+def _router_has_relay_snapshots(router) -> bool:
+    router_id = str((router or {}).get("id") or (router or {}).get("host") or "").strip()
+    if not router_id:
+        return False
+    try:
+        snapshots = db_mod.db_get_router_relay_snapshot(router_id)
+        return bool(snapshots)
+    except Exception:
+        return False
+
+
+def _relay_routeros_path(path):
+    parts = [part for part in str(path or "").strip("/").split("/") if part]
+    return "/" + " ".join(parts) if parts else "/"
+
+
+def _relay_routeros_quote(value):
+    text = str(value if value is not None else "")
+    text = text.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+    text = text.replace("\r", " ").replace("\n", " ")
+    return f'"{text}"'
+
+
+def _relay_routeros_key(key):
+    return str(key or "").strip().replace("_", "-")
+
+
+def _relay_build_resource_command(path, action, params=None, item_id=""):
+    path_cmd = _relay_routeros_path(path)
+    action = str(action or "").strip()
+    params = dict(params or {})
+    parts = [path_cmd, action]
+    if item_id:
+        parts.append(_relay_routeros_quote(item_id))
+    for key, value in params.items():
+        key = _relay_routeros_key(key)
+        if not key:
+            continue
+        if key in {"id", ".id"}:
+            continue
+        parts.append(f"{key}={_relay_routeros_quote(value)}")
+    return " ".join(parts) + ";"
 
 
 def get_api():
     r = get_active_router()
     if not r:
         return None, "Aucun routeur actif"
-    driver = r.get("driver", "mikrotik")
-    router_user = r.get("user") or r.get("username") or "admin"
-    api, err = mk.safe_connect(r["host"], router_user, r.get("password", ""), r.get("port", 8728), driver=driver)
+    if int(r.get("relay_enabled") or 0):
+        return RelaySnapshotApi(r), None
+    api, err = mk.safe_connect_router(r)
+    if api:
+        apis = getattr(g, "_mikrotik_apis", None)
+        if apis is None:
+            apis = []
+            g._mikrotik_apis = apis
+        apis.append(api)
     return api, err
+
+
+def _connect_router_universal(router):
+    router = dict(router or {})
+    api, err = mk.safe_connect_router(router)
+    if not err and api:
+        return api, None
+    if int(router.get("relay_enabled") or 0):
+        return RelaySnapshotApi(router), None
+    return api, err
+
+
+def _apply_ticket_runtime_to_router(router_info, timeout=8):
+    """
+    Tente d'installer immédiatement les scripts ticket sur un routeur.
+    Retourne (ok, message) sans lever d'exception bloquante pour le parcours UI.
+    """
+    router_info = dict(router_info or {})
+    api = None
+    try:
+        api, err = mk.safe_connect_router(router_info, timeout=timeout)
+        if err or not api:
+            return False, str(err or "connexion impossible")
+        ensure_ntp_configured(api)
+        ensure_ticket_runtime_support(api)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+    finally:
+        _close_api_quietly(api)
 
 
 def _normalize_router_count(value):
@@ -1199,23 +3119,125 @@ def resource_count(api, path):
         return 0
 
 # ─── Context processor ───────────────────────────────────────────────────────
+def resource_first(api, path):
+    try:
+        rows = api.get_resource(path).get()
+        return rows[0] if rows else {}
+    except Exception:
+        return {}
+
+
+def _invalidate_routers_cache():
+    _layout_routers_cache["ts"] = 0.0
+
+# Cache court pour la liste des routeurs (évite une requête SQL à chaque render)
+_layout_routers_cache: dict = {"data": [], "ts": 0.0, "owner": ""}
+_LAYOUT_ROUTERS_TTL = 4  # secondes
+
+# Cache permanent pour la version CSS/JS/PWA (mtime calcule une seule fois au boot)
+_css_ver_cache: dict = {"v": 0}
+_js_ver_cache: dict = {"v": 0}
+_pwa_ver_cache: dict = {"v": ""}
+
+def _get_css_ver():
+    if not _css_ver_cache["v"]:
+        try:
+            _css_ver_cache["v"] = int(os.path.getmtime(
+                os.path.join(os.path.dirname(__file__), "static", "css", "style.css")
+            ))
+        except Exception:
+            _css_ver_cache["v"] = 1
+    return _css_ver_cache["v"]
+
+
+def _get_js_ver():
+    if not _js_ver_cache["v"]:
+        try:
+            _js_ver_cache["v"] = int(os.path.getmtime(
+                os.path.join(os.path.dirname(__file__), "static", "js", "main.js")
+            ))
+        except Exception:
+            _js_ver_cache["v"] = 1
+    return _js_ver_cache["v"]
+
+
+def _get_pwa_ver():
+    if _pwa_ver_cache["v"]:
+        return _pwa_ver_cache["v"]
+
+    override = os.environ.get("KETAMON_PWA_VERSION", "").strip()
+    if override:
+        cleaned = re.sub(r"[^0-9A-Za-z_.-]", "", override)
+        _pwa_ver_cache["v"] = cleaned or "1"
+        return _pwa_ver_cache["v"]
+
+    watched_paths = [
+        ("app.py",),
+        ("database.py",),
+        ("ketamon_agent.py",),
+        ("templates", "base.html"),
+        ("templates", "login.html"),
+        ("static", "sw.js"),
+        ("static", "manifest.json"),
+        ("static", "css", "style.css"),
+        ("static", "js", "main.js"),
+    ]
+    mtimes = []
+    for parts in watched_paths:
+        try:
+            mtimes.append(int(os.path.getmtime(os.path.join(APP_DIR, *parts))))
+        except Exception:
+            pass
+    for root_parts in (("templates",), ("static", "css"), ("static", "js")):
+        root_dir = os.path.join(APP_DIR, *root_parts)
+        try:
+            for dirpath, _dirnames, filenames in os.walk(root_dir):
+                for filename in filenames:
+                    try:
+                        mtimes.append(int(os.path.getmtime(os.path.join(dirpath, filename))))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    _pwa_ver_cache["v"] = str(max(mtimes) if mtimes else int(time.time()))
+    return _pwa_ver_cache["v"]
+
+def _safe_agent_count(logged_in: bool) -> int:
+    try:
+        if logged_in and session.get("role") == "concepteur":
+            return db_mod.db_agent_count_open()
+    except Exception:
+        pass
+    return 0
+
+
 @app.context_processor
 def inject_layout_context():
     logged_in = bool(session.get("logged_in"))
     _ad = load_ad_config()
-    _css_path = os.path.join(os.path.dirname(__file__), "static", "css", "style.css")
-    try:
-        _css_ver = int(os.path.getmtime(_css_path))
-    except Exception:
-        _css_ver = 1
+    routers = []
+    if logged_in:
+        owner = _current_owner_id() or ""
+        now = time.time()
+        if (now - _layout_routers_cache["ts"] > _LAYOUT_ROUTERS_TTL
+                or _layout_routers_cache["owner"] != owner):
+            _layout_routers_cache["data"]  = get_routers()
+            _layout_routers_cache["ts"]    = now
+            _layout_routers_cache["owner"] = owner
+        routers = _layout_routers_cache["data"]
     return {
-        "routers": get_routers() if logged_in else [],
+        "routers": routers,
         "active_router": get_active_router() if logged_in else None,
         "current_page": request.endpoint or "",
-        "adsense_pub_id":      _ad.get("adsensePubId", "") or os.environ.get("ADSENSE_PUB_ID", ""),
-        "adsense_banner_slot": _ad.get("adsenseBannerSlot", ""),
-        "adsense_inter_slot":  _ad.get("adsenseInterSlot", ""),
-        "_css_ver": _css_ver,
+        "adsense_pub_id":       _ad.get("adsensePubId", "") or os.environ.get("ADSENSE_PUB_ID", ""),
+        "adsense_banner_slot":  _ad.get("adsenseBannerSlot", ""),
+        "adsense_inter_slot":   _ad.get("adsenseInterSlot", ""),
+        "adsterra_banner_code": _ad.get("adsterraBannerCode", ""),
+        "adsterra_inter_code":  _ad.get("adsterraInterCode", ""),
+        "_css_ver": _get_css_ver(),
+        "_js_ver": _get_js_ver(),
+        "_pwa_ver": _get_pwa_ver(),
+        "agent_open_count": _safe_agent_count(logged_in),
     }
 
 @app.route("/login", methods=["GET", "POST"])
@@ -1246,6 +3268,7 @@ def login():
             resp, err = ks_post("/api/auth/login", {"username": username, "password": password})
             if resp and resp.get("ok"):
                 _clear_login_failures()
+                session.permanent = True
                 session.update({
                     "logged_in": True, "ks_token": resp.get("token"),
                     "username": resp.get("displayName") or username,
@@ -1261,7 +3284,7 @@ def login():
                         creds = json.load(f)
                     stored = creds.get("password", "")
                     if stored and stored.startswith(("pbkdf2:", "scrypt:")):
-                        if check_password_hash(stored, password) and creds.get("username") == username:
+                        if check_password_hash(stored, password) and str(creds.get("username") or "").casefold() == username.casefold():
                             creds_ok = True
                             display = creds.get("displayName", username)
                     else:
@@ -1270,10 +3293,29 @@ def login():
                     pass
                 if creds_ok:
                     _clear_login_failures()
+                    session.permanent = True
                     session.update({
                         "logged_in": True, "ks_token": None,
                         "username": display,
                         "role": "concepteur", "user_id": username,
+                    })
+                    return redirect(url_for("index"))
+
+                local_admin = authenticate_local_user(username, password)
+                if local_admin and str(local_admin.get("role") or "").lower() in {"admin", "concepteur"}:
+                    if not _local_user_is_approved(local_admin) or not _local_user_is_active(local_admin):
+                        flash(_local_user_access_message(local_admin), "warning")
+                        return render_template("login.html", **tpl_vars)
+                    _clear_login_failures()
+                    session.permanent = True
+                    session.update({
+                        "logged_in": True,
+                        "ks_token": None,
+                        "ks_refresh_token": None,
+                        "username": local_admin.get("displayName") or username,
+                        "role": local_admin.get("role", "admin"),
+                        "user_id": local_admin.get("email") or local_admin.get("username") or username,
+                        "auth_source": "local",
                     })
                     return redirect(url_for("index"))
                 _record_login_failure()
@@ -1290,7 +3332,11 @@ def login():
                 # Try local fallback
                 user = authenticate_local_user(email, password)
                 if user:
+                    if not _local_user_is_approved(user) or not _local_user_is_active(user):
+                        flash(_local_user_access_message(user), "warning")
+                        return render_template("login.html", **tpl_vars)
                     _clear_login_failures()
+                    session.permanent = True
                     session.update({
                         "logged_in": True, "ks_token": None,
                         "ks_refresh_token": None,
@@ -1302,7 +3348,20 @@ def login():
                 _record_login_failure()
                 flash("KetaServer indisponible ou identifiants incorrects.", "danger")
             elif remote_session:
+                shadow = _ensure_local_email_shadow(
+                    email,
+                    password=password,
+                    display_name=remote_session.get("username") or email,
+                    role=remote_session.get("role", "utilisateur"),
+                )
+                if not shadow:
+                    flash("Impossible de verifier l'activation de ce compte Gmail.", "danger")
+                    return render_template("login.html", **tpl_vars)
+                if not _local_user_is_approved(shadow) or not _local_user_is_active(shadow):
+                    flash(_local_user_access_message(shadow), "warning")
+                    return render_template("login.html", **tpl_vars)
                 _clear_login_failures()
+                session.permanent = True
                 session.update(remote_session)
                 return redirect(url_for("index"))
             else:
@@ -1323,27 +3382,33 @@ def login():
             elif len(password) < 8:
                 flash("Mot de passe min. 8 caracteres.", "danger")
             else:
+                existing_local = db_mod.db_get_local_user(email)
+                if existing_local and _local_user_is_approved(existing_local) and _local_user_is_active(existing_local):
+                    flash("Ce compte Gmail existe deja. Connectez-vous.", "warning")
+                    tpl_vars["submode"] = "login"
+                    return render_template("login.html", **tpl_vars)
+
+                shadow = local_register(email, password, display)
                 resp, err = ks_post("/api/auth/register",
                                     {"email": email, "password": password, "displayName": display})
-                remote_session = build_remote_user_session(resp, display or email)
-                if err:
-                    u = local_register(email, password, display)
-                    if u:
-                        session.update({
-                            "logged_in": True, "ks_token": None,
-                            "ks_refresh_token": None,
-                            "username": u.get("displayName") or email,
-                            "role": u.get("role", "utilisateur"), "user_id": email,
-                            "auth_source": "local",
-                        })
-                        flash("Compte créé avec succès.", "success")
-                        return redirect(url_for("index"))
+                if not shadow:
                     flash("Inscription impossible. Réessayez.", "danger")
-                elif remote_session:
-                    session.update(remote_session)
-                    return redirect(url_for("index"))
+                elif err:
+                    flash("Compte Gmail cree. En attente d'activation par le concepteur.", "success")
+                    tpl_vars["submode"] = "login"
+                    return render_template("login.html", **tpl_vars)
+                elif resp and resp.get("ok"):
+                    flash("Compte Gmail cree. En attente d'activation par le concepteur.", "success")
+                    tpl_vars["submode"] = "login"
+                    return render_template("login.html", **tpl_vars)
                 else:
-                    flash(resp.get("message", "Erreur inscription.") if resp else "Erreur.", "danger")
+                    flash(
+                        resp.get("message", "Compte en attente d'activation par le concepteur.") if resp
+                        else "Compte en attente d'activation par le concepteur.",
+                        "warning"
+                    )
+                    tpl_vars["submode"] = "login"
+                    return render_template("login.html", **tpl_vars)
 
         # ── MOT DE PASSE OUBLIÉ ────────────────────────────────────────────
         elif submode == "forgot":
@@ -1393,9 +3458,13 @@ def login():
 
 @app.route("/logout")
 def logout():
-    session.clear()
-    flash("Vous avez ete deconnecte.", "info")
-    return redirect(url_for("login"))
+    try:
+        session.clear()
+    except Exception:
+        pass
+    response = redirect(url_for("login"))
+    response.delete_cookie("session")
+    return response
 
 @app.route("/")
 @login_required
@@ -1410,16 +3479,29 @@ def index():
 @login_required
 @router_required
 def dashboard():
+    active_router_info = get_active_router() or {}
+    relay_mode = bool(int(active_router_info.get("relay_enabled") or 0))
+    relay_commands = db_mod.db_get_router_relay_commands(active_router_info.get("id", ""), limit=8) if relay_mode else []
     api, err = get_api()
     data = {}
+    router_error = ""
     if err:
+        router_error = str(err)
         flash(err, "danger")
     else:
         try:
-            res   = api.get_resource("/system/resource").get()[0]
-            ident = api.get_resource("/system/identity").get()[0]
-            clock = api.get_resource("/system/clock").get()[0]
-            rb    = api.get_resource("/system/routerboard").get()[0]
+            res_rows = api.get_resource("/system/resource").get()
+            ident_rows = api.get_resource("/system/identity").get()
+            clock_rows = api.get_resource("/system/clock").get()
+            rb_rows = api.get_resource("/system/routerboard").get()
+            if relay_mode and (not res_rows or not ident_rows):
+                data = _relay_database_dashboard_data(active_router_info)
+                router_error = "Affichage restaure depuis la base KetaMon en attendant le snapshot reel du MikroTik."
+                return render_template("dashboard.html", data=data, router_error=router_error, relay_mode=relay_mode, relay_commands=relay_commands)
+            res   = res_rows[0] if res_rows else {}
+            ident = ident_rows[0] if ident_rows else {}
+            clock = clock_rows[0] if clock_rows else {}
+            rb    = rb_rows[0] if rb_rows else {}
             hs_users    = resource_count(api, "/ip/hotspot/user")
             hs_active   = resource_count(api, "/ip/hotspot/active")
             hs_profiles = resource_count(api, "/ip/hotspot/user/profile")
@@ -1454,8 +3536,9 @@ def dashboard():
                 "router_port":  str(router.get("port", "8728")),
             }
         except Exception as e:
+            router_error = str(e)
             _flash_err("Erreur de communication MikroTik.", e)
-    return render_template("dashboard.html", data=data)
+    return render_template("dashboard.html", data=data, router_error=router_error, relay_mode=relay_mode, relay_commands=relay_commands)
 
 # ─── Hotspot : Utilisateurs ──────────────────────────────────────────────────
 
@@ -1494,6 +3577,8 @@ def reseau_clients():
             for user in users:
                 row = dict(user)
                 username = str(row.get("name") or "").strip()
+                row["id"] = router_action_ref(row, "name")
+                row["limit-uptime"] = normalize_ticket_time_limit(row.get("limit-uptime")) or "0"
                 is_disabled = str(row.get("disabled", "no")).strip().lower() == "yes"
                 active_rows = active_by_user.get(username, [])
                 row["_active_sessions"] = len(active_rows)
@@ -1559,6 +3644,8 @@ def reseau_ajouter_client():
             api.get_resource("/ip/hotspot/user").add(**params)
             flash(f'Client "{name}" cree. 1 ticket = 1 appareil, compteur absolu a la premiere connexion.', "success")
             return redirect(url_for("reseau_clients"))
+        except ValueError as e:
+            flash(str(e), "warning")
         except Exception as e:
             _flash_err("Une erreur est survenue.", e)
     return render_template("reseau/ajouter_client.html", profiles=profiles, servers=servers)
@@ -1577,6 +3664,8 @@ def hotspot_edit_user(uid):
         profiles = api.get_resource("/ip/hotspot/user/profile").get()
         servers  = api.get_resource("/ip/hotspot").get()
         user = users[0] if users else {}
+        if user:
+            user["limit-uptime"] = normalize_ticket_time_limit(user.get("limit-uptime")) or "0"
     except Exception as e:
         _flash_err("Une erreur est survenue.", e)
         return redirect(url_for("hotspot_users"))
@@ -1588,10 +3677,11 @@ def hotspot_edit_user(uid):
             profile  = request.form.get("profile", "default")
             comment  = request.form.get("comment", "")
             server   = (request.form.get("server", "") or "").strip()
+            router_id = session.get("router_id", "")
 
             # Normaliser la limite de temps (accepte "1h30m", "3600s", "0", etc.)
             time_limit_raw = request.form.get("time_limit", "0") or "0"
-            time_limit = normalize_ticket_time_limit(time_limit_raw) or "0"
+            time_limit = coerce_ticket_time_limit_router(time_limit_raw, empty="0", prefer_legacy_routeros=False) or "0"
 
             # Convertir Mo → octets (comme à l'ajout)
             data_limit_mo = request.form.get("data_limit", "0") or "0"
@@ -1638,13 +3728,20 @@ def hotspot_delete_user():
     try:
         payload = request_payload()
         uid = (payload.get("id") or "").strip()
-        if not uid:
+        username_payload = str(payload.get("name") or payload.get("user") or "").strip()
+        if not uid and username_payload:
+            uid = username_payload
+        if not uid and not username_payload:
             return jsonify({"ok": False, "msg": "Identifiant utilisateur introuvable."}), 400
-        users = api.get_resource("/ip/hotspot/user").get(id=uid)
+        user_resource = api.get_resource("/ip/hotspot/user")
+        users = _resource_rows_by_id_or_name(user_resource, item_id=uid, name=username_payload)
         username = str(users[0].get("name") or "") if users else ""
+        if not username and not _is_real_router_item_id(uid):
+            username = uid
         active_rows = find_matching_hotspot_active_rows(api, usernames=[username])
         usernames, addresses, mac_addresses, active_ids = build_active_disconnect_targets(active_rows)
-        api.get_resource("/ip/hotspot/user").remove(id=uid)
+        if not router_resource_remove_by_id_or_name(api, "/ip/hotspot/user", item_id=uid, name=username):
+            return jsonify({"ok": False, "msg": "Utilisateur hotspot introuvable sur le routeur."}), 404
         disconnected = disconnect_hotspot_entities(
             api,
             usernames=usernames or [username],
@@ -1652,6 +3749,11 @@ def hotspot_delete_user():
             mac_addresses=mac_addresses,
             active_ids=active_ids,
         )
+        try:
+            if username:
+                db_mod.db_delete_ticket_pricing(session.get("router_id", ""), [username])
+        except Exception:
+            pass
         return jsonify({"ok": True, "disconnected": disconnected})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
@@ -1667,11 +3769,15 @@ def hotspot_toggle_user():
     try:
         payload = request_payload()
         uid = (payload.get("id") or "").strip()
+        username_payload = str(payload.get("name") or payload.get("user") or "").strip()
+        if not uid and username_payload:
+            uid = username_payload
         disabled = str(payload.get("disabled", "yes")).strip().lower() or "yes"
-        if not uid:
+        if not uid and not username_payload:
             return jsonify({"ok": False, "msg": "Identifiant utilisateur introuvable."}), 400
 
-        users = api.get_resource("/ip/hotspot/user").get(id=uid)
+        user_resource = api.get_resource("/ip/hotspot/user")
+        users = _resource_rows_by_id_or_name(user_resource, item_id=uid, name=username_payload)
         if not users:
             return jsonify({"ok": False, "msg": "Utilisateur hotspot introuvable sur le routeur."}), 404
 
@@ -1679,7 +3785,7 @@ def hotspot_toggle_user():
         active_rows = find_matching_hotspot_active_rows(api, usernames=[username])
         usernames, addresses, mac_addresses, active_ids = build_active_disconnect_targets(active_rows)
 
-        api.get_resource("/ip/hotspot/user").set(id=uid, disabled=disabled)
+        router_resource_set_by_id_or_name(api, "/ip/hotspot/user", {"disabled": disabled}, item_id=uid, name=username)
 
         disconnected = {"active_sessions": 0, "cookies": 0, "hosts": 0}
         if disabled == "yes":
@@ -1786,26 +3892,21 @@ def hotspot_reset_user():
 @login_required
 @router_required
 def hotspot_generate():
-    api, err = get_api()
     profiles, servers = [], []
     generated = []
     router_id = session.get("router_id", "")
-    if err:
-        flash(err, "danger")
-    else:
-        try:
-            profiles = api.get_resource("/ip/hotspot/user/profile").get()
-            servers  = api.get_resource("/ip/hotspot").get()
-        except Exception as e:
-            _flash_err("Une erreur est survenue.", e)
-
+    selected_profile = (request.values.get("profile", "") or "").strip()
+    api = None
+    err = None
+    skip_profile_load = False
     # Charger les métadonnées (prix) de chaque profil depuis SQLite
     profiles_meta = get_hotspot_profile_metadata_map(router_id)
 
-    if request.method == "POST" and not err:
+    if request.method == "POST":
         try:
-            qty          = safe_int(request.form.get("qty", 1), default=1, min_val=1, max_val=200)
+            qty          = safe_int(request.form.get("qty", 1), default=1, min_val=1, max_val=MAX_TICKET_GENERATION_QTY)
             profile      = (request.form.get("profile", "default") or "default").strip() or "default"
+            selected_profile = profile
             server       = (request.form.get("server", "") or "").strip()
             mode          = request.form.get("mode", "aleatoire")
             password_mode = request.form.get("password_mode", "identique")
@@ -1816,7 +3917,8 @@ def hotspot_generate():
             data_limit   = (request.form.get("data_limit", "0") or "0").strip()
             time_limit_override = (request.form.get("time_limit_override", "") or "").strip()
 
-            ticket_time_limit = time_limit_override if time_limit_override else (get_profile_time_limit(router_id, profile) or "0")
+            ticket_time_limit = resolve_ticket_time_limit(router_id, profile, time_limit_override) or "0"
+            ticket_time_limit_label = resolve_ticket_time_limit_display(router_id, profile, time_limit_override) or "0"
 
             # ensure_ticket_runtime_support : exécuter une seule fois par session router
             _erts_key = f"erts_done_{router_id}"
@@ -1837,15 +3939,23 @@ def hotspot_generate():
                 charset = string.ascii_lowercase
             else:
                 charset = string.ascii_lowercase + string.digits
+            existing_names = set()
 
             now_dt   = datetime.now()
             date_str = now_dt.strftime("%Y-%m-%d")
 
             hotspot_resource = api.get_resource("/ip/hotspot/user")
             pricing_batch = []
-            for _ in range(qty):
-                rand = "".join(random.choices(charset, k=length))
-                name = prefix + rand
+            gen_errors = []
+            attempts = 0
+            max_attempts = max(qty * 5, qty + 50)
+            while len(generated) < qty and attempts < max_attempts:
+                attempts += 1
+                try:
+                    name = _next_unique_ticket_name(existing_names, charset, length, prefix)
+                except ValueError as ex:
+                    gen_errors.append(str(ex))
+                    break
                 if password_mode == "different":
                     password = "".join(random.choices(charset, k=length))
                 else:
@@ -1860,7 +3970,7 @@ def hotspot_generate():
                 if server:
                     params["server"] = server
                 try:
-                    hotspot_resource.add(**params)
+                    _add_or_repair_hotspot_ticket(api, hotspot_resource, params)
                     generated.append({
                         "name":       name,
                         "password":   password,
@@ -1870,30 +3980,149 @@ def hotspot_generate():
                         "network":    network_name,
                         "date":       date_str,
                         "data_limit": data_limit,
-                        "time_limit": ticket_time_limit,
+                        "time_limit": ticket_time_limit_label,
                     })
                     pricing_batch.append({
                         "router_id": router_id,
                         "user":      name,
+                        "password":  password,
                         "prix":      float(price) if price and price != "0" else 0.0,
                         "devise":    currency,
                         "profil":    profile,
                         "reseau":    network_name,
                     })
                 except Exception as ex:
-                    _flash_err("Erreur lors de la création du ticket.", ex, "warning")
+                    gen_errors.append(str(ex))
+                    if _looks_like_duplicate_ticket_error(ex):
+                        continue
+                    break
             if pricing_batch:
                 db_mod.db_batch_upsert_ticket_pricing(pricing_batch)
 
-            flash(f"{len(generated)} ticket(s) créé(s).", "success")
+            if len(generated) == qty:
+                flash(f"{len(generated)} ticket(s) crees.", "success")
+            else:
+                detail = gen_errors[-1] if gen_errors else "quantite partielle"
+                flash(f"{len(generated)}/{qty} ticket(s) crees. {detail}", "warning")
+        except ValueError as e:
+            flash(str(e), "warning")
         except Exception as e:
             _flash_err("Une erreur est survenue.", e)
 
+    if not selected_profile and profiles:
+        first_profile = profiles[0] or {}
+        selected_profile = str(first_profile.get("name", "") if isinstance(first_profile, dict) else "")
+
     return render_template("reseau/creer_comptes.html",
         profiles=profiles, servers=servers, generated=generated,
-        profiles_meta=profiles_meta)
+        profiles_meta=profiles_meta, selected_profile=selected_profile)
 
 # ─── Hotspot : Profils ───────────────────────────────────────────────────────
+
+def hotspot_generate_safe():
+    profiles, servers = [], []
+    generated = []
+    router_id = session.get("router_id", "")
+    selected_profile = (request.values.get("profile", "") or "").strip()
+    profiles_meta = get_hotspot_profile_metadata_map(router_id)
+    api = None
+    err = None
+    skip_profile_load = False
+
+    if request.method == "POST":
+        try:
+            qty = safe_int(request.form.get("qty", 1), default=1, min_val=1, max_val=MAX_TICKET_GENERATION_QTY)
+            profile = (request.form.get("profile", "default") or "default").strip() or "default"
+            selected_profile = profile
+            server = (request.form.get("server", "") or "").strip()
+            mode = request.form.get("mode", "aleatoire")
+            password_mode = request.form.get("password_mode", "identique")
+            prefix = (request.form.get("prefix", "") or "").strip()
+            length = safe_int(request.form.get("length", 8), default=8, min_val=4, max_val=32)
+            comment = request.form.get("comment", "")
+            network_name = (request.form.get("network_name", "") or "").strip()
+            data_limit = (request.form.get("data_limit", "0") or "0").strip()
+            time_limit_override = (request.form.get("time_limit_override", "") or "").strip()
+
+            ticket_time_limit = resolve_ticket_time_limit(router_id, profile, time_limit_override) or "0"
+            ticket_time_limit_label = resolve_ticket_time_limit_display(router_id, profile, time_limit_override) or "0"
+            meta = profiles_meta.get(profile, {})
+            price = meta.get("price", "0") or "0"
+            currency = meta.get("currency", "FCFA") or "FCFA"
+
+            with TicketGenerationJob(router_id, qty, profile, source="web") as job:
+                api, err = get_api()
+                if err:
+                    raise RuntimeError(err)
+
+                _erts_key = f"erts_done_{router_id}"
+                if not session.get(_erts_key):
+                    try:
+                        ensure_ticket_runtime_support(api, profile)
+                        session[_erts_key] = True
+                    except Exception:
+                        pass
+
+                generated, gen_errors = create_hotspot_ticket_batch(
+                    api, router_id, qty, profile,
+                    server=server,
+                    mode=mode,
+                    length=length,
+                    prefix=prefix,
+                    password_mode=password_mode,
+                    comment=comment,
+                    network_name=network_name,
+                    data_limit=data_limit,
+                    price=price,
+                    currency=currency,
+                    ticket_time_limit=ticket_time_limit,
+                    ticket_time_limit_label=ticket_time_limit_label,
+                    job=job,
+                    source="web",
+                )
+
+            if len(generated) == qty:
+                flash(f"{len(generated)} ticket(s) crees.", "success")
+            else:
+                detail = gen_errors[-1] if gen_errors else "quantite partielle"
+                flash(f"{len(generated)}/{qty} ticket(s) crees. {detail}", "warning")
+        except TicketGenerationBusyError as e:
+            skip_profile_load = True
+            flash(str(e), "warning")
+        except ValueError as e:
+            flash(str(e), "warning")
+        except Exception as e:
+            _flash_err("Une erreur est survenue.", e)
+
+    if not skip_profile_load:
+        if api is None:
+            api, err = get_api()
+        if err:
+            flash(err, "danger")
+        else:
+            try:
+                profiles = api.get_resource("/ip/hotspot/user/profile").get()
+                servers = api.get_resource("/ip/hotspot").get()
+            except Exception as e:
+                _flash_err("Une erreur est survenue.", e)
+
+    if not selected_profile and profiles:
+        first_profile = profiles[0] or {}
+        selected_profile = str(first_profile.get("name", "") if isinstance(first_profile, dict) else "")
+
+    return render_template(
+        "reseau/creer_comptes.html",
+        profiles=profiles,
+        servers=servers,
+        generated=generated,
+        profiles_meta=profiles_meta,
+        selected_profile=selected_profile,
+    )
+
+
+app.view_functions["hotspot_generate"] = hotspot_generate_safe
+app.view_functions["reseau_creer_comptes"] = hotspot_generate_safe
+
 
 @app.route("/hotspot/profils")
 @app.route("/reseau/profils", endpoint="reseau_profils")
@@ -1915,6 +4144,8 @@ def hotspot_profiles():
                 )
                 for profile in api.get_resource("/ip/hotspot/user/profile").get()
             ]
+            for profile in profiles:
+                profile["id"] = router_action_ref(profile, "name")
         except Exception as e:
             _flash_err("Une erreur est survenue.", e)
     return render_template("hotspot/profiles.html", profiles=profiles)
@@ -1943,7 +4174,7 @@ def hotspot_add_profile():
             expire_mode  = request.form.get("expire_behavior") or request.form.get("expire_mode", "none")
             addr_pool    = request.form.get("addr_pool", "")
             lock_user    = "yes"
-            time_limit   = normalize_ticket_time_limit(request.form.get("time_limit", "")) or "0"
+            time_limit   = coerce_ticket_time_limit_user(request.form.get("time_limit", ""), empty="0", prefer_legacy_routeros=False) or "0"
             price        = request.form.get("price", "0")
             currency     = request.form.get("currency", "FCFA")
             router_params = {
@@ -1992,6 +4223,8 @@ def hotspot_add_profile():
                     "warning",
                 )
             return redirect(url_for("hotspot_profiles"))
+        except ValueError as e:
+            flash(str(e), "warning")
         except Exception as e:
             _flash_err("Une erreur est survenue.", e)
 
@@ -2008,7 +4241,7 @@ def hotspot_update_profile_meta():
     name      = str(payload.get("name", "")).strip()
     price     = str(payload.get("price", "0")).strip()
     currency  = str(payload.get("currency", "FCFA")).strip()
-    time_limit = str(payload.get("time_limit", "0")).strip()
+    time_limit = coerce_ticket_time_limit_user(payload.get("time_limit", "0"), empty="0", prefer_legacy_routeros=False) or "0"
     expire_mode= str(payload.get("expire_mode", "none")).strip()
     if not name:
         return jsonify({"ok": False, "msg": "Nom de profil manquant."})
@@ -2019,6 +4252,8 @@ def hotspot_update_profile_meta():
             expire_mode=expire_mode, lock_user="yes", time_limit=time_limit
         )
         return jsonify({"ok": True})
+    except ValueError as e:
+        return jsonify({"ok": False, "msg": str(e)})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
 
@@ -2032,12 +4267,18 @@ def hotspot_delete_profile():
     try:
         payload = request_payload()
         pid = (payload.get("id") or "").strip()
-        if not pid:
+        profile_name_payload = str(payload.get("name") or payload.get("profile") or payload.get("nom") or "").strip()
+        if not pid and profile_name_payload:
+            pid = profile_name_payload
+        if not pid and not profile_name_payload:
             return jsonify({"ok": False, "msg": "Identifiant profil introuvable."}), 400
         profile_resource = api.get_resource("/ip/hotspot/user/profile")
-        existing = profile_resource.get(id=pid)
+        existing = _resource_rows_by_id_or_name(profile_resource, item_id=pid, name=profile_name_payload)
         profile_name = str(existing[0].get("name") or "") if existing else ""
-        profile_resource.remove(id=pid)
+        if not profile_name and not _is_real_router_item_id(pid):
+            profile_name = pid
+        if not router_resource_remove_by_id_or_name(api, "/ip/hotspot/user/profile", item_id=pid, name=profile_name):
+            return jsonify({"ok": False, "msg": "Profil hotspot introuvable sur le routeur."}), 404
         if profile_name:
             db_mod.db_delete_hotspot_profile_metadata(session.get("router_id", ""), profile_name)
         return jsonify({"ok": True})
@@ -2063,7 +4304,73 @@ def hotspot_active():
                 actifs = api.get_resource("/ip/hotspot/active").get(**{"server": server_filter})
             else:
                 actifs = api.get_resource("/ip/hotspot/active").get()
-            actifs = normalize_active_sessions(api, actifs)
+            stale_active = getattr(api, "stale_resources", {}).get("/ip/hotspot/active")
+            if stale_active:
+                age = stale_active.get("age")
+                updated_at = stale_active.get("updated_at") or "jamais"
+                detail = f" Dernier snapshot: {updated_at}."
+                if age is not None:
+                    detail = f" Dernier snapshot il y a {format_duration_compact(age)}."
+                flash(
+                    "Sessions actives non affichees car le relais MikroTik n'a pas envoye de donnees recentes."
+                    + detail,
+                    "warning",
+                )
+            users_map = {
+                str(user.get("name") or "").strip(): dict(user)
+                for user in api.get_resource("/ip/hotspot/user").get()
+                if str(user.get("name") or "").strip()
+            }
+            # Enrichir avec expire_at et first_used_at
+            router_id = session.get("router_id", "")
+            _record_active_revenues_from_database(router_id, actifs)
+            first_used_map = _build_first_used_map(router_id)
+            users_map = _enrich_active_users_from_database(router_id, actifs, users_map)
+            _cleanup_expired_active_from_database(api, router_id, actifs, first_used_map)
+            _repair_active_ticket_epochs(
+                api,
+                router_id,
+                active_rows=actifs,
+                users_map=users_map,
+                first_used_map=first_used_map,
+            )
+            actifs = normalize_active_sessions(api, actifs, users_map=users_map)
+            for a in actifs:
+                comment = a.get("user_comment", "")
+                uname = str(a.get("user") or "").strip()
+                fu = first_used_map.get(uname, "")
+                if not fu:
+                    uptime_sec = parse_routeros_duration(str(a.get("uptime", "") or ""))
+                    if uptime_sec > 0:
+                        fu_dt = datetime.now() - timedelta(seconds=uptime_sec)
+                        fu = fu_dt.strftime("%Y-%m-%d %H:%M")
+                a["first_used_at"] = fu
+                a["expire_estimated"] = False
+                # 1. Chercher epoch exact dans le commentaire
+                expire_at = ""
+                expire_dt = _extract_ketamon_expire_datetime(comment)
+                if expire_dt:
+                    expire_at = expire_dt.strftime("%d/%m/%Y %H:%M")
+                # 2. Fallback : calculer depuis first_used_at + limit-uptime
+                if not expire_at:
+                    first_used_str = a.get("first_used_at", "")
+                    dur_sec = parse_routeros_duration(a.get("limit-uptime", "0"))
+                    if first_used_str and dur_sec and dur_sec > 0:
+                        try:
+                            fdt = datetime.strptime(first_used_str[:16], "%Y-%m-%d %H:%M")
+                            expire_at = (fdt + timedelta(seconds=dur_sec)).strftime("%d/%m/%Y %H:%M")
+                            a["expire_estimated"] = True
+                        except Exception:
+                            pass
+                a["expire_at"] = expire_at
+                # Toujours afficher le temps restant a partir de l'expiration absolue si connue.
+                if expire_at:
+                    try:
+                        expire_dt = datetime.strptime(expire_at, "%d/%m/%Y %H:%M")
+                        remaining = int((expire_dt - datetime.now()).total_seconds())
+                        a["temps-restant"] = format_duration_compact(remaining) if remaining > 0 else "Expiré"
+                    except Exception:
+                        pass
         except Exception as e:
             _flash_err("Une erreur est survenue.", e)
     return render_template("hotspot/active.html", actifs=actifs, servers=servers,
@@ -2072,8 +4379,8 @@ def hotspot_active():
 @app.route("/hotspot/scripts/reinstaller", methods=["POST"])
 @login_required
 def hotspot_reinstall_scripts():
-    """Réinstalle les scripts MikroTik (expiration + login) sur tous les routeurs."""
-    routers = db_mod.db_get_routers()
+    """Réinstalle les scripts MikroTik (expiration + login) sur les routeurs de l'utilisateur."""
+    routers = get_routers()
     if not routers:
         return jsonify({"ok": False, "msg": "Aucun routeur configuré."})
     ok_count = 0
@@ -2081,10 +4388,7 @@ def hotspot_reinstall_scripts():
     for router_info in routers:
         try:
             rhost = router_info.get("host","")
-            ruser = router_info.get("user") or "admin"
-            rpwd  = router_info.get("password","")
-            rport = int(router_info.get("port") or 8728)
-            api2, err2 = mk.safe_connect(rhost, ruser, rpwd, rport)
+            api2, err2 = mk.safe_connect_router(router_info)
             if err2:
                 errors.append(f"{rhost}: {err2}")
                 continue
@@ -2390,7 +4694,7 @@ def quick_print_generer():
         mode    = parts[3] if len(parts) > 3 else "aleatoire"
         length  = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 8
         prefix  = parts[5] if len(parts) > 5 else ""
-        qty     = int(parts[6]) if len(parts) > 6 and parts[6].isdigit() else 1
+        qty     = safe_int(parts[6] if len(parts) > 6 else 1, default=1, min_val=1, max_val=MAX_TICKET_GENERATION_QTY)
         price   = parts[7] if len(parts) > 7 else "0"
         network = parts[8] if len(parts) > 8 else ""
     except Exception as e:
@@ -2402,7 +4706,12 @@ def quick_print_generer():
         charset = string.ascii_lowercase
     else:
         charset = string.ascii_lowercase + string.digits
-    ticket_time_limit = get_profile_time_limit(router_id, profile) or "0"
+    try:
+        ensure_ticket_runtime_support(api, profile)
+    except Exception:
+        pass
+    ticket_time_limit = resolve_ticket_time_limit(router_id, profile, "") or "0"
+    ticket_time_limit_label = get_profile_time_limit(router_id, profile) or "0"
     profiles_meta = get_hotspot_profile_metadata_map(router_id)
     meta = profiles_meta.get(profile, {})
     currency = meta.get("currency", "FCFA") or "FCFA"
@@ -2412,9 +4721,17 @@ def quick_print_generer():
     generated = []
     pricing_batch = []
     hotspot_resource = api.get_resource("/ip/hotspot/user")
-    for _ in range(qty):
-        rand = "".join(random.choices(charset, k=length))
-        name = prefix + rand
+    existing_names = set()
+    gen_errors = []
+    attempts = 0
+    max_attempts = max(qty * 5, qty + 50)
+    while len(generated) < qty and attempts < max_attempts:
+        attempts += 1
+        try:
+            name = _next_unique_ticket_name(existing_names, charset, length, prefix)
+        except ValueError as ex:
+            gen_errors.append(str(ex))
+            break
         password = name
         params = {
             "name": name, "password": password, "profile": profile,
@@ -2424,22 +4741,106 @@ def quick_print_generer():
         if server:
             params["server"] = server
         try:
-            hotspot_resource.add(**params)
+            _add_or_repair_hotspot_ticket(api, hotspot_resource, params)
             generated.append({
                 "name": name, "password": password, "profile": profile,
                 "price": price, "currency": currency, "network": network,
-                "date": date_str, "time_limit": ticket_time_limit,
+                "date": date_str, "time_limit": ticket_time_limit_label,
             })
             pricing_batch.append({
                 "router_id": router_id, "user": name,
+                "password": password,
                 "prix": float(price) if price and price != "0" else 0.0,
                 "devise": currency, "profil": profile, "reseau": network,
             })
-        except Exception:
-            pass
+        except Exception as ex:
+            gen_errors.append(str(ex))
+            if _looks_like_duplicate_ticket_error(ex):
+                continue
+            break
     if pricing_batch:
         db_mod.db_batch_upsert_ticket_pricing(pricing_batch)
-    return jsonify({"ok": True, "tickets": generated, "count": len(generated)})
+    return jsonify({
+        "ok": len(generated) == qty,
+        "tickets": generated,
+        "count": len(generated),
+        "requested": qty,
+        "msg": "" if len(generated) == qty else (gen_errors[-1] if gen_errors else "Generation partielle"),
+    })
+
+
+def quick_print_generer_safe():
+    router_id = session.get("router_id", "")
+    data = request.get_json(silent=True) or {}
+    script_id = data.get("id", "")
+    try:
+        with TicketGenerationJob(router_id, 0, source="quick-print") as job:
+            api, err = get_api()
+            if err:
+                raise RuntimeError(err)
+
+            scripts = api.get_resource("/system/script").get(id=script_id)
+            if not scripts:
+                return jsonify({"ok": False, "msg": "Modele introuvable."})
+
+            src = scripts[0].get("source", "")
+            parts = src.split("#")
+            profile = parts[1] if len(parts) > 1 else "default"
+            server = parts[2] if len(parts) > 2 else ""
+            mode = parts[3] if len(parts) > 3 else "aleatoire"
+            length = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 8
+            prefix = parts[5] if len(parts) > 5 else ""
+            qty = safe_int(parts[6] if len(parts) > 6 else 1, default=1, min_val=1, max_val=MAX_TICKET_GENERATION_QTY)
+            price = parts[7] if len(parts) > 7 else "0"
+            network = parts[8] if len(parts) > 8 else ""
+            job.requested = qty
+            job.profile = profile
+            job.progress(0)
+
+            try:
+                ensure_ticket_runtime_support(api, profile)
+            except Exception:
+                pass
+
+            ticket_time_limit = resolve_ticket_time_limit(router_id, profile, "") or "0"
+            ticket_time_limit_label = resolve_ticket_time_limit_display(router_id, profile, "") or "0"
+            profiles_meta = get_hotspot_profile_metadata_map(router_id)
+            meta = profiles_meta.get(profile, {})
+            currency = meta.get("currency", "FCFA") or "FCFA"
+            if not price or price == "0":
+                price = meta.get("price", "0") or "0"
+
+            generated, gen_errors = create_hotspot_ticket_batch(
+                api, router_id, qty, profile,
+                server=server,
+                mode=mode,
+                length=length,
+                prefix=prefix,
+                password_mode="identique",
+                comment="",
+                network_name=network,
+                price=price,
+                currency=currency,
+                ticket_time_limit=ticket_time_limit,
+                ticket_time_limit_label=ticket_time_limit_label,
+                job=job,
+                source="quick-print",
+            )
+
+        return jsonify({
+            "ok": len(generated) == qty,
+            "tickets": generated,
+            "count": len(generated),
+            "requested": qty,
+            "msg": "" if len(generated) == qty else (gen_errors[-1] if gen_errors else "Generation partielle"),
+        })
+    except TicketGenerationBusyError as e:
+        return jsonify({"ok": False, "msg": str(e), "busy": True}), 409
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+app.view_functions["quick_print_generer"] = quick_print_generer_safe
 
 
 @app.route("/impression-rapide/creer", methods=["POST"], endpoint="quick_print_creer")
@@ -2454,9 +4855,9 @@ def quick_print_creer():
     profile = (data.get("profile", "default") or "default").strip()
     server  = (data.get("server", "") or "").strip()
     mode    = data.get("mode", "aleatoire")
-    length  = int(data.get("length", 8))
+    length  = safe_int(data.get("length", 8), default=8, min_val=4, max_val=32)
     prefix  = (data.get("prefix", "") or "").strip()
-    qty     = int(data.get("qty", 1))
+    qty     = safe_int(data.get("qty", 1), default=1, min_val=1, max_val=MAX_TICKET_GENERATION_QTY)
     price   = (data.get("price", "0") or "0").strip()
     network = (data.get("network", "") or "").strip()
     if not name:
@@ -2518,6 +4919,62 @@ def vouchers():
 
 # ─── Journaux ────────────────────────────────────────────────────────────────
 
+@app.route("/bons/imprimer")
+@login_required
+@router_required
+def vouchers_print_view():
+    api, err = get_api()
+    if err:
+        flash(err, "danger")
+        return redirect(url_for("vouchers"))
+
+    router_id = session.get("router_id", "")
+    router = get_active_router() or {}
+    selected_profile = (request.args.get("profile", "all") or "all").strip()
+    auto_print = str(request.args.get("print", "")).lower() in {"1", "true", "yes", "on"}
+    profiles_meta = get_hotspot_profile_metadata_map(router_id)
+    cards = []
+
+    try:
+        all_users = api.get_resource("/ip/hotspot/user").get()
+    except Exception as e:
+        _flash_err("Erreur lors du chargement des bons.", e)
+        return redirect(url_for("vouchers"))
+
+    for user_row in all_users:
+        profile_name = str(user_row.get("profile") or "default")
+        if selected_profile != "all" and profile_name != selected_profile:
+            continue
+
+        meta = profiles_meta.get(profile_name, {})
+        duration = str(meta.get("time_limit") or "")
+        price = str(meta.get("price") or "")
+        currency = str(meta.get("currency") or "FCFA")
+        parts = [profile_name]
+        if duration and duration != "0":
+            parts.append(duration)
+        if price and price != "0":
+            parts.append(f"{price} {currency}")
+
+        cards.append({
+            "num": len(cards) + 1,
+            "code": str(user_row.get("name") or ""),
+            "profile": profile_name,
+            "info": " - ".join(parts),
+        })
+
+    title = "Tous les bons" if selected_profile == "all" else selected_profile
+    wifi_name = str(router.get("wifi_name") or "").strip() or "WiFi"
+    return render_template(
+        "vouchers_print.html",
+        title=title,
+        cards=cards,
+        wifi_name=wifi_name,
+        printed_at=datetime.now().strftime("%d/%m/%Y %H:%M"),
+        auto_print=auto_print,
+    )
+
+
 @app.route("/journaux/hotspot")
 @login_required
 @router_required
@@ -2529,7 +4986,13 @@ def log_hotspot():
     else:
         try:
             all_logs = api.get_resource("/log").get()
-            logs = [l for l in all_logs if "hotspot" in l.get("topics", "")]
+            # MikroTik double chaque event hotspot : une fois réel, une fois "->:" (proxy redirect).
+            # On ne garde que les entrées sans le préfixe "->:" pour éviter l'affichage en double.
+            logs = [
+                l for l in all_logs
+                if "hotspot" in l.get("topics", "")
+                and not l.get("message", "").startswith("->:")
+            ]
             logs = list(reversed(logs))[:200]
         except Exception as e:
             _flash_err("Une erreur est survenue.", e)
@@ -2547,7 +5010,11 @@ def log_users():
         try:
             all_logs = api.get_resource("/log").get()
             relevant = ("account", "hotspot", "system", "wireless", "manager")
-            logs = [l for l in all_logs if any(t in l.get("topics", "") for t in relevant)]
+            logs = [
+                l for l in all_logs
+                if any(t in l.get("topics", "") for t in relevant)
+                and not l.get("message", "").startswith("->:")
+            ]
             logs = list(reversed(logs))[:300]
         except Exception as e:
             _flash_err("Une erreur est survenue.", e)
@@ -2715,6 +5182,33 @@ def api_sync_etat():
     return jsonify({"ok": True, "stats": stats})
 
 
+@app.route("/api/wifi-name", methods=["GET", "POST"])
+def api_wifi_name():
+    payload = request.get_json(silent=True) if request.method == "POST" else {}
+    if not session.get("logged_in"):
+        auth_ok, _ = _check_basic_auth()
+        if not auth_ok:
+            return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+
+    owner_id = _current_owner_id()
+    router = _get_requested_router(payload)
+    if not router:
+        return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
+
+    router_id = str(router.get("id", "") or router.get("host", "")).strip()
+    if not router_id:
+        return jsonify({"ok": False, "msg": "Routeur invalide"}), 400
+
+    if request.method == "POST":
+        name = str(payload.get("wifi_name", "") or payload.get("network_name", "") or payload.get("network", "")).strip()[:64]
+        db_mod.db_update_router(router_id, owner_id, {"wifi_name": name})
+        _invalidate_routers_cache()
+        return jsonify({"ok": True, "wifi_name": name, "network": name, "router_id": router_id})
+
+    wifi_name = str(router.get("wifi_name", "") or "")
+    return jsonify({"ok": True, "wifi_name": wifi_name, "network": wifi_name, "router_id": router_id})
+
+
 @app.route("/api/revenus")
 @login_required
 @router_required
@@ -2752,7 +5246,6 @@ def report():
     today_str = datetime.now().strftime("%Y-%m-%d")
     month_str = datetime.now().strftime("%Y-%m")
 
-    # Mois cible pour suppression : mois filtré ou mois courant
     if filtre_annee and filtre_mois:
         mois_filtre = f"{filtre_annee}-{filtre_mois.zfill(2)}"
     elif filtre_mois:
@@ -2767,7 +5260,6 @@ def report():
                                 mois=filtre_mois.zfill(2) if filtre_mois else "",
                                 annee=filtre_annee, q=filtre_q, profil=filtre_profil)
 
-    # Total global (toutes périodes confondues)
     conn = db_mod.get_conn()
     total_row = conn.execute(
         "SELECT COUNT(*) cnt, COALESCE(SUM(prix),0) tot FROM ventes WHERE router_id=?",
@@ -2776,7 +5268,6 @@ def report():
     total_global_count = total_row[0] if total_row else 0
     total_global       = float(total_row[1]) if total_row else 0.0
 
-    # Profils distincts pour le filtre
     profils_rows = conn.execute(
         "SELECT DISTINCT profil FROM ventes WHERE router_id=? ORDER BY profil", (router_id,)
     ).fetchall()
@@ -2917,6 +5408,7 @@ def settings_add_router():
     if request.method == "POST":
         name     = request.form.get("name", "").strip()
         host     = request.form.get("host", "").strip()
+        fallback_host = request.form.get("fallback_host", "").strip()
         port     = db_mod._normalize_port(request.form.get("port", 8728))
         user     = request.form.get("user", "admin").strip() or "admin"
         password = request.form.get("password", "")
@@ -2926,18 +5418,26 @@ def settings_add_router():
             flash("Nom et hote sont obligatoires.", "danger")
         else:
             owner_id = _current_owner_id() or ""
-            db_mod.db_add_router({
-                "id": str(uuid.uuid4()),
-                "name": name,
-                "host": host,
-                "port": port,
-                "user": user,
-                "password": password,
-                "currency": currency,
-                "created_at": datetime.now().isoformat(),
-            }, owner_id=owner_id)
-            flash(f"Routeur \"{name}\" enregistre. Cliquez sur Connecter pour tester.", "success")
-            return redirect(url_for("sessions_list"))
+            try:
+                router_info = {
+                    "id": str(uuid.uuid4()),
+                    "name": name,
+                    "host": host,
+                    "fallback_host": fallback_host,
+                    "port": port,
+                    "user": user,
+                    "password": password,
+                    "currency": currency,
+                    "relay_enabled": 1,
+                    "relay_token": secrets.token_urlsafe(32),
+                    "created_at": datetime.now().isoformat(),
+                }
+                db_mod.db_add_router(router_info, owner_id=owner_id)
+                _invalidate_routers_cache()
+                flash(f"Routeur \"{name}\" enregistre avec relais cloud actif.", "success")
+                return redirect(url_for("sessions_list"))
+            except db_mod.RouterLimitExceededError:
+                flash("Chaque compte Gmail a droit a un seul routeur.", "warning")
     return render_template("settings/add_router.html")
 
 @app.route("/parametres/routeurs/<rid>/connecter")
@@ -2946,11 +5446,32 @@ def connect_router(rid):
     routers = get_routers()
     for r in routers:
         if r["id"] == rid:
-            router_user = r.get("user") or r.get("username") or "admin"
-            api_test, err = mk.safe_connect(r["host"], router_user, r.get("password", ""), r.get("port", 8728), driver=r.get("driver", "mikrotik"))
+            api_test = None
+            api_test, err = mk.safe_connect_router(r)
             if err:
+                if int(r.get("relay_enabled") or 0):
+                    session["router_id"] = r["id"]
+                    session["router_name"] = r["name"]
+                    if _router_has_relay_snapshots(r):
+                        flash(
+                            f"Connecte a \"{r['name']}\" via relais. Les pages affichent uniquement les derniers contenus reels envoyes par ce MikroTik.",
+                            "success",
+                        )
+                    else:
+                        flash(
+                            f"Connecte a \"{r['name']}\" via relais. En attente du premier snapshot reel du MikroTik.",
+                            "warning",
+                        )
+                    return redirect(url_for("dashboard"))
                 _flash_err("Connexion au routeur echouee. Verifiez les parametres (hote, port, identifiants).", err)
                 return redirect(url_for("sessions_list"))
+            try:
+                ensure_ntp_configured(api_test)
+                ensure_ticket_runtime_support(api_test)
+            except Exception:
+                pass
+            finally:
+                _close_api_quietly(api_test)
             session["router_id"]   = r["id"]
             session["router_name"] = r["name"]
             flash(f"Connecte a \"{r['name']}\".", "success")
@@ -2964,13 +5485,16 @@ def api_test_connexion():
     """Teste la connexion à un routeur MikroTik sans le sélectionner."""
     data = request.get_json(silent=True) or {}
     host = str(data.get("host", "")).strip()
+    fallback_host = str(data.get("fallback_host", "")).strip()
     user = str(data.get("user", "admin")).strip() or "admin"
     pwd  = str(data.get("password", ""))
     port = int(data.get("port", 8728) or 8728)
+    driver = str(data.get("driver", "mikrotik") or "mikrotik").strip() or "mikrotik"
     if not host:
         return jsonify({"ok": False, "msg": "Adresse IP manquante."})
+    api_t = None
     try:
-        api_t, err = mk.safe_connect(host, user, pwd, port, timeout=8)
+        api_t, err = mk.safe_connect(host, user, pwd, port, timeout=8, driver=driver, fallback_host=fallback_host)
         if err:
             return jsonify({"ok": False, "msg": f"Connexion echouee : {err}"})
         identity = api_t.get_resource("/system/identity").get()
@@ -2978,6 +5502,581 @@ def api_test_connexion():
         return jsonify({"ok": True, "msg": f"Connexion reussie — routeur : {name}"})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
+    finally:
+        _close_api_quietly(api_t)
+
+def _is_local_relay_host(host):
+    host = str(host or "").strip().lower().strip("[]")
+    return (
+        not host
+        or host == "localhost"
+        or host == "::1"
+        or host.startswith("127.")
+    )
+
+
+def _is_usable_lan_ip(ip):
+    ip = str(ip or "").strip()
+    if not ip or ":" in ip:
+        return False
+    return not (
+        ip.startswith("127.")
+        or ip.startswith("169.254.")
+        or ip == "0.0.0.0"
+    )
+
+
+def _relay_ip_preference(ip):
+    ip = str(ip or "").strip()
+    if ip.startswith("192.168."):
+        return 0
+    if ip.startswith("172.16.") or ip.startswith("172.17.") or ip.startswith("172.18.") or ip.startswith("172.19."):
+        return 1
+    if re.match(r"^172\.(2[0-9]|3[0-1])\.", ip):
+        return 1
+    if ip.startswith("10."):
+        return 2
+    return 3
+
+
+def _detect_lan_ip_for_relay():
+    """Find an address reachable by MikroTik when localhost is used in the browser."""
+    forced_ip = os.environ.get("KETAMON_RELAY_LAN_IP", "").strip()
+    if _is_usable_lan_ip(forced_ip):
+        return forced_ip
+    targets = []
+    try:
+        owner_id = _current_owner_id()
+        routers = db_mod.db_get_routers(owner_id=owner_id) if owner_id else db_mod.db_get_routers()
+    except Exception:
+        routers = []
+    for router in routers or []:
+        host = str(router.get("host") or "").strip()
+        if host and not _is_local_relay_host(host) and not re.search(r"[a-zA-Z]", host):
+            targets.append((host, int(router.get("port") or 8728)))
+    targets.extend([("10.10.10.1", 8728), ("192.168.88.1", 8728), ("192.168.1.1", 8728), ("1.1.1.1", 80)])
+    seen = set()
+    candidates = []
+    for host, port in targets:
+        key = (host, port)
+        if key in seen:
+            continue
+        seen.add(key)
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.3)
+            sock.connect((host, int(port or 8728)))
+            ip = sock.getsockname()[0]
+            if _is_usable_lan_ip(ip):
+                candidates.append(ip)
+        except Exception:
+            continue
+        finally:
+            try:
+                if sock:
+                    sock.close()
+            except Exception:
+                pass
+    if candidates:
+        return sorted(set(candidates), key=_relay_ip_preference)[0]
+    return ""
+
+
+def _relay_public_base_url():
+    configured = os.environ.get("KETAMON_PUBLIC_URL", "").strip().rstrip("/")
+    if configured:
+        return configured
+    root = request.url_root.rstrip("/")
+    try:
+        parsed = urlsplit(root)
+        host = parsed.hostname or ""
+        if not _is_local_relay_host(host):
+            return root
+        lan_ip = _detect_lan_ip_for_relay()
+        if lan_ip:
+            port = f":{parsed.port}" if parsed.port else ""
+            scheme = parsed.scheme or "http"
+            return f"{scheme}://{lan_ip}{port}"
+    except Exception:
+        pass
+    return root
+
+
+def _relay_token_from_request():
+    data = request.get_json(silent=True) if request.method == "POST" else None
+    data = data if isinstance(data, dict) else {}
+    return (
+        request.headers.get("X-KetaMon-Relay-Token")
+        or request.headers.get("X-Relay-Token")
+        or data.get("token")
+        or request.args.get("token")
+        or ""
+    ).strip()
+
+
+def _relay_router_from_request():
+    token = _relay_token_from_request()
+    router = db_mod.db_get_router_by_relay_token(token)
+    if not router:
+        return None, token
+    db_mod.db_touch_router_relay(router["id"], "online")
+    return router, token
+
+
+def _relay_unescape_value(value):
+    text = str(value or "")
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            code = text[i + 1]
+            if code == "n":
+                out.append("\n")
+            elif code == "r":
+                out.append("\r")
+            elif code == "t":
+                out.append("\t")
+            elif code == "p":
+                out.append("|")
+            elif code == "\\":
+                out.append("\\")
+            else:
+                out.append(code)
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _parse_relay_snapshot_text(text):
+    resources = {}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line == "KETAMON_SNAPSHOT_V1":
+            continue
+        parts = line.split("|")
+        resource = ""
+        row = {}
+        for part in parts:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            key = key.strip()
+            value = _relay_unescape_value(value)
+            if key in {"R", "RESOURCE", "resource"}:
+                resource = value.strip()
+            elif key:
+                row[key] = value
+        if resource:
+            resources.setdefault(resource, []).append(row)
+    return resources
+
+
+@app.route("/api/relay/snapshot", methods=["POST"])
+def api_relay_snapshot():
+    router, _token = _relay_router_from_request()
+    if not router:
+        return jsonify({"ok": False, "msg": "Token relais invalide."}), 401
+    data = request.get_json(silent=True)
+    if isinstance(data, dict):
+        resources = data.get("resources") if isinstance(data.get("resources"), dict) else data
+    else:
+        resources = _parse_relay_snapshot_text(request.get_data(as_text=True))
+    saved = db_mod.db_upsert_router_relay_snapshots(router["id"], resources)
+    db_mod.db_touch_router_relay(router["id"], "snapshot")
+    return jsonify({
+        "ok": True,
+        "saved": saved,
+        "router_id": router["id"],
+        "server_time": datetime.now().isoformat(),
+    })
+
+
+@app.route("/api/relay/ping", methods=["GET", "POST"])
+def api_relay_ping():
+    router, _token = _relay_router_from_request()
+    if not router:
+        return jsonify({"ok": False, "msg": "Token relais invalide."}), 401
+    payload = request.get_json(silent=True) if request.method == "POST" else {}
+    payload = payload if isinstance(payload, dict) else {}
+    status = payload.get("status") or request.args.get("status") or "online"
+    db_mod.db_touch_router_relay(router["id"], status)
+    return jsonify({
+        "ok": True,
+        "router_id": router["id"],
+        "router_name": router.get("name", ""),
+        "server_time": datetime.now().isoformat(),
+    })
+
+
+@app.route("/api/relay/commands/next", methods=["GET", "POST"])
+def api_relay_next_command():
+    router, _token = _relay_router_from_request()
+    if not router:
+        return jsonify({"ok": False, "msg": "Token relais invalide."}), 401
+    command = db_mod.db_claim_next_router_relay_command(router["id"])
+    if not command:
+        return jsonify({"ok": True, "empty": True, "server_time": datetime.now().isoformat()})
+    try:
+        payload = json.loads(command.get("payload") or "{}")
+    except Exception:
+        payload = {}
+    return jsonify({
+        "ok": True,
+        "empty": False,
+        "command": {
+            "id": command["id"],
+            "type": command["command"],
+            "payload": payload,
+        },
+    })
+
+
+@app.route("/api/relay/commands/result", methods=["GET", "POST"])
+def api_relay_command_result():
+    router, _token = _relay_router_from_request()
+    if not router:
+        return jsonify({"ok": False, "msg": "Token relais invalide."}), 401
+    data = request.get_json(silent=True) if request.method == "POST" else {}
+    data = data if isinstance(data, dict) else {}
+    command_id = data.get("id") or request.args.get("id") or ""
+    ok_raw = data.get("ok", request.args.get("ok", "0"))
+    ok = str(ok_raw).strip().lower() in {"1", "true", "yes", "ok"}
+    result = data.get("result")
+    if result is None:
+        result = request.args.get("msg", "")
+    if not command_id:
+        return jsonify({"ok": False, "msg": "ID commande manquant."}), 400
+    saved = db_mod.db_complete_router_relay_command(command_id, router["id"], ok, result)
+    return jsonify({"ok": bool(saved), "saved": bool(saved)})
+
+
+def _router_clock_datetime_from_snapshot(router_id):
+    try:
+        rows = db_mod.db_get_router_relay_snapshot(router_id, "/system/clock")
+        row = rows[0] if rows else {}
+        clock_time = str(row.get("time") or "").strip()
+        clock_date = str(row.get("date") or "").strip()
+        if not clock_time or not clock_date:
+            return None
+        if "/" in clock_date:
+            clock_date = _ros_date_to_iso(clock_date)
+        if not clock_date:
+            return None
+        return datetime.strptime(f"{clock_date} {clock_time[:8]}", "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _router_clock_drift_seconds(router_id):
+    router_dt = _router_clock_datetime_from_snapshot(router_id)
+    if not router_dt:
+        return None
+    return int((datetime.now() - router_dt).total_seconds())
+
+
+def _server_clock_routeros_source():
+    now = datetime.now() + timedelta(seconds=2)
+    iso_date = now.strftime("%Y-%m-%d")
+    ros_date = now.strftime("%b/%d/%Y").lower()
+    clock_time = now.strftime("%H:%M:%S")
+    return "\n".join([
+        ":do { /system clock set time-zone-autodetect=no time-zone-name=Africa/Abidjan; } on-error={ :do { /system clock set time-zone-name=manual gmt-offset=+00:00; } on-error={} }",
+        f":do {{ /system clock set time={_relay_routeros_quote(clock_time)}; }} on-error={{}}",
+        f":do {{ /system clock set date={_relay_routeros_quote(iso_date)}; }} on-error={{ :do {{ /system clock set date={_relay_routeros_quote(ros_date)}; }} on-error={{}} }}",
+        ':do { /system ntp client set enabled=yes servers="pool.ntp.org,time.google.com"; } on-error={ :do { /system ntp client set enabled=yes primary-ntp=216.239.35.0 secondary-ntp=216.239.35.4; } on-error={} }',
+    ])
+
+
+def _clock_sync_source_if_needed(router_id):
+    drift = _router_clock_drift_seconds(router_id)
+    if drift is None or abs(drift) <= 300:
+        return ""
+    return _server_clock_routeros_source()
+
+
+@app.route("/api/relay/routeros/next", methods=["GET"])
+def api_relay_routeros_next():
+    router, token = _relay_router_from_request()
+    if not router:
+        return ":put \"KetaMon relay: token invalide\"\n", 401, {"Content-Type": "text/plain; charset=utf-8"}
+    clock_sync_source = _clock_sync_source_if_needed(router["id"])
+    if clock_sync_source:
+        return (
+            ':do {\n'
+            f'{clock_sync_source}\n'
+            ':put "KetaMon relay: horloge synchronisee";\n'
+            '} on-error={ :put "KetaMon relay: erreur sync horloge"; }\n'
+        ), 200, {"Content-Type": "text/plain; charset=utf-8"}
+    command = db_mod.db_claim_next_router_relay_command(router["id"])
+    if not command:
+        return ":put \"KetaMon relay: aucune commande\"\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
+    command_id = command["id"]
+    result_url = (
+        f"{_relay_public_base_url()}/api/relay/routeros/result"
+        f"?token={quote(token)}&id={quote(command_id)}"
+    )
+    if command["command"] == "ping":
+        source = (
+            ':put "KetaMon relay: ping";\n'
+            f'{clock_sync_source}\n'
+            f'/tool fetch url="{result_url}&ok=1&msg=pong" keep-result=no;\n'
+        )
+    elif command["command"] == "routeros-script":
+        try:
+            payload = json.loads(command.get("payload") or "{}")
+        except Exception:
+            payload = {}
+        script_source = str(payload.get("source") or "").strip()
+        if not script_source:
+            source = (
+                ':put "KetaMon relay: script vide";\n'
+                f'/tool fetch url="{result_url}&ok=0&msg=script_vide" keep-result=no;\n'
+            )
+        else:
+            source = (
+                ':do {\n'
+                f'{clock_sync_source}\n'
+                f'{script_source}\n'
+                f'/tool fetch url="{result_url}&ok=1&msg=done" keep-result=no;\n'
+                '} on-error={\n'
+                f'/tool fetch url="{result_url}&ok=0&msg=error" keep-result=no;\n'
+                '}\n'
+            )
+    else:
+        source = (
+            f':put "KetaMon relay: commande non supportee {command["command"]}";\n'
+            f'/tool fetch url="{result_url}&ok=0&msg=commande_non_supportee" keep-result=no;\n'
+        )
+    return source, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+@app.route("/api/relay/routeros/result", methods=["GET", "POST"])
+def api_relay_routeros_result():
+    return api_relay_command_result()
+
+
+@app.route("/api/relay/routers/<rid>/ping", methods=["POST"])
+@login_required
+def api_relay_queue_ping(rid):
+    owner_id = _current_owner_id()
+    router = db_mod.db_get_router(rid, owner_id)
+    if not router:
+        return jsonify({"ok": False, "msg": "Routeur introuvable ou non autorise."}), 404
+    if not int(router.get("relay_enabled") or 0):
+        return jsonify({"ok": False, "msg": "Relais cloud non active sur ce routeur."}), 400
+    command = db_mod.db_enqueue_router_relay_command(
+        rid,
+        router.get("owner_id", ""),
+        "ping",
+        {"from": "web-test"},
+    )
+    if not command:
+        return jsonify({"ok": False, "msg": "Impossible de creer la commande relais."}), 500
+    return jsonify({
+        "ok": True,
+        "msg": "Test relais envoye. Si le MikroTik poll, le statut passera de queued a done.",
+        "command_id": command["id"],
+    })
+
+
+def _build_routeros_relay_script(base_url, token):
+    base_url = str(base_url or "").rstrip("/")
+    token = str(token or "").strip()
+    next_url = f"{base_url}/api/relay/routeros/next?token={token}"
+    ping_url = f"{base_url}/api/relay/ping?token={token}"
+    snapshot_url = f"{base_url}/api/relay/snapshot?token={token}"
+    return "\n".join([
+        "# KetaMon Cloud Relay - polling + real snapshot",
+        "/system script remove [find name=\"ketamon-relay-poll\"]",
+        "/system scheduler remove [find name=\"ketamon-relay-poll\"]",
+        "/system script add name=\"ketamon-relay-poll\" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon source={",
+        "  :global ktmEsc do={",
+        "    :local v [:tostr $1];",
+        "    :local out \"\";",
+        "    :for i from=0 to=([:len $v] - 1) do={",
+        "      :local ch [:pick $v $i ($i + 1)];",
+        "      :if ($ch = \"\\\\\") do={ :set out ($out . \"\\\\\\\\\"); } else={",
+        "        :if ($ch = \"|\") do={ :set out ($out . \"\\\\p\"); } else={",
+        "          :if ($ch = \"\\n\") do={ :set out ($out . \"\\\\n\"); } else={ :set out ($out . $ch); }",
+        "        }",
+        "      }",
+        "    }",
+        "    :return $out;",
+        "  };",
+        "  :local NL \"\\n\";",
+        "  :local payload (\"KETAMON_SNAPSHOT_V1\" . $NL);",
+        "  :do { :set payload ($payload . \"R=/system/identity|name=\" . [$ktmEsc [/system identity get name]] . $NL); } on-error={};",
+        "  :do { :set payload ($payload . \"R=/system/resource|version=\" . [$ktmEsc [/system resource get version]] . \"|uptime=\" . [$ktmEsc [/system resource get uptime]] . \"|cpu-load=\" . [$ktmEsc [/system resource get cpu-load]] . \"|total-memory=\" . [$ktmEsc [/system resource get total-memory]] . \"|free-memory=\" . [$ktmEsc [/system resource get free-memory]] . \"|total-hdd-space=\" . [$ktmEsc [/system resource get total-hdd-space]] . \"|free-hdd-space=\" . [$ktmEsc [/system resource get free-hdd-space]] . \"|board-name=\" . [$ktmEsc [/system resource get board-name]] . $NL); } on-error={};",
+        "  :do { :set payload ($payload . \"R=/system/clock|time=\" . [$ktmEsc [/system clock get time]] . \"|date=\" . [$ktmEsc [/system clock get date]] . $NL); } on-error={};",
+        "  :do { :set payload ($payload . \"R=/system/routerboard|model=\" . [$ktmEsc [/system routerboard get model]] . $NL); } on-error={};",
+        "  :do { :foreach i in=[/ip hotspot print as-value] do={ :set payload ($payload . \"R=/ip/hotspot|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|interface=\" . [$ktmEsc ($i->\"interface\")] . \"|address-pool=\" . [$ktmEsc ($i->\"address-pool\")] . \"|profile=\" . [$ktmEsc ($i->\"profile\")] . $NL); } } on-error={};",
+        "  :do { :foreach i in=[/ip hotspot user print as-value] do={ :set payload ($payload . \"R=/ip/hotspot/user|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|password=\" . [$ktmEsc ($i->\"password\")] . \"|profile=\" . [$ktmEsc ($i->\"profile\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|limit-uptime=\" . [$ktmEsc ($i->\"limit-uptime\")] . \"|uptime=\" . [$ktmEsc ($i->\"uptime\")] . \"|bytes-in=\" . [$ktmEsc ($i->\"bytes-in\")] . \"|bytes-out=\" . [$ktmEsc ($i->\"bytes-out\")] . \"|limit-bytes-total=\" . [$ktmEsc ($i->\"limit-bytes-total\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|comment=\" . [$ktmEsc ($i->\"comment\")] . $NL); } } on-error={};",
+        "  :do { :foreach i in=[/ip hotspot user profile print as-value] do={ :set payload ($payload . \"R=/ip/hotspot/user/profile|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|rate-limit=\" . [$ktmEsc ($i->\"rate-limit\")] . \"|shared-users=\" . [$ktmEsc ($i->\"shared-users\")] . \"|address-pool=\" . [$ktmEsc ($i->\"address-pool\")] . \"|session-timeout=\" . [$ktmEsc ($i->\"session-timeout\")] . \"|idle-timeout=\" . [$ktmEsc ($i->\"idle-timeout\")] . \"|keepalive-timeout=\" . [$ktmEsc ($i->\"keepalive-timeout\")] . \"|mac-cookie-timeout=\" . [$ktmEsc ($i->\"mac-cookie-timeout\")] . \"|add-mac-cookie=\" . [$ktmEsc ($i->\"add-mac-cookie\")] . $NL); } } on-error={};",
+        "  :do { :foreach i in=[/ip hotspot active print as-value] do={ :set payload ($payload . \"R=/ip/hotspot/active|.id=\" . [$ktmEsc ($i->\".id\")] . \"|user=\" . [$ktmEsc ($i->\"user\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|uptime=\" . [$ktmEsc ($i->\"uptime\")] . \"|session-time-left=\" . [$ktmEsc ($i->\"session-time-left\")] . \"|bytes-in=\" . [$ktmEsc ($i->\"bytes-in\")] . \"|bytes-out=\" . [$ktmEsc ($i->\"bytes-out\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|login-by=\" . [$ktmEsc ($i->\"login-by\")] . $NL); } } on-error={};",
+        "  :do { :foreach i in=[/ip hotspot host print as-value] do={ :set payload ($payload . \"R=/ip/hotspot/host|.id=\" . [$ktmEsc ($i->\".id\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|to-address=\" . [$ktmEsc ($i->\"to-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|authorized=\" . [$ktmEsc ($i->\"authorized\")] . \"|blocked=\" . [$ktmEsc ($i->\"blocked\")] . $NL); } } on-error={};",
+        "  :do { :foreach i in=[/ip hotspot ip-binding print as-value] do={ :set payload ($payload . \"R=/ip/hotspot/ip-binding|.id=\" . [$ktmEsc ($i->\".id\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|to-address=\" . [$ktmEsc ($i->\"to-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|type=\" . [$ktmEsc ($i->\"type\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|comment=\" . [$ktmEsc ($i->\"comment\")] . $NL); } } on-error={};",
+        "  :do { :foreach i in=[/ip hotspot cookie print as-value] do={ :set payload ($payload . \"R=/ip/hotspot/cookie|.id=\" . [$ktmEsc ($i->\".id\")] . \"|user=\" . [$ktmEsc ($i->\"user\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|expires-in=\" . [$ktmEsc ($i->\"expires-in\")] . $NL); } } on-error={};",
+        "  :do { :foreach i in=[/ip dhcp-server lease print as-value] do={ :set payload ($payload . \"R=/ip/dhcp-server/lease|.id=\" . [$ktmEsc ($i->\".id\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|host-name=\" . [$ktmEsc ($i->\"host-name\")] . \"|status=\" . [$ktmEsc ($i->\"status\")] . \"|dynamic=\" . [$ktmEsc ($i->\"dynamic\")] . \"|comment=\" . [$ktmEsc ($i->\"comment\")] . $NL); } } on-error={};",
+        "  :do { :foreach i in=[/interface print as-value] do={ :set payload ($payload . \"R=/interface|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|type=\" . [$ktmEsc ($i->\"type\")] . \"|running=\" . [$ktmEsc ($i->\"running\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|rx-byte=\" . [$ktmEsc ($i->\"rx-byte\")] . \"|tx-byte=\" . [$ktmEsc ($i->\"tx-byte\")] . \"|rx-packet=\" . [$ktmEsc ($i->\"rx-packet\")] . \"|tx-packet=\" . [$ktmEsc ($i->\"tx-packet\")] . $NL); } } on-error={};",
+        "  :do { :foreach i in=[/system scheduler print as-value] do={ :set payload ($payload . \"R=/system/scheduler|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|start-date=\" . [$ktmEsc ($i->\"start-date\")] . \"|start-time=\" . [$ktmEsc ($i->\"start-time\")] . \"|interval=\" . [$ktmEsc ($i->\"interval\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|next-run=\" . [$ktmEsc ($i->\"next-run\")] . \"|on-event=\" . [$ktmEsc ($i->\"on-event\")] . $NL); } } on-error={};",
+        "  :do { :foreach i in=[/ip pool print as-value] do={ :set payload ($payload . \"R=/ip/pool|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|ranges=\" . [$ktmEsc ($i->\"ranges\")] . $NL); } } on-error={};",
+        "  :do { :local c 0; :foreach i in=[/log print as-value] do={ :if ($c < 40) do={ :set payload ($payload . \"R=/log|.id=\" . [$ktmEsc ($i->\".id\")] . \"|time=\" . [$ktmEsc ($i->\"time\")] . \"|topics=\" . [$ktmEsc ($i->\"topics\")] . \"|message=\" . [$ktmEsc ($i->\"message\")] . $NL); :set c ($c + 1); } } } on-error={};",
+        f"  :do {{ /tool fetch url=\"{snapshot_url}\" http-method=post http-header-field=\"Content-Type: text/plain\" http-data=$payload keep-result=no; }} on-error={{ /tool fetch url=\"{snapshot_url}\" http-method=post http-data=$payload keep-result=no; }}",
+        f"  /tool fetch url=\"{ping_url}\" keep-result=no;",
+        f"  /tool fetch url=\"{next_url}\" dst-path=\"ketamon-relay-next.rsc\" keep-result=yes;",
+        "  :delay 1s;",
+        "  /import file-name=\"ketamon-relay-next.rsc\";",
+        "  /file remove [find name=\"ketamon-relay-next.rsc\"];",
+        "}",
+        "/system scheduler add name=\"ketamon-relay-poll\" interval=30s on-event=\"/system script run ketamon-relay-poll\" disabled=no",
+        ":delay 2s",
+        "/system script run ketamon-relay-poll",
+    ])
+
+
+def _build_routeros_relay_script(base_url, token):
+    base_url = str(base_url or "").rstrip("/")
+    token = str(token or "").strip()
+    next_url = f"{base_url}/api/relay/routeros/next?token={token}"
+    ping_url = f"{base_url}/api/relay/ping?token={token}"
+    snapshot_url = f"{base_url}/api/relay/snapshot?token={token}"
+
+    def send_line(payload_var="p"):
+        return (
+            f"  :do {{ /tool fetch url=\"{snapshot_url}\" http-method=post "
+            f"http-header-field=\"Content-Type: text/plain\" http-data=${payload_var} keep-result=no; }} on-error={{}}"
+        )
+
+    return "\n".join([
+        "# KetaMon Cloud Relay - safe snapshots by resource",
+        "/system script remove [find name=\"ketamon-relay-poll\"]",
+        "/system scheduler remove [find name=\"ketamon-relay-poll\"]",
+        "/system script add name=\"ketamon-relay-poll\" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon source={",
+        "  :global ktmEsc do={",
+        "    :local v [:tostr $1];",
+        "    :local out \"\";",
+        "    :for i from=0 to=([:len $v] - 1) do={",
+        "      :local ch [:pick $v $i ($i + 1)];",
+        "      :if ($ch = \"\\\\\") do={ :set out ($out . \"\\\\\\\\\"); } else={",
+        "        :if ($ch = \"|\") do={ :set out ($out . \"\\\\p\"); } else={",
+        "          :if ($ch = \"\\n\") do={ :set out ($out . \"\\\\n\"); } else={ :set out ($out . $ch); }",
+        "        }",
+        "      }",
+        "    }",
+        "    :return $out;",
+        "  };",
+        "  :local NL \"\\n\";",
+        "  :local p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
+        "  :do { :set p ($p . \"R=/system/identity|name=\" . [$ktmEsc [/system identity get name]] . $NL); } on-error={};",
+        "  :do { :set p ($p . \"R=/system/resource|version=\" . [$ktmEsc [/system resource get version]] . \"|uptime=\" . [$ktmEsc [/system resource get uptime]] . \"|cpu-load=\" . [$ktmEsc [/system resource get cpu-load]] . \"|total-memory=\" . [$ktmEsc [/system resource get total-memory]] . \"|free-memory=\" . [$ktmEsc [/system resource get free-memory]] . \"|total-hdd-space=\" . [$ktmEsc [/system resource get total-hdd-space]] . \"|free-hdd-space=\" . [$ktmEsc [/system resource get free-hdd-space]] . \"|board-name=\" . [$ktmEsc [/system resource get board-name]] . $NL); } on-error={};",
+        "  :do { :set p ($p . \"R=/system/clock|time=\" . [$ktmEsc [/system clock get time]] . \"|date=\" . [$ktmEsc [/system clock get date]] . $NL); } on-error={};",
+        "  :do { :set p ($p . \"R=/system/routerboard|model=\" . [$ktmEsc [/system routerboard get model]] . $NL); } on-error={};",
+        send_line(),
+        "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
+        "  :do { :foreach i in=[/ip hotspot print as-value] do={ :set p ($p . \"R=/ip/hotspot|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|interface=\" . [$ktmEsc ($i->\"interface\")] . \"|address-pool=\" . [$ktmEsc ($i->\"address-pool\")] . \"|profile=\" . [$ktmEsc ($i->\"profile\")] . $NL); } } on-error={};",
+        send_line(),
+        "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
+        "  :do { :foreach i in=[/ip hotspot user profile print as-value] do={ :set p ($p . \"R=/ip/hotspot/user/profile|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|rate-limit=\" . [$ktmEsc ($i->\"rate-limit\")] . \"|shared-users=\" . [$ktmEsc ($i->\"shared-users\")] . \"|address-pool=\" . [$ktmEsc ($i->\"address-pool\")] . $NL); } } on-error={};",
+        send_line(),
+        "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
+        "  :do { :foreach aid in=[/ip hotspot active find] do={ :local user [/ip hotspot active get $aid user]; :local addr [/ip hotspot active get $aid address]; :local mac [/ip hotspot active get $aid mac-address]; :if ([:len $mac] = 0) do={ :local hid [/ip hotspot host find where address=$addr]; :if ([:len $hid] > 0) do={ :set mac [/ip hotspot host get [:pick $hid 0] mac-address]; } }; :set p ($p . \"R=/ip/hotspot/active|.id=\" . [$ktmEsc $aid] . \"|user=\" . [$ktmEsc $user] . \"|address=\" . [$ktmEsc $addr] . \"|mac-address=\" . [$ktmEsc $mac] . \"|uptime=\" . [$ktmEsc [/ip hotspot active get $aid uptime]] . \"|session-time-left=\" . [$ktmEsc [/ip hotspot active get $aid session-time-left]] . \"|bytes-in=\" . [$ktmEsc [/ip hotspot active get $aid bytes-in]] . \"|bytes-out=\" . [$ktmEsc [/ip hotspot active get $aid bytes-out]] . \"|server=\" . [$ktmEsc [/ip hotspot active get $aid server]] . $NL); } } on-error={};",
+        send_line(),
+        "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
+        "  :do { :local c 0; :foreach i in=[/ip hotspot user print as-value] do={ :if ($c < 500) do={ :set p ($p . \"R=/ip/hotspot/user|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|password=\" . [$ktmEsc ($i->\"password\")] . \"|profile=\" . [$ktmEsc ($i->\"profile\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|limit-uptime=\" . [$ktmEsc ($i->\"limit-uptime\")] . \"|uptime=\" . [$ktmEsc ($i->\"uptime\")] . \"|bytes-in=\" . [$ktmEsc ($i->\"bytes-in\")] . \"|bytes-out=\" . [$ktmEsc ($i->\"bytes-out\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|comment=\" . [$ktmEsc ($i->\"comment\")] . $NL); :set c ($c + 1); } } } on-error={};",
+        send_line(),
+        "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
+        "  :do { :local c 0; :foreach i in=[/ip hotspot host print as-value] do={ :if ($c < 500) do={ :set p ($p . \"R=/ip/hotspot/host|.id=\" . [$ktmEsc ($i->\".id\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|to-address=\" . [$ktmEsc ($i->\"to-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|authorized=\" . [$ktmEsc ($i->\"authorized\")] . $NL); :set c ($c + 1); } } } on-error={};",
+        send_line(),
+        "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
+        "  :do { :foreach i in=[/interface print as-value] do={ :set p ($p . \"R=/interface|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|type=\" . [$ktmEsc ($i->\"type\")] . \"|running=\" . [$ktmEsc ($i->\"running\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|actual-mtu=\" . [$ktmEsc ($i->\"actual-mtu\")] . \"|mtu=\" . [$ktmEsc ($i->\"mtu\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|rx-byte=\" . [$ktmEsc ($i->\"rx-byte\")] . \"|tx-byte=\" . [$ktmEsc ($i->\"tx-byte\")] . \"|rx-packet=\" . [$ktmEsc ($i->\"rx-packet\")] . \"|tx-packet=\" . [$ktmEsc ($i->\"tx-packet\")] . $NL); } } on-error={};",
+        send_line(),
+        "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
+        "  :do { :local c 0; :foreach i in=[/log print as-value] do={ :if ($c < 120) do={ :set p ($p . \"R=/log|.id=\" . [$ktmEsc ($i->\".id\")] . \"|time=\" . [$ktmEsc ($i->\"time\")] . \"|topics=\" . [$ktmEsc ($i->\"topics\")] . \"|message=\" . [$ktmEsc ($i->\"message\")] . $NL); :set c ($c + 1); } } } on-error={};",
+        send_line(),
+        "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
+        "  :do { :foreach i in=[/system scheduler print as-value] do={ :set p ($p . \"R=/system/scheduler|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|interval=\" . [$ktmEsc ($i->\"interval\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|next-run=\" . [$ktmEsc ($i->\"next-run\")] . \"|on-event=\" . [$ktmEsc ($i->\"on-event\")] . $NL); } } on-error={};",
+        send_line(),
+        f"  :do {{ /tool fetch url=\"{ping_url}\" keep-result=no; }} on-error={{}}",
+        "  :for ktmCmd from=1 to=5 do={",
+        f"    :do {{ /tool fetch url=\"{next_url}\" dst-path=\"ketamon-relay-next.rsc\" keep-result=yes; :delay 1s; /import file-name=\"ketamon-relay-next.rsc\"; /file remove [find name=\"ketamon-relay-next.rsc\"]; }} on-error={{}}",
+        "  }",
+        "}",
+        "/system scheduler add name=\"ketamon-relay-poll\" interval=30s on-event=\"/system script run ketamon-relay-poll\" disabled=no",
+        ":delay 2s",
+        "/system script run ketamon-relay-poll",
+    ])
+
+
+@app.route("/api/relay/routeros/install.rsc", methods=["GET"])
+def api_relay_routeros_install_script():
+    router, token = _relay_router_from_request()
+    if not router:
+        return ":put \"KetaMon relay: token invalide\"\n", 401, {"Content-Type": "text/plain; charset=utf-8"}
+    return _build_routeros_relay_script(_relay_public_base_url(), token) + "\n", 200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store",
+    }
+
+
+@app.route("/parametres/routeurs/<rid>/relais", methods=["GET", "POST"])
+@login_required
+def router_relay_settings(rid):
+    owner_id = _current_owner_id()
+    router = db_mod.db_get_router(rid, owner_id)
+    if not router:
+        flash("Routeur introuvable ou non autorise.", "danger")
+        return redirect(url_for("sessions_list"))
+
+    if request.method == "POST":
+        action = request.form.get("action", "").strip()
+        if action == "enable":
+            token = router.get("relay_token") or secrets.token_urlsafe(32)
+            db_mod.db_set_router_relay(rid, owner_id, enabled=True, token=token)
+            flash("Relais cloud active pour ce routeur.", "success")
+        elif action == "disable":
+            db_mod.db_set_router_relay(rid, owner_id, enabled=False)
+            flash("Relais cloud desactive pour ce routeur.", "info")
+        elif action == "rotate":
+            db_mod.db_set_router_relay(rid, owner_id, enabled=True, token=secrets.token_urlsafe(32))
+            flash("Nouveau token relais genere.", "success")
+        elif action == "queue_ping":
+            router = db_mod.db_get_router(rid, owner_id)
+            if not int(router.get("relay_enabled") or 0):
+                flash("Activez d'abord le relais cloud.", "warning")
+            else:
+                db_mod.db_enqueue_router_relay_command(rid, router.get("owner_id", ""), "ping", {"from": "web"})
+                flash("Commande test envoyee. Le MikroTik la prendra au prochain polling.", "success")
+        return redirect(url_for("router_relay_settings", rid=rid))
+
+    router = db_mod.db_get_router(rid, owner_id)
+    commands = db_mod.db_get_router_relay_commands(rid, limit=12)
+    base_url = _relay_public_base_url()
+    install_script = ""
+    install_url = ""
+    bootstrap_command = ""
+    if router.get("relay_token"):
+        token = router.get("relay_token")
+        install_url = f"{base_url}/api/relay/routeros/install.rsc?token={quote(token)}"
+        bootstrap_command = (
+            f'/tool fetch url="{install_url}" dst-path="ketamon-relay-install.rsc"; '
+            '/import file-name="ketamon-relay-install.rsc"; '
+            '/file remove [find name="ketamon-relay-install.rsc"]'
+        )
+        install_script = _build_routeros_relay_script(base_url, token)
+    return render_template(
+        "settings/relay_router.html",
+        router=router,
+        commands=commands,
+        relay_base_url=base_url,
+        install_url=install_url,
+        bootstrap_command=bootstrap_command,
+        install_script=install_script,
+    )
+
 
 @app.route("/parametres/routeurs/<rid>/supprimer", methods=["POST"])
 @login_required
@@ -2987,6 +6086,7 @@ def delete_router(rid):
     if not deleted:
         flash("Routeur introuvable ou non autorise.", "danger")
         return redirect(url_for("sessions_list"))
+    _invalidate_routers_cache()
     if session.get("router_id") == rid:
         session.pop("router_id", None)
         session.pop("router_name", None)
@@ -3002,9 +6102,16 @@ def edit_router(rid):
         flash("Routeur introuvable.", "danger")
         return redirect(url_for("sessions_list"))
     if request.method == "POST":
+        new_host = request.form.get("host", router["host"]).strip()
+        fallback_host = request.form.get("fallback_host", router.get("fallback_host", "")).strip()
+        # Si on migre vers une adresse directe et qu'aucun secours n'est fourni,
+        # on conserve l'ancien host comme fallback automatique.
+        if not fallback_host and new_host and new_host != str(router.get("host", "")).strip():
+            fallback_host = str(router.get("host", "")).strip()
         fields = {
             "name":     request.form.get("name", router["name"]).strip(),
-            "host":     request.form.get("host", router["host"]).strip(),
+            "host":     new_host,
+            "fallback_host": fallback_host,
             "port":     request.form.get("port", router.get("port", 8728)),
             "user":     (request.form.get("user", router.get("user") or "admin").strip() or "admin"),
             "currency": request.form.get("currency", router.get("currency", "FCFA")).strip(),
@@ -3013,7 +6120,17 @@ def edit_router(rid):
         if pwd:
             fields["password"] = pwd
         db_mod.db_update_router(rid, _current_owner_id(), fields)
-        flash("Routeur modifie.", "success")
+        updated_router = dict(router)
+        updated_router.update(fields)
+        runtime_ok, runtime_msg = _apply_ticket_runtime_to_router(updated_router)
+        if runtime_ok:
+            flash("Routeur modifie et scripts d'expiration reinstalles.", "success")
+        else:
+            flash(
+                "Routeur modifie. Le push direct des scripts MikroTik est en attente car l'API 8728 est inaccessible. "
+                f"L'expiration serveur/fallback reste active. Detail: {runtime_msg}",
+                "warning",
+            )
         return redirect(url_for("sessions_list"))
     return render_template("settings/edit_router.html", router=router)
 
@@ -3105,9 +6222,65 @@ def privacy():
 
 @app.route("/sw.js")
 def service_worker():
-    from flask import send_from_directory
-    return send_from_directory(app.static_folder, "sw.js",
-                               mimetype="application/javascript")
+    sw_path = os.path.join(app.static_folder, "sw.js")
+    try:
+        with open(sw_path, encoding="utf-8") as f:
+            body = f.read()
+    except Exception:
+        body = ""
+    body = body.replace("__PWA_VERSION__", _get_pwa_ver())
+    response = app.response_class(body, mimetype="application/javascript")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+@app.route("/offline")
+def offline_page():
+    return render_template("offline.html"), 200
+
+
+@app.route("/pwa-reset")
+def pwa_reset_page():
+    html = """<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KetaMon - Reparation PWA</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#f8fafc;font-family:Arial,sans-serif}
+main{width:min(420px,calc(100% - 32px));background:#1f2937;border:1px solid #334155;border-radius:16px;padding:24px;text-align:center}
+a,button{display:inline-block;margin-top:14px;background:#0ea5e9;color:#fff;border:0;border-radius:10px;padding:11px 16px;text-decoration:none;font-weight:700}
+p{color:#cbd5e1}
+</style>
+</head>
+<body>
+<main>
+<h1>KetaMon</h1>
+<p>Nettoyage du cache PWA en cours...</p>
+<button id="retry" type="button">Ouvrir la connexion</button>
+</main>
+<script>
+(function(){
+  function go(){ window.location.replace('/login?cache=cleaned&t=' + Date.now()); }
+  document.getElementById('retry').addEventListener('click', go);
+  var clearCaches = 'caches' in window
+    ? caches.keys().then(function(keys){ return Promise.all(keys.map(function(k){ return caches.delete(k); })); }).catch(function(){})
+    : Promise.resolve();
+  var unregister = navigator.serviceWorker && navigator.serviceWorker.getRegistrations
+    ? navigator.serviceWorker.getRegistrations().then(function(regs){ return Promise.all(regs.map(function(reg){ return reg.unregister(); })); }).catch(function(){})
+    : Promise.resolve();
+  Promise.all([clearCaches, unregister]).then(function(){ setTimeout(go, 300); });
+})();
+</script>
+</body>
+</html>"""
+    response = app.response_class(html, mimetype="text/html")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 # ─── API Log Hotspot (live dashboard) ────────────────────────────────────────
 
@@ -3147,13 +6320,13 @@ def api_resources():
     if err:
         return jsonify({"ok": False, "msg": err})
     try:
-        res       = api.get_resource("/system/resource").get()[0]
+        res       = resource_first(api, "/system/resource")
         total_mem = int(res.get("total-memory", 1) or 1)
         free_mem  = int(res.get("free-memory", 0)  or 0)
         total_hdd = int(res.get("total-hdd-space", 0) or 0)
         free_hdd  = int(res.get("free-hdd-space",  0) or 0)
         try:
-            rb    = api.get_resource("/system/routerboard").get()[0]
+            rb    = resource_first(api, "/system/routerboard")
             board = rb.get("model", res.get("board-name", "—"))
         except Exception:
             board = res.get("board-name", "—")
@@ -3242,11 +6415,7 @@ def concepteur_dashboard():
     active_router_info = get_active_router()
     if active_router_info:
         try:
-            host = active_router_info.get("host","")
-            ruser = active_router_info.get("user") or "admin"
-            pwd = active_router_info.get("password","")
-            port = int(active_router_info.get("port") or 8728)
-            api2, err2 = mk.safe_connect(host, ruser, pwd, port)
+            api2, err2 = mk.safe_connect_router(active_router_info)
             if not err2:
                 all_u = api2.get_resource("/ip/hotspot/user").get()
                 total_mk_users = len(all_u)
@@ -3278,42 +6447,102 @@ def concepteur_users():
     token = session.get("ks_token")
     users_data = []
     is_local = False
+    local_rows = db_mod.db_get_local_users()
+    router_counts = db_mod.db_get_router_counts_by_owner()
+
+    def local_payload(lu):
+        email = str(lu.get("email") or lu.get("username", "")).strip()
+        approved = _local_user_is_approved(lu)
+        active = _local_user_is_active(lu)
+        return {
+            "id": lu.get("id", ""),
+            "email": email,
+            "displayName": lu.get("display_name") or lu.get("username", ""),
+            "role": lu.get("role", "utilisateur"),
+            "routerCount": router_counts.get(email, 0),
+            "loginCount": 0,
+            "lastLoginAt": None,
+            "createdAt": lu.get("created_at", ""),
+            "active": active,
+            "approvalPending": not approved,
+        }
+
+    local_by_email = {}
+    for lu in local_rows:
+        email_key = str(lu.get("email") or lu.get("username", "")).strip().casefold()
+        if email_key:
+            local_by_email[email_key] = lu
+
+    remote_users = []
     if token:
         u, _ = ks_get("/api/admin/users", token)
         if u and u.get("ok"):
-            users_data = u.get("users", [])
-    if not users_data:
+            remote_users = u.get("users", [])
+
+    if remote_users:
+        seen = set()
+        for ru in remote_users:
+            email = str(ru.get("email") or ru.get("username") or "").strip()
+            local_user = local_by_email.get(email.casefold()) if email else None
+            if email and not local_user:
+                remote_active = bool(ru.get("active", True))
+                local_user = db_mod.db_upsert_local_email_user(
+                    email,
+                    display_name=ru.get("displayName") or ru.get("display_name") or email,
+                    role=ru.get("role", "utilisateur"),
+                    approved=1 if remote_active else 0,
+                    disabled=0 if remote_active else 1,
+                )
+                if local_user:
+                    local_by_email[email.casefold()] = local_user
+            if local_user:
+                row = local_payload(local_user)
+                row["loginCount"] = ru.get("loginCount", 0) or 0
+                row["lastLoginAt"] = ru.get("lastLoginAt")
+                row["displayName"] = row["displayName"] or ru.get("displayName") or "—"
+                row["role"] = local_user.get("role", ru.get("role", "utilisateur"))
+            else:
+                row = {
+                    "id": ru.get("id", ""),
+                    "email": email,
+                    "displayName": ru.get("displayName") or ru.get("display_name") or email,
+                    "role": ru.get("role", "utilisateur"),
+                    "routerCount": ru.get("routerCount", 0) or 0,
+                    "loginCount": ru.get("loginCount", 0) or 0,
+                    "lastLoginAt": ru.get("lastLoginAt"),
+                    "createdAt": ru.get("createdAt", ""),
+                    "active": bool(ru.get("active", True)),
+                    "approvalPending": False,
+                }
+            users_data.append(row)
+            seen.add((email or str(row["id"])).casefold())
+
+        for lu in local_rows:
+            email = str(lu.get("email") or lu.get("username", "")).strip()
+            key = (email or str(lu.get("id", ""))).casefold()
+            if key not in seen:
+                users_data.append(local_payload(lu))
+    else:
         is_local = True
-        for lu in db_mod.db_get_local_users():
-            users_data.append({
-                "id":          lu.get("id", ""),
-                "email":       lu.get("email") or lu.get("username", ""),
-                "displayName": lu.get("display_name") or lu.get("username", ""),
-                "role":        lu.get("role", "utilisateur"),
-                "routerCount": 0,
-                "loginCount":  0,
-                "lastLoginAt": None,
-                "createdAt":   lu.get("created_at", ""),
-                "active":      int(lu.get("disabled", 0)) == 0,
-            })
+        for lu in local_rows:
+            users_data.append(local_payload(lu))
     return render_template("concepteur/users.html", users_data=users_data, is_local=is_local)
 
 @app.route("/concepteur/utilisateurs/<uid>/supprimer", methods=["POST"])
 @concepteur_required
 def concepteur_delete_user(uid):
     token = session.get("ks_token")
-    if token:
-        resp, err = ks_delete(f"/api/admin/users/{uid}", token)
-        if err:
-            return jsonify({"ok": False, "msg": err})
-        return jsonify(resp or {"ok": False})
-    # Fallback : supprimer l'utilisateur local
     try:
         conn = db_mod.get_conn()
         rows = conn.execute("DELETE FROM local_users WHERE id=?", (uid,)).rowcount
         conn.commit()
         if rows:
             return jsonify({"ok": True})
+        if token:
+            resp, err = ks_delete(f"/api/admin/users/{uid}", token)
+            if err:
+                return jsonify({"ok": False, "msg": err})
+            return jsonify(resp or {"ok": False})
         return jsonify({"ok": False, "msg": "Utilisateur introuvable."})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
@@ -3322,21 +6551,21 @@ def concepteur_delete_user(uid):
 @concepteur_required
 def concepteur_toggle_user(uid):
     token = session.get("ks_token")
-    if token:
-        resp, err = ks_patch(f"/api/admin/users/{uid}/toggle", token)
-        if err:
-            return jsonify({"ok": False, "msg": err})
-        return jsonify(resp or {"ok": False})
-    # Fallback : basculer disabled dans la base locale
     try:
-        conn = db_mod.get_conn()
-        row = conn.execute("SELECT disabled FROM local_users WHERE id=?", (uid,)).fetchone()
-        if not row:
-            return jsonify({"ok": False, "msg": "Utilisateur introuvable."})
-        new_val = 0 if int(row["disabled"] or 0) else 1
-        conn.execute("UPDATE local_users SET disabled=? WHERE id=?", (new_val, uid))
-        conn.commit()
-        return jsonify({"ok": True, "active": new_val == 0})
+        user = db_mod.db_get_local_user(uid)
+        if user:
+            updated = db_mod.db_set_local_user_active(uid, not _local_user_is_active(user))
+            return jsonify({
+                "ok": True,
+                "active": _local_user_is_active(updated),
+                "approvalPending": not _local_user_is_approved(updated),
+            })
+        if token:
+            resp, err = ks_patch(f"/api/admin/users/{uid}/toggle", token)
+            if err:
+                return jsonify({"ok": False, "msg": err})
+            return jsonify(resp or {"ok": False})
+        return jsonify({"ok": False, "msg": "Utilisateur introuvable."})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
 
@@ -3430,7 +6659,7 @@ def concepteur_credentials():
 @login_required
 def abonnement():
     uid    = session.get("user_id", "")
-    sub    = get_user_subscription(uid)
+    sub    = ensure_trial_subscription_for_user(uid, session.get("username", uid))
     # Demande en attente de validation (si pas d'abo actif)
     pending_sub = None
     if not sub:
@@ -3440,7 +6669,7 @@ def abonnement():
     cfg    = get_pay_config()
     methodes_actives = [m for m in cfg.get("methodes", []) if m.get("actif") and m.get("numero")]
     return render_template("abonnement.html", plans=plans, sub=sub, pending_sub=pending_sub,
-                           methodes=methodes_actives, cfg=cfg)
+                           methodes=methodes_actives, cfg=cfg, trial_days=get_trial_days())
 
 @app.route("/abonnement/souscrire", methods=["POST"])
 @login_required
@@ -3612,6 +6841,10 @@ def concepteur_paiements_config():
             cfg["devise_base"]  = request.form.get("devise_base", "FCFA")
             flash("Taux de change mis à jour.", "success")
 
+        elif action == "trial":
+            cfg["trial_days"] = safe_int(request.form.get("trial_days", 45), default=45, min_val=0, max_val=3650)
+            flash("Duree d'essai mise a jour.", "success")
+
         elif action == "methode":
             mid    = request.form.get("methode_id", "")
             numero = request.form.get("numero", "").strip()
@@ -3674,11 +6907,8 @@ def concepteur_tickets():
     for router_info in db_mod.db_get_routers():
         try:
             rhost = router_info.get("host","")
-            ruser = router_info.get("user") or "admin"
-            rpwd  = router_info.get("password","")
-            rport = int(router_info.get("port") or 8728)
             rid   = router_info.get("id") or rhost
-            api2, err2 = mk.safe_connect(rhost, ruser, rpwd, rport)
+            api2, err2 = mk.safe_connect_router(router_info)
             if err2:
                 continue
             mk_users = api2.get_resource("/ip/hotspot/user").get()
@@ -3769,6 +6999,295 @@ def concepteur_paiements():
     }
     return render_template("concepteur/paiements.html", summary=summary, history=history)
 
+# ─── Agent KetaMon : Incidents ────────────────────────────────────────────────
+
+@app.route("/concepteur/incidents")
+@concepteur_required
+def concepteur_incidents():
+    open_incidents   = db_mod.db_agent_get_incidents(resolved=False)
+    closed_incidents = db_mod.db_agent_get_incidents(resolved=True, limit=50)
+    return render_template("concepteur/incidents.html",
+                           open_incidents=open_incidents,
+                           closed_incidents=closed_incidents)
+
+
+@app.route("/api/agent/incidents/<inc_id>/approve", methods=["POST"])
+@concepteur_required
+def agent_approve_incident(inc_id):
+    ok = db_mod.db_agent_approve_incident(inc_id)
+    return jsonify({"ok": ok})
+
+
+@app.route("/api/agent/incidents/<inc_id>/reject", methods=["POST"])
+@concepteur_required
+def agent_reject_incident(inc_id):
+    ok = db_mod.db_agent_reject_incident(inc_id)
+    return jsonify({"ok": ok})
+
+
+@app.route("/api/agent/incidents/count")
+@concepteur_required
+def agent_incidents_count():
+    return jsonify({"count": db_mod.db_agent_count_open()})
+
+
+@app.route("/api/agent/status")
+@concepteur_required
+def agent_status():
+    return jsonify({"ok": True, "status": agent_mod.get_status(),
+                    "config": agent_mod.get_config()})
+
+
+@app.route("/api/agent/force-run", methods=["POST"])
+@concepteur_required
+def agent_force_run():
+    agent_mod.force_run()
+    return jsonify({"ok": True, "msg": "Cycle force declenche."})
+
+
+@app.route("/api/agent/config", methods=["POST"])
+@concepteur_required
+def agent_set_config():
+    data = request.get_json(silent=True) or {}
+    changed = []
+    for key in ("expiry_interval", "monitor_interval", "revenue_interval",
+                "sync_stale_min", "paused"):
+        if key in data:
+            val = data[key]
+            if key == "paused":
+                val = bool(val)
+            else:
+                try:
+                    val = int(val)
+                    if val < 10:
+                        val = 10
+                except Exception:
+                    continue
+            if agent_mod.set_config(key, val):
+                changed.append(key)
+    return jsonify({"ok": True, "changed": changed})
+
+
+@app.route("/api/agent/chat", methods=["POST"])
+@concepteur_required
+def agent_chat():
+    data = request.get_json(silent=True) or {}
+    msg  = str(data.get("message","")).strip().lower()
+    if not msg:
+        return jsonify({"ok": False, "reply": ""})
+
+    reply, actions = _agent_chat_reply(msg)
+    return jsonify({"ok": True, "reply": reply, "actions": actions})
+
+
+def _agent_chat_reply(msg: str):
+    """
+    Moteur de réponse basé sur les règles KetaMon.
+    Retourne (texte_reponse, liste_actions_executees).
+    """
+    actions = []
+    now     = datetime.now()
+
+    # ── Helpers internes ──
+    def _routers():
+        try:    return db_mod.db_get_routers(owner_id=None)
+        except: return []
+
+    def _count_open_incidents():
+        try:    return db_mod.db_agent_count_open()
+        except: return 0
+
+    def _agent_st():
+        try:    return agent_mod.get_status()
+        except: return {}
+
+    def _ventes_today(rid):
+        try:
+            today = now.strftime("%Y-%m-%d")
+            return db_mod.db_get_ventes(rid, jour=today)
+        except: return []
+
+    def _profile_meta(rid):
+        try:    return db_mod.db_get_hotspot_profile_metadata(rid) or []
+        except: return []
+
+    # ── Mots-clés ──
+    kw = lambda *words: any(w in msg for w in words)
+
+    # ── 1. STATUT GÉNÉRAL ──
+    if kw("statut","status","etat","état","comment","ca va","ça va","sante","santé","tout","general","général"):
+        st   = _agent_st()
+        open_inc = _count_open_incidents()
+        routers  = _routers()
+        lines = [
+            f"**Statut système :**",
+            f"- Agent : {'En pause ⏸' if agent_mod.get_config().get('paused') else 'Actif ✅'}",
+            f"- Cycles expiration effectués : {st.get('expiry_cycles',0)}",
+            f"- Tickets expirés traités : {st.get('tickets_expired',0)}",
+            f"- Ventes synchronisées : {st.get('ventes_synced',0)}",
+            f"- Incidents ouverts : {open_inc}",
+            f"- Routeurs configurés : {len(routers)}",
+            f"- Démarré le : {st.get('started_at','—')}",
+        ]
+        if open_inc > 0:
+            lines.append(f"\n⚠️ {open_inc} incident(s) en attente de ton approbation.")
+        return "\n".join(lines), actions
+
+    # ── 2. INCIDENTS ──
+    if kw("incident","incidents","problème","probleme","erreur","erreurs","alerte","bug","panne"):
+        open_inc = db_mod.db_agent_get_incidents(resolved=False, limit=5)
+        if not open_inc:
+            return "✅ Aucun incident ouvert. Tout fonctionne correctement.", actions
+        lines = [f"**{len(open_inc)} incident(s) ouvert(s) :**"]
+        for i in open_inc:
+            lines.append(f"- [{i['level'].upper()}] {i['title']} — statut : {i['fix_status']}")
+        lines.append("\nVa sur **/concepteur/incidents** pour approuver les corrections.")
+        return "\n".join(lines), actions
+
+    # ── 3. TICKETS ──
+    if kw("ticket","tickets","expir","expiration","actif","actifs","combien de ticket"):
+        routers = _routers()
+        if not routers:
+            return "Aucun routeur configuré. Je ne peux pas lire les tickets.", actions
+        total_actifs = 0
+        lines = ["**État des tickets par routeur :**"]
+        for router in routers:
+            rid   = router.get("id") or router.get("host","")
+            rname = router.get("name") or router.get("host","?")
+            rhost = router.get("host","")
+            ruser = router.get("user") or "admin"
+            rpwd  = router.get("password","")
+            rport = int(router.get("port") or 8728)
+            try:
+                api, err = mk.safe_connect_router(router, timeout=6)
+                if err:
+                    lines.append(f"- **{rname}** : ❌ inaccessible")
+                    continue
+                users = api.get_resource("/ip/hotspot/user").get()
+                actifs = [u for u in users
+                          if str(u.get("profile","")).lower() != "default"]
+                avec_epoch = sum(1 for u in actifs
+                                 if " ##KETAMON## exp=" in str(u.get("comment","")))
+                total_actifs += len(actifs)
+                lines.append(f"- **{rname}** : {len(actifs)} ticket(s) — {avec_epoch} avec expiration tracée")
+            except Exception as e:
+                lines.append(f"- **{rname}** : erreur ({e})")
+        lines.append(f"\n**Total : {total_actifs} ticket(s) actifs**")
+        return "\n".join(lines), actions
+
+    # ── 4. REVENUS / VENTES ──
+    if kw("revenu","revenus","vente","ventes","argent","recette","combien","aujourd","aujrd","money","fcfa","xof"):
+        routers = _routers()
+        if not routers:
+            return "Aucun routeur configuré.", actions
+        today   = now.strftime("%Y-%m-%d")
+        month   = now.strftime("%Y-%m")
+        lines   = [f"**Revenus — {now.strftime('%d/%m/%Y')} :**"]
+        total_j = 0.0
+        total_m = 0.0
+        total_ventes_j = 0
+        total_ventes_m = 0
+        for router in routers:
+            rid   = router.get("id") or router.get("host","")
+            rname = router.get("name") or router.get("host","?")
+            try:
+                summary = db_mod.db_get_ventes_summary(rid, today, month)
+                tj  = float(summary.get("today_total", 0) or 0)
+                tm  = float(summary.get("month_total", 0) or 0)
+                cj  = int(summary.get("today_count", 0) or 0)
+                cm  = int(summary.get("month_count", 0) or 0)
+                cur = summary.get("currency","FCFA")
+                total_j += tj
+                total_m += tm
+                total_ventes_j += cj
+                total_ventes_m += cm
+                lines.append(f"- **{rname}** : aujourd'hui {tj:.0f} {cur} ({cj} vente(s)) | mois {tm:.0f} {cur} ({cm} vente(s))")
+            except Exception as e:
+                lines.append(f"- **{rname}** : erreur ({e})")
+        lines.append(f"\n**Total aujourd'hui : {total_j:.0f} ({total_ventes_j} vente(s)) | ce mois : {total_m:.0f} ({total_ventes_m} vente(s))**")
+        return "\n".join(lines), actions
+
+    # ── 5. ROUTEURS ──
+    if kw("routeur","router","mikrotik","connexion","connecté","connecte","ping","accessible","inaccessible"):
+        routers = _routers()
+        if not routers:
+            return "Aucun routeur configuré dans KetaMon.", actions
+        lines = [f"**Routeurs ({len(routers)}) :**"]
+        for router in routers:
+            rname = router.get("name") or router.get("host","?")
+            rhost = router.get("host","")
+            ruser = router.get("user") or "admin"
+            rpwd  = router.get("password","")
+            rport = int(router.get("port") or 8728)
+            try:
+                api, err = mk.safe_connect_router(router, timeout=5)
+                if err:
+                    lines.append(f"- **{rname}** ({rhost}) : ❌ Hors ligne — {err}")
+                else:
+                    lines.append(f"- **{rname}** ({rhost}) : ✅ En ligne")
+            except:
+                lines.append(f"- **{rname}** ({rhost}) : ❌ Erreur connexion")
+        return "\n".join(lines), actions
+
+    # ── 6. FORCER CYCLE ──
+    if kw("force","forcer","relance","relancer","déclenche","declenche","maintenant","execut","exécut"):
+        agent_mod.force_run()
+        actions.append("force_run")
+        return "⚡ Cycle forcé déclenché. L'agent va vérifier les expirations et les incidents dans les prochaines secondes.", actions
+
+    # ── 7. PAUSE / RESUME ──
+    if kw("pause","suspend","stop","arrête","arrete"):
+        agent_mod.set_config("paused", True)
+        actions.append("pause")
+        return "⏸ Agent mis en pause. Les cycles automatiques sont suspendus. Dis **reprendre** pour relancer.", actions
+
+    if kw("repren","resume","reprend","redémarre","redémarre","relance","activ"):
+        agent_mod.set_config("paused", False)
+        agent_mod.force_run()
+        actions.append("resume")
+        return "▶️ Agent repris. Les cycles automatiques sont relancés.", actions
+
+    # ── 8. AIDE ──
+    if kw("aide","help","quoi","que faire","commandes","liste","que peux"):
+        return (
+            "**Ce que je peux faire pour toi :**\n\n"
+            "📊 **Informations :**\n"
+            "- *statut* — état général du système\n"
+            "- *incidents* — liste des problèmes détectés\n"
+            "- *tickets* — état des tickets par routeur\n"
+            "- *revenus* — ventes du jour et du mois\n"
+            "- *routeurs* — connectivité de chaque routeur\n\n"
+            "⚡ **Actions :**\n"
+            "- *forcer* — déclenche un cycle immédiat\n"
+            "- *pause* — suspend l'agent\n"
+            "- *reprendre* — relance l'agent\n\n"
+            "Tu peux écrire naturellement : *'comment vont les ventes aujourd'hui ?'* ou *'y a-t-il des incidents ?'*"
+        ), actions
+
+    # ── 9. SALUTATIONS ──
+    if kw("bonjour","bonsoir","salut","hello","hi","bj","bjr"):
+        open_inc = _count_open_incidents()
+        st = _agent_st()
+        greeting = "Bonjour 👋" if now.hour < 18 else "Bonsoir 👋"
+        msg_inc = f" ⚠️ {open_inc} incident(s) en attente." if open_inc else " ✅ Aucun incident."
+        return (f"{greeting} Je suis l'agent KetaMon.\n"
+                f"Cycles effectués : {st.get('expiry_cycles',0)} expiration | "
+                f"{st.get('revenue_cycles',0)} revenus.{msg_inc}\n\n"
+                "Tape **aide** pour voir ce que je peux faire."), actions
+
+    # ── 10. RÉPONSE PAR DÉFAUT ──
+    return (
+        "Je n'ai pas compris. Voici ce que je comprends :\n"
+        "*statut, incidents, tickets, revenus, routeurs, forcer, pause, reprendre, aide*\n\n"
+        "Exemple : **'montre les revenus d'aujourd'hui'** ou **'y a-t-il des problèmes ?'**"
+    ), actions
+
+
+@app.route("/health")
+def health_check():
+    return jsonify({"ok": True, "time": datetime.now().isoformat()})
+
+
 # ─── Concepteur : Publicités ──────────────────────────────────────────────────
 
 @app.route("/concepteur/pubs")
@@ -3781,6 +7300,24 @@ def concepteur_pubs():
         stats = s or {}
         c, _ = ks_get("/api/ads/config", token)
         config = c or {}
+    # Fallback local (mode standalone, pas de KetaServer)
+    if not config:
+        config = load_ad_config()
+    if not stats:
+        views = load_ad_views()
+        today = datetime.now().strftime("%Y-%m-%d")
+        month_prefix = datetime.now().strftime("%Y-%m")
+        ecpm = safe_int(config.get("eCpmEstimate", 0), default=0, min_val=0)
+        def _rev(v): return round(v * ecpm / 1000)
+        today_v = views.get(today, {}).get("total", 0)
+        month_v = sum(v.get("total", 0) for k, v in views.items() if k.startswith(month_prefix))
+        total_v = sum(v.get("total", 0) for v in views.values())
+        stats = {
+            "today":  {"views": today_v, "revenue": _rev(today_v)},
+            "month":  {"views": month_v, "revenue": _rev(month_v)},
+            "total":  {"views": total_v, "revenue": _rev(total_v)},
+            "currency": "FCFA",
+        }
     return render_template("concepteur/pubs.html", stats=stats, config=config)
 
 @app.route("/concepteur/pubs/config", methods=["POST"])
@@ -3796,6 +7333,9 @@ def concepteur_pubs_config():
         "adsensePubId":         request.form.get("adsense_pub_id", "").strip(),
         "adsenseBannerSlot":    request.form.get("adsense_banner_slot", "").strip(),
         "adsenseInterSlot":     request.form.get("adsense_inter_slot", "").strip(),
+        # Adsterra
+        "adsterraBannerCode":   request.form.get("adsterra_banner_code", "").strip(),
+        "adsterraInterCode":    request.form.get("adsterra_inter_code", "").strip(),
     }
     existing.update(data)
     save_ad_config(existing)
@@ -3895,14 +7435,13 @@ def api_dashboard():
         return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
 
     r = routers[0]
-    router_user = r.get("user") or r.get("username") or "admin"
-    api, err = mk.safe_connect(r["host"], router_user, r.get("password", ""), r.get("port", 8728))
+    api, err = _connect_router_universal(r)
     if err:
         return jsonify({"ok": False, "msg": "Routeur inaccessible : " + err}), 503
 
     try:
-        res   = api.get_resource("/system/resource").get()[0]
-        ident = api.get_resource("/system/identity").get()[0]
+        res   = resource_first(api, "/system/resource")
+        ident = resource_first(api, "/system/identity")
         hs_active  = resource_count(api, "/ip/hotspot/active")
         hs_tickets = resource_count(api, "/ip/hotspot/user")
         total_mem  = int(res.get("total-memory", 0))
@@ -3932,7 +7471,8 @@ def api_create_voucher():
     data    = request.get_json(silent=True) or {}
     code    = str(data.get("code", "")).strip()
     profile = str(data.get("profile", "default")).strip() or "default"
-    uptime  = str(data.get("uptime", "1h")).strip() or "1h"
+    uptime_raw = str(data.get("uptime", "") or data.get("time_limit", "")).strip()
+    uptime = "1h"
 
     if not code or not re.match(r"^[A-Za-z0-9\-_]{1,64}$", code):
         return jsonify({"ok": False, "msg": "Code invalide"}), 400
@@ -3946,8 +7486,7 @@ def api_create_voucher():
         return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
 
     r = routers[0]
-    router_user = r.get("user") or r.get("username") or "admin"
-    api, err = mk.safe_connect(r["host"], router_user, r.get("password", ""), r.get("port", 8728))
+    api, err = _connect_router_universal(r)
     if err:
         return jsonify({"ok": False, "msg": "Routeur inaccessible : " + err}), 503
 
@@ -3979,8 +7518,7 @@ def api_hotspot_vouchers_summary():
     if not routers:
         return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
     r = routers[0]
-    router_user = r.get("user") or r.get("username") or "admin"
-    api, err = mk.safe_connect(r["host"], router_user, r.get("password", ""), r.get("port", 8728))
+    api, err = _connect_router_universal(r)
     if err:
         return jsonify({"ok": False, "msg": "Routeur inaccessible : " + err}), 503
     try:
@@ -3998,7 +7536,7 @@ def api_hotspot_vouchers_summary():
             meta = profiles_meta.get(nom, {})
             prix_val  = str(meta.get("price", "0") or "0")
             devise    = str(meta.get("currency", "FCFA") or "FCFA")
-            duree_val = normalize_ticket_time_limit(str(meta.get("time_limit", "0") or "0")) or "0"
+            duree_val = normalize_profile_time_limit(str(meta.get("time_limit", "0") or "0")) or "0"
             result.append({
                 "nom":   nom,
                 "count": count_by_profil.get(nom, 0),
@@ -4018,15 +7556,14 @@ def api_hotspot_vouchers_generate():
         return jsonify({"ok": False, "msg": "Authentification requise"}), 401
     data   = request.get_json(silent=True) or {}
     profil = str(data.get("profil", "default")).strip() or "default"
-    qty    = safe_int(data.get("qty", 1), default=1, min_val=1, max_val=50)
+    qty    = safe_int(data.get("qty", 1), default=1, min_val=1, max_val=MAX_TICKET_GENERATION_QTY)
     if not re.match(r"^[\w\-]{1,64}$", profil):
         return jsonify({"ok": False, "msg": "Profil invalide"}), 400
     routers = get_routers()
     if not routers:
         return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
     r = routers[0]
-    router_user = r.get("user") or r.get("username") or "admin"
-    api, err = mk.safe_connect(r["host"], router_user, r.get("password", ""), r.get("port", 8728))
+    api, err = _connect_router_universal(r)
     if err:
         return jsonify({"ok": False, "msg": "Routeur inaccessible : " + err}), 503
     try:
@@ -4038,8 +7575,17 @@ def api_hotspot_vouchers_generate():
             pass
         resource  = api.get_resource("/ip/hotspot/user")
         generated = []
-        for _ in range(qty):
-            code = "".join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=8))
+        existing_names = set()
+        gen_errors = []
+        attempts = 0
+        max_attempts = max(qty * 5, qty + 50)
+        while len(generated) < qty and attempts < max_attempts:
+            attempts += 1
+            try:
+                code = _next_unique_ticket_name(existing_names, "ABCDEFGHJKLMNPQRSTUVWXYZ23456789", 8, "")
+            except ValueError as ex:
+                gen_errors.append(str(ex))
+                break
             try:
                 resource.add(
                     name=code, password=code, profile=profil,
@@ -4048,9 +7594,18 @@ def api_hotspot_vouchers_generate():
                     **{"limit-uptime": ticket_time_limit}
                 )
                 generated.append(code)
-            except Exception:
-                pass  # Ignorer les doublons éventuels
-        return jsonify({"ok": True, "codes": generated, "count": len(generated)})
+            except Exception as ex:
+                gen_errors.append(str(ex))
+                if _looks_like_duplicate_ticket_error(ex):
+                    continue
+                break
+        return jsonify({
+            "ok": len(generated) == qty,
+            "codes": generated,
+            "count": len(generated),
+            "requested": qty,
+            "msg": "" if len(generated) == qty else (gen_errors[-1] if gen_errors else "Generation partielle"),
+        })
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
@@ -4065,8 +7620,7 @@ def api_hotspot_users():
     if not routers:
         return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
     r = routers[0]
-    router_user = r.get("user") or r.get("username") or "admin"
-    api, err = mk.safe_connect(r["host"], router_user, r.get("password", ""), r.get("port", 8728))
+    api, err = _connect_router_universal(r)
     if err:
         return jsonify({"ok": False, "msg": "Routeur inaccessible : " + err}), 503
     try:
@@ -4089,6 +7643,7 @@ def api_hotspot_users():
             else:
                 etat = "hors_ligne"
             mac = str(u.get("mac-address", "") or (sess.get("mac-address", "") if sess else ""))
+            download_bytes, upload_bytes = _traffic_client_bytes(sess or {})
             result.append({
                 "id":        str(u.get(".id", "")),
                 "nom":       nom,
@@ -4098,6 +7653,8 @@ def api_hotspot_users():
                 "mac":       mac,
                 "bytesIn":   str(sess.get("bytes-in", "0") if sess else "0"),
                 "bytesOut":  str(sess.get("bytes-out", "0") if sess else "0"),
+                "downloadBytes": str(download_bytes or "0"),
+                "uploadBytes": str(upload_bytes or "0"),
                 "uptime":    str(sess.get("uptime", "") if sess else ""),
                 "sessionId": str(sess.get(".id", "") if sess else ""),
             })
@@ -4120,8 +7677,7 @@ def api_hotspot_disconnect():
     if not routers:
         return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
     r = routers[0]
-    router_user = r.get("user") or r.get("username") or "admin"
-    api, err = mk.safe_connect(r["host"], router_user, r.get("password", ""), r.get("port", 8728))
+    api, err = _connect_router_universal(r)
     if err:
         return jsonify({"ok": False, "msg": "Routeur inaccessible : " + err}), 503
     try:
@@ -4146,8 +7702,7 @@ def api_hotspot_profiles():
     if not routers:
         return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
     r = routers[0]
-    router_user = r.get("user") or r.get("username") or "admin"
-    api, err = mk.safe_connect(r["host"], router_user, r.get("password", ""), r.get("port", 8728))
+    api, err = _connect_router_universal(r)
     if err:
         return jsonify({"ok": False, "msg": "Routeur inaccessible : " + err}), 503
     try:
@@ -4160,7 +7715,7 @@ def api_hotspot_profiles():
             meta = profiles_meta.get(nom, {})
             prix_val  = str(meta.get("price", "0") or "0")
             devise    = str(meta.get("currency", "FCFA") or "FCFA")
-            duree_val = normalize_ticket_time_limit(str(meta.get("time_limit", "0") or "0")) or "0"
+            duree_val = normalize_profile_time_limit(str(meta.get("time_limit", "0") or "0")) or "0"
             result.append({
                 "nom":   nom,
                 "debit": str(p.get("rate-limit", "") or "illimité"),
@@ -4184,8 +7739,7 @@ def api_list_tickets():
         return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
 
     r = routers[0]
-    router_user = r.get("user") or r.get("username") or "admin"
-    api, err = mk.safe_connect(r["host"], router_user, r.get("password", ""), r.get("port", 8728))
+    api, err = _connect_router_universal(r)
     if err:
         return jsonify({"ok": False, "msg": "Routeur inaccessible : " + err}), 503
 
@@ -4204,12 +7758,11 @@ def api_list_tickets():
             marker_pos = comment.find(marker)
             if marker_pos != -1:
                 expire_raw = comment[marker_pos + len(marker):].strip()
-                try:
-                    # Format RouterOS : "jan/27/2026 15:30:00"
-                    expire_dt = datetime.strptime(expire_raw[:19], "%b/%d/%Y %H:%M:%S")
+                expire_dt = _parse_ketamon_expire(expire_raw)
+                if expire_dt is not None:
                     expire_at = expire_dt.strftime("%d/%m %H:%M")
                     statut = "expire" if now >= expire_dt else "utilise"
-                except Exception:
+                else:
                     statut = "utilise"
 
             clean_comment = strip_ticket_runtime_comment(comment)
@@ -4261,9 +7814,28 @@ def _mk_connect_first_router():
     if not routers:
         return None, "Aucun routeur configuré"
     r = routers[0]
-    router_user = r.get("user") or r.get("username") or "admin"
-    api, err = mk.safe_connect(r["host"], router_user, r.get("password", ""), r.get("port", 8728))
+    if int(r.get("relay_enabled") or 0):
+        return RelaySnapshotApi(r), None
+    api, err = mk.safe_connect_router(r)
     return (api, err) if not err else (None, err)
+
+
+def _mk_connect_request_router(payload=None):
+    """Connecte au routeur demandÃ© si prÃ©cisÃ©, sinon au routeur actif / premier disponible."""
+    router = _get_requested_router(payload)
+    if not router:
+        return None, "Aucun routeur configurÃ©"
+    if int(router.get("relay_enabled") or 0):
+        return RelaySnapshotApi(router), None
+    api, err = _connect_router_universal(router)
+    return (api, err) if not err else (None, err)
+
+
+def _mk_connect_first_router(payload=None):
+    if payload is None:
+        payload = request.get_json(silent=True) or request.form or request.args
+    return _mk_connect_request_router(payload)
+
 
 def _fmt_bytes(b):
     b = int(b or 0)
@@ -4412,8 +7984,8 @@ def api_system_info():
     if err:
         return jsonify({"ok": False, "msg": err}), 503
     try:
-        res   = api.get_resource("/system/resource").get()[0]
-        ident = api.get_resource("/system/identity").get()[0]
+        res   = resource_first(api, "/system/resource")
+        ident = resource_first(api, "/system/identity")
         total_mem = int(res.get("total-memory", 0) or 0)
         free_mem  = int(res.get("free-memory",  0) or 0)
         total_hdd = int(res.get("total-hdd-space", 0) or 0)
@@ -4421,7 +7993,7 @@ def api_system_info():
         ram_pct   = round((total_mem - free_mem) / total_mem * 100) if total_mem else 0
         modele = str(res.get("board-name", ""))
         try:
-            rb = api.get_resource("/system/routerboard").get()[0]
+            rb = resource_first(api, "/system/routerboard")
             modele = str(rb.get("model", modele))
         except Exception:
             pass
@@ -4523,11 +8095,10 @@ def api_rapport():
             count_by_profil[profil] = count_by_profil.get(profil, 0) + 1
             if marker in comment:
                 expire_raw = comment[comment.find(marker) + len(marker):].strip()
-                try:
-                    expire_dt = datetime.strptime(expire_raw[:19], "%b/%d/%Y %H:%M:%S")
-                    if now >= expire_dt: expires += 1
-                    else:                utilises += 1
-                except Exception:
+                expire_dt = _parse_ketamon_expire(expire_raw)
+                if expire_dt is not None and now >= expire_dt:
+                    expires += 1
+                else:
                     utilises += 1
             else:
                 actifs += 1
@@ -4540,7 +8111,7 @@ def api_rapport():
             meta = profiles_meta.get(nom, {})
             prix_val  = str(meta.get("price", "0") or "0")
             devise    = str(meta.get("currency", "FCFA") or "FCFA")
-            duree_val = normalize_ticket_time_limit(str(meta.get("time_limit", "0") or "0")) or "0"
+            duree_val = normalize_profile_time_limit(str(meta.get("time_limit", "0") or "0")) or "0"
             par_profil.append({
                 "nom":   nom,
                 "count": count_by_profil.get(nom, 0),
@@ -4574,6 +8145,7 @@ def api_hotspot_active():
         sessions = api.get_resource("/ip/hotspot/active").get()
         result = []
         for s in sessions:
+            download_bytes, upload_bytes = _traffic_client_bytes(s)
             result.append({
                 "id":       str(s.get(".id", "")),
                 "nom":      str(s.get("user", "")),
@@ -4583,6 +8155,8 @@ def api_hotspot_active():
                 "uptime":   str(s.get("uptime", "")),
                 "bytesIn":  str(s.get("bytes-in", "0")),
                 "bytesOut": str(s.get("bytes-out", "0")),
+                "downloadBytes": str(download_bytes or "0"),
+                "uploadBytes": str(upload_bytes or "0"),
                 "loginBy":  str(s.get("login-by", "")),
             })
         return jsonify({"ok": True, "sessions": result})
@@ -4704,18 +8278,26 @@ def api_hotspot_users_add():
     limit_uptime = str(data.get("limitUptime", "") or data.get("limit-uptime", "")).strip()
     if not nom or not re.match(r"^[\w\-\.@]{1,64}$", nom):
         return jsonify({"ok": False, "msg": "Nom invalide"}), 400
-    api, err = _mk_connect_first_router()
+    routers = get_routers()
+    if not routers:
+        return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
+    router = routers[0]
+    router_id = router.get("id", "") or router.get("host", "")
+    api, err = _connect_router_universal(router)
     if err:
         return jsonify({"ok": False, "msg": err}), 503
     try:
+        try:
+            ensure_ticket_runtime_support(api, profil)
+        except Exception:
+            pass
         res = api.get_resource("/ip/hotspot/user")
-        params = {"name": nom, "profile": profil, "password": password or nom, "disabled": "no", "limit-uptime": "0"}
+        resolved_limit = resolve_ticket_time_limit(router_id, profil, limit_uptime) or "0"
+        params = {"name": nom, "profile": profil, "password": password or nom, "disabled": "no", "limit-uptime": resolved_limit}
         if server:
             params["server"] = server
         if comment:
             params["comment"] = comment
-        if limit_uptime:
-            params["limit-uptime"] = limit_uptime
         res.add(**params)
         return jsonify({"ok": True, "msg": f"Utilisateur {nom} ajouté"})
     except Exception as e:
@@ -4736,10 +8318,14 @@ def api_hotspot_users_delete():
         return jsonify({"ok": False, "msg": err}), 503
     try:
         res = api.get_resource("/ip/hotspot/user")
-        rows = res.get(**{"name": nom})
+        rows = _resource_rows_by_id_or_name(res, item_id=nom, name=nom)
         if not rows:
             return jsonify({"ok": False, "msg": "Utilisateur introuvable"}), 404
-        res.remove(id=rows[0][".id"])
+        router_resource_remove_by_id_or_name(api, "/ip/hotspot/user", item_id=router_action_ref(rows[0], "name"), name=nom)
+        try:
+            db_mod.db_delete_ticket_pricing(session.get("router_id", ""), [nom])
+        except Exception:
+            pass
         return jsonify({"ok": True, "msg": f"Utilisateur {nom} supprimé"})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -4759,18 +8345,51 @@ def api_hotspot_users_toggle():
         return jsonify({"ok": False, "msg": err}), 503
     try:
         res = api.get_resource("/ip/hotspot/user")
-        rows = res.get(**{"name": nom})
+        rows = _resource_rows_by_id_or_name(res, item_id=nom, name=nom)
         if not rows:
             return jsonify({"ok": False, "msg": "Utilisateur introuvable"}), 404
-        uid = rows[0][".id"]
+        uid = router_action_ref(rows[0], "name")
+        username = str(rows[0].get("name") or "").strip() or nom
         disable_req = data.get("disabled", data.get("disable", None))
         if disable_req is None:
             disable_req = str(rows[0].get("disabled", "no")).lower() != "yes"
         elif isinstance(disable_req, str):
             disable_req = disable_req.lower() in ("yes", "true", "1")
-        res.set(id=uid, disabled="yes" if disable_req else "no")
+        router_resource_set_by_id_or_name(api, "/ip/hotspot/user", {"disabled": "yes" if disable_req else "no"}, item_id=uid, name=username)
+        disconnected = {"active_sessions": 0, "cookies": 0, "hosts": 0}
+        if disable_req:
+            remaining_active = find_matching_hotspot_active_rows(api, usernames=[username])
+            for _ in range(3):
+                usernames, addresses, mac_addresses, active_ids = build_active_disconnect_targets(remaining_active)
+                batch = disconnect_hotspot_entities(
+                    api,
+                    usernames=usernames or [username],
+                    addresses=addresses,
+                    mac_addresses=mac_addresses,
+                    active_ids=active_ids,
+                )
+                for key, value in batch.items():
+                    disconnected[key] += int(value or 0)
+                remaining_active = find_matching_hotspot_active_rows(
+                    api,
+                    usernames=usernames or [username],
+                    addresses=addresses,
+                    mac_addresses=mac_addresses,
+                )
+                if not remaining_active:
+                    return jsonify({
+                        "ok": True,
+                        "msg": f"Utilisateur {nom} désactivé et accès coupé",
+                        "disconnected": disconnected,
+                    })
+                time.sleep(0.2)
+            return jsonify({
+                "ok": False,
+                "msg": f"Utilisateur {nom} désactivé, mais la session est encore active",
+                "disconnected": disconnected,
+            }), 409
         state = "désactivé" if disable_req else "activé"
-        return jsonify({"ok": True, "msg": f"Utilisateur {nom} {state}"})
+        return jsonify({"ok": True, "msg": f"Utilisateur {nom} {state}", "disconnected": disconnected})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
@@ -4784,7 +8403,12 @@ def api_hotspot_users_edit():
     nom = str(data.get("name", "") or data.get("nom", "")).strip()
     if not nom:
         return jsonify({"ok": False, "msg": "Nom requis"}), 400
-    api, err = _mk_connect_first_router()
+    routers = get_routers()
+    if not routers:
+        return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
+    router = routers[0]
+    router_id = router.get("id", "") or router.get("host", "")
+    api, err = _connect_router_universal(router)
     if err:
         return jsonify({"ok": False, "msg": err}), 503
     try:
@@ -4801,14 +8425,19 @@ def api_hotspot_users_edit():
         if pwd:
             params["password"] = pwd
         profil = str(data.get("profile", "") or data.get("profil", "")).strip()
+        effective_profile = profil or str(rows[0].get("profile", "")).strip() or "default"
         if profil:
+            try:
+                ensure_ticket_runtime_support(api, effective_profile)
+            except Exception:
+                pass
             params["profile"] = profil
         comment = str(data.get("comment", "") or data.get("commentaire", "")).strip()
         if comment:
             params["comment"] = comment
         tlimit = str(data.get("limitUptime", "") or data.get("limit-uptime", "")).strip()
         if tlimit:
-            params["limit-uptime"] = tlimit
+            params["limit-uptime"] = resolve_ticket_time_limit(router_id, effective_profile, tlimit) or "0"
         res.set(**params)
         return jsonify({"ok": True, "msg": f"Utilisateur {nom} modifié"})
     except Exception as e:
@@ -4868,13 +8497,798 @@ def api_hotspot_profiles_delete():
         return jsonify({"ok": False, "msg": err}), 503
     try:
         res = api.get_resource("/ip/hotspot/user/profile")
-        rows = res.get(**{"name": nom})
+        rows = _resource_rows_by_id_or_name(res, item_id=nom, name=nom)
         if not rows:
             return jsonify({"ok": False, "msg": "Profil introuvable"}), 404
-        res.remove(id=rows[0][".id"])
+        router_resource_remove_by_id_or_name(api, "/ip/hotspot/user/profile", item_id=router_action_ref(rows[0], "name"), name=nom)
+        try:
+            db_mod.db_delete_hotspot_profile_metadata(session.get("router_id", ""), nom)
+        except Exception:
+            pass
         return jsonify({"ok": True, "msg": f"Profil {nom} supprimé"})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+def _api_pick_router(payload=None):
+    router = _get_requested_router(payload)
+    if not router:
+        return None, (jsonify({"ok": False, "msg": "Aucun routeur configurÃ©"}), 503)
+    return router, None
+
+
+def _api_connect_router(router):
+    if int((router or {}).get("relay_enabled") or 0):
+        return RelaySnapshotApi(router), None
+    api, err = _connect_router_universal(router)
+    if err or not api:
+        return None, (jsonify({"ok": False, "msg": "Routeur inaccessible : " + str(err or "")}), 503)
+    return api, None
+
+
+def api_dashboard_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    router, error_response = _api_pick_router()
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        res = resource_first(api, "/system/resource")
+        ident = resource_first(api, "/system/identity")
+        hs_active = resource_count(api, "/ip/hotspot/active")
+        hs_tickets = resource_count(api, "/ip/hotspot/user")
+        total_mem = int(res.get("total-memory", 0))
+        free_mem = int(res.get("free-memory", 0))
+        mem_pct = round((total_mem - free_mem) / total_mem * 100) if total_mem else 0
+        return jsonify({
+            "ok": True,
+            "identity": ident.get("name", "MikroTik"),
+            "version": res.get("version", "?"),
+            "uptime": res.get("uptime", "?"),
+            "cpu_load": str(res.get("cpu-load", "0")),
+            "mem_pct": mem_pct,
+            "hs_active": hs_active,
+            "hs_tickets": hs_tickets,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_create_voucher_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    data = request.get_json(silent=True) or {}
+    code = str(data.get("code", "")).strip()
+    profile = str(data.get("profile", "default")).strip() or "default"
+    uptime_raw = str(data.get("uptime", "") or data.get("time_limit", "")).strip()
+    if not code or not re.match(r"^[A-Za-z0-9\-_]{1,64}$", code):
+        return jsonify({"ok": False, "msg": "Code invalide"}), 400
+    if not re.match(r"^[\w\-]{1,64}$", profile):
+        return jsonify({"ok": False, "msg": "Profil invalide"}), 400
+    router, error_response = _api_pick_router(data)
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        router_id = router.get("id", "") or router.get("host", "")
+        wifi_name = str(data.get("wifi_name", "") or data.get("network_name", "") or data.get("network", "")).strip()[:64]
+        if wifi_name:
+            db_mod.db_update_router(router_id, _current_owner_id(), {"wifi_name": wifi_name})
+            _invalidate_routers_cache()
+        else:
+            wifi_name = str(router.get("wifi_name", "") or "")
+        uptime = resolve_ticket_time_limit(router_id, profile, uptime_raw) or "0"
+        try:
+            ensure_ticket_runtime_support(api, profile)
+        except Exception:
+            pass
+        api.get_resource("/ip/hotspot/user").add(
+            name=code,
+            password=code,
+            profile=profile,
+            disabled="no",
+            comment=f"vc-{datetime.now().strftime('%d/%m %H:%M')}",
+            **{"limit-uptime": uptime},
+        )
+        return jsonify({
+            "ok": True,
+            "code": code,
+            "profile": profile,
+            "time_limit": normalize_ticket_time_limit(uptime) or "0",
+            "wifi_name": wifi_name,
+            "network": wifi_name,
+            "router_id": router_id,
+        })
+    except ValueError as e:
+        return jsonify({"ok": False, "msg": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_hotspot_vouchers_summary_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    router, error_response = _api_pick_router()
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        users = api.get_resource("/ip/hotspot/user").get()
+        profiles = api.get_resource("/ip/hotspot/user/profile").get()
+        router_id = router.get("id", "") or router.get("host", "")
+        wifi_name = str(router.get("wifi_name", "") or "")
+        profiles_meta = get_hotspot_profile_metadata_map(router_id)
+        count_by_profil = {}
+        for user in users:
+            profil = str(user.get("profile", "default")).strip()
+            count_by_profil[profil] = count_by_profil.get(profil, 0) + 1
+        result = [{"nom": "all", "count": len(users), "prix": "", "duree": ""}]
+        for profile_row in profiles:
+            nom = str(profile_row.get("name", "")).strip()
+            meta = profiles_meta.get(nom, {})
+            prix_val = str(meta.get("price", "0") or "0")
+            devise = str(meta.get("currency", "FCFA") or "FCFA")
+            duree_val = normalize_profile_time_limit(str(meta.get("time_limit", "0") or "0")) or "0"
+            result.append({
+                "nom": nom,
+                "count": count_by_profil.get(nom, 0),
+                "prix": f"{prix_val} {devise}" if prix_val != "0" else "",
+                "duree": duree_val if duree_val != "0" else "",
+            })
+        return jsonify({"ok": True, "profiles": result, "wifi_name": wifi_name, "network": wifi_name, "router_id": router_id})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_hotspot_vouchers_generate_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    data = request.get_json(silent=True) or {}
+    profil = str(data.get("profil", "default")).strip() or "default"
+    qty = safe_int(data.get("qty", 1), default=1, min_val=1, max_val=MAX_TICKET_GENERATION_QTY)
+    if not re.match(r"^[\w\-]{1,64}$", profil):
+        return jsonify({"ok": False, "msg": "Profil invalide"}), 400
+    router, error_response = _api_pick_router(data)
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        router_id = router.get("id", "") or router.get("host", "")
+        wifi_name = str(data.get("wifi_name", "") or data.get("network_name", "") or data.get("network", "")).strip()[:64]
+        if wifi_name:
+            db_mod.db_update_router(router_id, _current_owner_id(), {"wifi_name": wifi_name})
+            _invalidate_routers_cache()
+        else:
+            wifi_name = str(router.get("wifi_name", "") or "")
+        ticket_time_limit = resolve_ticket_time_limit(router_id, profil, "") or "0"
+        try:
+            ensure_ticket_runtime_support(api, profil)
+        except Exception:
+            pass
+        resource = api.get_resource("/ip/hotspot/user")
+        generated = []
+        generated_tickets = []
+        existing_names = set()
+        gen_errors = []
+        attempts = 0
+        max_attempts = max(qty * 5, qty + 50)
+        while len(generated) < qty and attempts < max_attempts:
+            attempts += 1
+            try:
+                code = _next_unique_ticket_name(existing_names, "ABCDEFGHJKLMNPQRSTUVWXYZ23456789", 8, "")
+            except ValueError as ex:
+                gen_errors.append(str(ex))
+                break
+            try:
+                resource.add(
+                    name=code,
+                    password=code,
+                    profile=profil,
+                    disabled="no",
+                    comment=f"vc-{datetime.now().strftime('%d/%m %H:%M')}",
+                    **{"limit-uptime": ticket_time_limit},
+                )
+                generated.append(code)
+                generated_tickets.append({
+                    "code": code,
+                    "profile": profil,
+                    "time_limit": normalize_ticket_time_limit(ticket_time_limit) or "0",
+                    "wifi_name": wifi_name,
+                    "network": wifi_name,
+                })
+            except Exception as ex:
+                gen_errors.append(str(ex))
+                if _looks_like_duplicate_ticket_error(ex):
+                    continue
+                break
+        return jsonify({
+            "ok": len(generated) == qty,
+            "codes": generated,
+            "tickets": generated_tickets,
+            "count": len(generated),
+            "requested": qty,
+            "msg": "" if len(generated) == qty else (gen_errors[-1] if gen_errors else "Generation partielle"),
+            "profile": profil,
+            "time_limit": normalize_ticket_time_limit(ticket_time_limit) or "0",
+            "wifi_name": wifi_name,
+            "network": wifi_name,
+            "router_id": router_id,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_hotspot_users_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    router, error_response = _api_pick_router()
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        users = api.get_resource("/ip/hotspot/user").get()
+        sessions = api.get_resource("/ip/hotspot/active").get()
+        active_by_user = {}
+        for session_row in sessions:
+            uname = str(session_row.get("user", "")).strip()
+            if uname and uname not in active_by_user:
+                active_by_user[uname] = session_row
+        result = []
+        for user in users:
+            nom = str(user.get("name", "")).strip()
+            sess = active_by_user.get(nom)
+            is_disabled = str(user.get("disabled", "no")).strip().lower() == "yes"
+            if is_disabled:
+                etat = "desactive"
+            elif sess:
+                etat = "actif"
+            else:
+                etat = "hors_ligne"
+            mac = str(user.get("mac-address", "") or (sess.get("mac-address", "") if sess else ""))
+            download_bytes, upload_bytes = _traffic_client_bytes(sess or {})
+            result.append({
+                "id": str(user.get(".id", "")),
+                "nom": nom,
+                "profil": str(user.get("profile", "default")),
+                "etat": etat,
+                "ip": str(sess.get("address", "") if sess else ""),
+                "mac": mac,
+                "bytesIn": str(sess.get("bytes-in", "0") if sess else "0"),
+                "bytesOut": str(sess.get("bytes-out", "0") if sess else "0"),
+                "downloadBytes": str(download_bytes or "0"),
+                "uploadBytes": str(upload_bytes or "0"),
+                "uptime": str(sess.get("uptime", "") if sess else ""),
+                "limitUptime": normalize_ticket_time_limit(user.get("limit-uptime")) or "0",
+                "sessionId": str(sess.get(".id", "") if sess else ""),
+            })
+        return jsonify({"ok": True, "users": result})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_hotspot_disconnect_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    data = request.get_json(silent=True) or {}
+    nom = str(data.get("nom", "")).strip()
+    if not nom or not re.match(r"^[\w\-\.@]{1,64}$", nom):
+        return jsonify({"ok": False, "msg": "Nom utilisateur invalide"}), 400
+    router, error_response = _api_pick_router(data)
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        active_rows = find_matching_hotspot_active_rows(api, usernames=[nom])
+        usernames, addresses, mac_addresses, active_ids = build_active_disconnect_targets(active_rows)
+        disconnected = disconnect_hotspot_entities(
+            api,
+            usernames=usernames or [nom],
+            addresses=addresses,
+            mac_addresses=mac_addresses,
+            active_ids=active_ids,
+        )
+        return jsonify({"ok": True, "disconnected": disconnected})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_hotspot_profiles_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    router, error_response = _api_pick_router()
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        profiles = api.get_resource("/ip/hotspot/user/profile").get()
+        router_id = router.get("id", "") or router.get("host", "")
+        wifi_name = str(router.get("wifi_name", "") or "")
+        profiles_meta = get_hotspot_profile_metadata_map(router_id)
+        result = []
+        for profile_row in profiles:
+            nom = str(profile_row.get("name", "")).strip()
+            meta = profiles_meta.get(nom, {})
+            prix_val = str(meta.get("price", "0") or "0")
+            devise = str(meta.get("currency", "FCFA") or "FCFA")
+            duree_val = normalize_profile_time_limit(str(meta.get("time_limit", "0") or "0")) or "0"
+            result.append({
+                "nom": nom,
+                "debit": str(profile_row.get("rate-limit", "") or "illimitÃ©"),
+                "prix": f"{prix_val} {devise}" if prix_val != "0" else "",
+                "duree": duree_val if duree_val != "0" else "",
+            })
+        return jsonify({"ok": True, "profiles": result, "wifi_name": wifi_name, "network": wifi_name, "router_id": router_id})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_list_tickets_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    router, error_response = _api_pick_router()
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        users = api.get_resource("/ip/hotspot/user").get()
+        wifi_name = str(router.get("wifi_name", "") or "")
+        tickets = []
+        now = datetime.now()
+        for user in users:
+            comment = str(user.get("comment", ""))
+            duree_raw = normalize_ticket_time_limit(str(user.get("limit-uptime", "0") or "0")) or "0"
+            expire_dt = _extract_ketamon_expire_datetime(comment)
+            statut = "actif"
+            expire_at = ""
+            if expire_dt is not None:
+                expire_at = expire_dt.strftime("%d/%m %H:%M")
+                statut = "expire" if now >= expire_dt else "utilise"
+            clean_comment = strip_ticket_runtime_comment(comment)
+            cree_le = clean_comment[3:].strip() if clean_comment.startswith("vc-") else clean_comment
+            tickets.append({
+                "code": user.get("name", ""),
+                "profil": user.get("profile", "default"),
+                "duree": duree_raw,
+                "cree_le": cree_le,
+                "statut": statut,
+                "expire_at": expire_at,
+                "wifi_name": wifi_name,
+                "network": wifi_name,
+            })
+        return jsonify({"ok": True, "tickets": tickets, "wifi_name": wifi_name, "network": wifi_name})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_rapport_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    router, error_response = _api_pick_router()
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        users = api.get_resource("/ip/hotspot/user").get()
+        profiles = api.get_resource("/ip/hotspot/user/profile").get()
+        active = api.get_resource("/ip/hotspot/active").get()
+        now = datetime.now()
+        actifs = utilises = expires = 0
+        count_by_profil = {}
+        for user in users:
+            comment = str(user.get("comment", ""))
+            profil = str(user.get("profile", "default"))
+            count_by_profil[profil] = count_by_profil.get(profil, 0) + 1
+            expire_dt = _extract_ketamon_expire_datetime(comment)
+            if expire_dt is not None:
+                if now >= expire_dt:
+                    expires += 1
+                else:
+                    utilises += 1
+            else:
+                actifs += 1
+        router_id = router.get("id", "") or router.get("host", "")
+        profiles_meta = get_hotspot_profile_metadata_map(router_id)
+        par_profil = []
+        for profile_row in profiles:
+            nom = str(profile_row.get("name", "")).strip()
+            meta = profiles_meta.get(nom, {})
+            prix_val = str(meta.get("price", "0") or "0")
+            devise = str(meta.get("currency", "FCFA") or "FCFA")
+            duree_val = normalize_profile_time_limit(str(meta.get("time_limit", "0") or "0")) or "0"
+            par_profil.append({
+                "nom": nom,
+                "count": count_by_profil.get(nom, 0),
+                "prix": f"{prix_val} {devise}" if prix_val != "0" else "",
+                "duree": duree_val if duree_val != "0" else "",
+            })
+        return jsonify({
+            "ok": True,
+            "ticketsActifs": actifs,
+            "ticketsUtilises": utilises,
+            "ticketsExpires": expires,
+            "ticketsTotal": len(users),
+            "usersActifs": len(active),
+            "parProfil": par_profil,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_hotspot_users_add_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    data = request.get_json(silent=True) or {}
+    nom = str(data.get("name", "") or data.get("nom", "")).strip()
+    password = str(data.get("userPassword", "") or data.get("password", "")).strip()
+    profil = str(data.get("profile", "") or data.get("profil", "default")).strip() or "default"
+    server = str(data.get("server", "") or data.get("serveur", "")).strip()
+    comment = str(data.get("comment", "") or data.get("commentaire", "")).strip()
+    limit_uptime = str(data.get("limitUptime", "") or data.get("limit-uptime", "")).strip()
+    if not nom or not re.match(r"^[\w\-\.@]{1,64}$", nom):
+        return jsonify({"ok": False, "msg": "Nom invalide"}), 400
+    router, error_response = _api_pick_router(data)
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        router_id = router.get("id", "") or router.get("host", "")
+        try:
+            ensure_ticket_runtime_support(api, profil)
+        except Exception:
+            pass
+        resolved_limit = resolve_ticket_time_limit(router_id, profil, limit_uptime) or "0"
+        params = {"name": nom, "profile": profil, "password": password or nom, "disabled": "no", "limit-uptime": resolved_limit}
+        if server:
+            params["server"] = server
+        if comment:
+            params["comment"] = comment
+        api.get_resource("/ip/hotspot/user").add(**params)
+        return jsonify({"ok": True, "msg": f"Utilisateur {nom} ajoutÃ©"})
+    except ValueError as e:
+        return jsonify({"ok": False, "msg": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_hotspot_users_edit_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    data = request.get_json(silent=True) or {}
+    nom = str(data.get("name", "") or data.get("nom", "")).strip()
+    if not nom:
+        return jsonify({"ok": False, "msg": "Nom requis"}), 400
+    router, error_response = _api_pick_router(data)
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        router_id = router.get("id", "") or router.get("host", "")
+        res = api.get_resource("/ip/hotspot/user")
+        rows = res.get(**{"name": nom})
+        if not rows:
+            return jsonify({"ok": False, "msg": "Utilisateur introuvable"}), 404
+        uid = rows[0][".id"]
+        params = {"id": uid}
+        new_name = str(data.get("newName", "")).strip()
+        if new_name and new_name != nom:
+            params["name"] = new_name
+        pwd = str(data.get("userPassword", "") or data.get("password", "")).strip()
+        if pwd:
+            params["password"] = pwd
+        profil = str(data.get("profile", "") or data.get("profil", "")).strip()
+        effective_profile = profil or str(rows[0].get("profile", "")).strip() or "default"
+        if profil:
+            try:
+                ensure_ticket_runtime_support(api, effective_profile)
+            except Exception:
+                pass
+            params["profile"] = profil
+        comment = str(data.get("comment", "") or data.get("commentaire", "")).strip()
+        if comment:
+            params["comment"] = comment
+        tlimit = str(data.get("limitUptime", "") or data.get("limit-uptime", "")).strip()
+        if tlimit:
+            params["limit-uptime"] = resolve_ticket_time_limit(router_id, effective_profile, tlimit) or "0"
+        res.set(**params)
+        return jsonify({"ok": True, "msg": f"Utilisateur {nom} modifiÃ©"})
+    except ValueError as e:
+        return jsonify({"ok": False, "msg": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_hotspot_profiles_add_v2():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+    data = request.get_json(silent=True) or {}
+    nom = str(data.get("profileName", "") or data.get("name", "") or data.get("nom", "")).strip()
+    if not nom:
+        return jsonify({"ok": False, "msg": "Nom requis"}), 400
+    router, error_response = _api_pick_router(data)
+    if error_response:
+        return error_response
+    api, error_response = _api_connect_router(router)
+    if error_response:
+        return error_response
+    try:
+        res = api.get_resource("/ip/hotspot/user/profile")
+        params = {"name": nom, "shared-users": str(data.get("sharedUsers", "1") or "1")}
+        if data.get("rateLimit"):
+            params["rate-limit"] = str(data["rateLimit"])
+        if data.get("addressPool"):
+            params["address-pool"] = str(data["addressPool"])
+        res.add(**params)
+        try:
+            ensure_ticket_runtime_support(api, nom)
+        except Exception:
+            pass
+        rid = router.get("id", "") or router.get("host", "")
+        db_mod.db_upsert_hotspot_profile_metadata(
+            rid,
+            nom,
+            price=str(data.get("priceCfa", "0") or "0"),
+            currency=str(data.get("currency", "FCFA") or "FCFA"),
+            expire_mode=str(data.get("expiredMode", "none") or "none"),
+            lock_user="yes",
+            time_limit=coerce_ticket_time_limit_user(
+                data.get("timeLimit", "") or data.get("time_limit", "") or data.get("limitUptime", ""),
+                empty="0",
+                prefer_legacy_routeros=False,
+            ) or "0",
+        )
+        return jsonify({"ok": True, "msg": f"Profil {nom} ajoutÃ©"})
+    except ValueError as e:
+        return jsonify({"ok": False, "msg": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_create_voucher_v2_safe():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+
+    data = request.get_json(silent=True) or {}
+    code = str(data.get("code", "")).strip()
+    profile = str(data.get("profile", "default")).strip() or "default"
+    uptime_raw = str(data.get("uptime", "") or data.get("time_limit", "")).strip()
+    if not code or not re.match(r"^[A-Za-z0-9\-_]{1,64}$", code):
+        return jsonify({"ok": False, "msg": "Code invalide"}), 400
+    if not re.match(r"^[\w\-]{1,64}$", profile):
+        return jsonify({"ok": False, "msg": "Profil invalide"}), 400
+
+    router, error_response = _api_pick_router(data)
+    if error_response:
+        return error_response
+
+    router_id = router.get("id", "") or router.get("host", "")
+    api = None
+    try:
+        with TicketGenerationJob(router_id, 1, profile, source="api-single") as job:
+            api, error_response = _api_connect_router(router)
+            if error_response:
+                return error_response
+
+            wifi_name = str(data.get("wifi_name", "") or data.get("network_name", "") or data.get("network", "")).strip()[:64]
+            if wifi_name:
+                db_mod.db_update_router(router_id, _current_owner_id(), {"wifi_name": wifi_name})
+                _invalidate_routers_cache()
+            else:
+                wifi_name = str(router.get("wifi_name", "") or "")
+
+            uptime = resolve_ticket_time_limit(router_id, profile, uptime_raw) or "0"
+            try:
+                ensure_ticket_runtime_support(api, profile)
+            except Exception:
+                pass
+
+            hotspot_resource = api.get_resource("/ip/hotspot/user")
+            _add_or_repair_hotspot_ticket(api, hotspot_resource, {
+                "name": code,
+                "password": code,
+                "profile": profile,
+                "disabled": "no",
+                "comment": build_hotspot_user_comment("", "vc-"),
+                "limit-uptime": uptime,
+            })
+
+            meta = get_hotspot_profile_metadata_map(router_id).get(profile, {})
+            db_mod.db_batch_upsert_ticket_pricing([{
+                "router_id": router_id,
+                "user": code,
+                "password": code,
+                "prix": float(meta.get("price", "0") or 0),
+                "devise": meta.get("currency", "FCFA") or "FCFA",
+                "profil": profile,
+                "reseau": wifi_name,
+            }])
+            job.finish(1, [])
+
+        return jsonify({
+            "ok": True,
+            "code": code,
+            "profile": profile,
+            "time_limit": normalize_ticket_time_limit(uptime) or "0",
+            "wifi_name": wifi_name,
+            "network": wifi_name,
+            "router_id": router_id,
+        })
+    except TicketGenerationBusyError as e:
+        return jsonify({"ok": False, "msg": str(e), "busy": True}), 409
+    except ValueError as e:
+        return jsonify({"ok": False, "msg": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+def api_hotspot_vouchers_generate_v2_safe():
+    auth_ok, _ = _check_basic_auth()
+    if not auth_ok:
+        return jsonify({"ok": False, "msg": "Authentification requise"}), 401
+
+    data = request.get_json(silent=True) or {}
+    profil = str(data.get("profil", "default")).strip() or "default"
+    qty = safe_int(data.get("qty", 1), default=1, min_val=1, max_val=MAX_TICKET_GENERATION_QTY)
+    if not re.match(r"^[\w\-]{1,64}$", profil):
+        return jsonify({"ok": False, "msg": "Profil invalide"}), 400
+
+    router, error_response = _api_pick_router(data)
+    if error_response:
+        return error_response
+
+    router_id = router.get("id", "") or router.get("host", "")
+    api = None
+    try:
+        with TicketGenerationJob(router_id, qty, profil, source="api-vouchers") as job:
+            api, error_response = _api_connect_router(router)
+            if error_response:
+                return error_response
+
+            wifi_name = str(data.get("wifi_name", "") or data.get("network_name", "") or data.get("network", "")).strip()[:64]
+            if wifi_name:
+                db_mod.db_update_router(router_id, _current_owner_id(), {"wifi_name": wifi_name})
+                _invalidate_routers_cache()
+            else:
+                wifi_name = str(router.get("wifi_name", "") or "")
+
+            ticket_time_limit = resolve_ticket_time_limit(router_id, profil, "") or "0"
+            ticket_time_limit_label = resolve_ticket_time_limit_display(router_id, profil, "") or "0"
+            profiles_meta = get_hotspot_profile_metadata_map(router_id)
+            meta = profiles_meta.get(profil, {})
+            price = meta.get("price", "0") or "0"
+            currency = meta.get("currency", "FCFA") or "FCFA"
+            try:
+                ensure_ticket_runtime_support(api, profil)
+            except Exception:
+                pass
+
+            generated_rows, gen_errors = create_hotspot_ticket_batch(
+                api, router_id, qty, profil,
+                mode="aleatoire",
+                length=8,
+                prefix="",
+                password_mode="identique",
+                comment="",
+                network_name=wifi_name,
+                price=price,
+                currency=currency,
+                ticket_time_limit=ticket_time_limit,
+                ticket_time_limit_label=ticket_time_limit_label,
+                charset_override="ABCDEFGHJKLMNPQRSTUVWXYZ23456789",
+                job=job,
+                source="api-vouchers",
+            )
+
+        codes = [row["name"] for row in generated_rows]
+        generated_tickets = [{
+            "code": row["name"],
+            "profile": profil,
+            "time_limit": normalize_ticket_time_limit(ticket_time_limit) or "0",
+            "wifi_name": wifi_name,
+            "network": wifi_name,
+        } for row in generated_rows]
+        return jsonify({
+            "ok": len(generated_rows) == qty,
+            "codes": codes,
+            "tickets": generated_tickets,
+            "count": len(generated_rows),
+            "requested": qty,
+            "msg": "" if len(generated_rows) == qty else (gen_errors[-1] if gen_errors else "Generation partielle"),
+            "profile": profil,
+            "time_limit": normalize_ticket_time_limit(ticket_time_limit) or "0",
+            "wifi_name": wifi_name,
+            "network": wifi_name,
+            "router_id": router_id,
+        })
+    except TicketGenerationBusyError as e:
+        return jsonify({"ok": False, "msg": str(e), "busy": True}), 409
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
+
+
+@app.route("/api/hotspot/generation-status", methods=["GET"])
+@login_required
+@router_required
+def api_hotspot_generation_status():
+    router_id = session.get("router_id", "")
+    return jsonify({"ok": True, "status": get_ticket_generation_status(router_id)})
+
+
+app.view_functions["api_dashboard"] = api_dashboard_v2
+app.view_functions["api_create_voucher"] = api_create_voucher_v2_safe
+app.view_functions["api_hotspot_vouchers_summary"] = api_hotspot_vouchers_summary_v2
+app.view_functions["api_hotspot_vouchers_generate"] = api_hotspot_vouchers_generate_v2_safe
+app.view_functions["api_hotspot_users"] = api_hotspot_users_v2
+app.view_functions["api_hotspot_disconnect"] = api_hotspot_disconnect_v2
+app.view_functions["api_hotspot_profiles"] = api_hotspot_profiles_v2
+app.view_functions["api_list_tickets"] = api_list_tickets_v2
+app.view_functions["api_rapport"] = api_rapport_v2
+app.view_functions["api_hotspot_users_add"] = api_hotspot_users_add_v2
+app.view_functions["api_hotspot_users_edit"] = api_hotspot_users_edit_v2
+app.view_functions["api_hotspot_profiles_add"] = api_hotspot_profiles_add_v2
 
 
 @app.route("/concepteur/mise-a-jour")

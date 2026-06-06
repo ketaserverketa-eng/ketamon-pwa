@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}— Publicités{% endblock %}
-{% block page_title %}Publicités & AdSense{% endblock %}
+{% block page_title %}Publicités{% endblock %}
 {% block content %}
 <div class="concepteur-banner"><i class="fa fa-shield"></i> Mode Concepteur</div>
 
@@ -53,54 +53,59 @@
 
 <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:16px">
 
-  <!-- Configuration AdSense Web -->
+  <!-- Configuration Adsterra -->
   <div class="card card-form" style="flex:1;min-width:300px">
     <div class="card-header">
-      <h3><i class="fa fa-globe"></i> AdSense Web (site/PWA)</h3>
+      <h3><i class="fa fa-bullhorn"></i> Adsterra (recommandé)</h3>
     </div>
     <div class="card-body">
       <form method="POST" action="{{ url_for('concepteur_pubs_config') }}">
+        <input type="hidden" name="adsense_pub_id"       value="{{ config.get('adsensePubId','') }}">
+        <input type="hidden" name="adsense_banner_slot"  value="{{ config.get('adsenseBannerSlot','') }}">
+        <input type="hidden" name="adsense_inter_slot"   value="{{ config.get('adsenseInterSlot','') }}">
         <input type="hidden" name="banner_unit_id"       value="{{ config.get('bannerUnitId','') }}">
         <input type="hidden" name="interstitial_unit_id" value="{{ config.get('interstitialUnitId','') }}">
         <input type="hidden" name="ecpm_estimate"        value="{{ config.get('eCpmEstimate',0)|int }}">
 
-        <div class="form-group">
-          <label><i class="fa fa-id-card"></i> Publisher ID (ca-pub-...)</label>
-          <input type="text" name="adsense_pub_id" class="form-control"
-                 placeholder="ca-pub-XXXXXXXXXXXXXXXX"
-                 value="{{ config.get('adsensePubId','') }}">
-          <small style="color:#64748b">Ton ID AdSense — visible dans ton compte Google AdSense.</small>
+        <div style="background:#0f1f35;border:1px solid #1e3a5f;border-radius:8px;padding:10px;font-size:12px;color:#94a3b8;margin-bottom:14px;">
+          <b style="color:#38bdf8">Comment obtenir le code :</b><br>
+          1. Inscris-toi sur <b>adsterra.com</b><br>
+          2. Ajoute ton site (URL de ton VPS)<br>
+          3. Crée une bannière → copie le code HTML/JS<br>
+          4. Crée une interstitielle → copie son code
         </div>
+
         <div class="form-group">
-          <label><i class="fa fa-minus-square"></i> Slot Bannière (Ad Unit ID)</label>
-          <input type="text" name="adsense_banner_slot" class="form-control"
-                 placeholder="XXXXXXXXXX"
-                 value="{{ config.get('adsenseBannerSlot','') }}">
-          <small style="color:#64748b">Affiché en bas de page toutes les 2 visites.</small>
+          <label><i class="fa fa-minus-square"></i> Code Bannière Adsterra</label>
+          <textarea name="adsterra_banner_code" class="form-control" rows="4"
+                    placeholder="Colle ici le code HTML/JS Adsterra pour la bannière..."
+                    style="font-family:monospace;font-size:11px">{{ config.get('adsterraBannerCode','') }}</textarea>
+          <small style="color:#64748b">Affiché en bas de page toutes les 2 visites (utilisateurs seulement).</small>
         </div>
+
         <div class="form-group">
-          <label><i class="fa fa-expand"></i> Slot Interstitielle (Ad Unit ID)</label>
-          <input type="text" name="adsense_inter_slot" class="form-control"
-                 placeholder="XXXXXXXXXX"
-                 value="{{ config.get('adsenseInterSlot','') }}">
+          <label><i class="fa fa-expand"></i> Code Interstitielle Adsterra</label>
+          <textarea name="adsterra_inter_code" class="form-control" rows="4"
+                    placeholder="Colle ici le code HTML/JS Adsterra pour l'interstitielle..."
+                    style="font-family:monospace;font-size:11px">{{ config.get('adsterraInterCode','') }}</textarea>
           <small style="color:#64748b">Overlay plein écran toutes les 6 visites.</small>
         </div>
 
-        {% set adsense_ok = config.get('adsensePubId') and config.get('adsenseBannerSlot') and config.get('adsenseInterSlot') %}
+        {% set adsterra_ok = config.get('adsterraBannerCode') or config.get('adsterraInterCode') %}
         <div style="padding:10px;border-radius:8px;font-size:12px;margin-bottom:12px;
-          background:{{ '#162b1a' if adsense_ok else '#1c1a10' }};
-          border:1px solid {{ '#22c55e44' if adsense_ok else '#fbbf2444' }};">
-          {% if adsense_ok %}
+          background:{{ '#162b1a' if adsterra_ok else '#1c1a10' }};
+          border:1px solid {{ '#22c55e44' if adsterra_ok else '#fbbf2444' }};">
+          {% if adsterra_ok %}
           <i class="fa fa-check-circle" style="color:#22c55e"></i>
-          <strong style="color:#22c55e">AdSense activé</strong> — les pubs s'affichent sur le site web.
+          <strong style="color:#22c55e">Adsterra activé</strong> — les pubs s'affichent aux utilisateurs.
           {% else %}
           <i class="fa fa-exclamation-triangle" style="color:#fbbf24"></i>
-          <strong style="color:#fbbf24">AdSense non configuré</strong> — remplis les 3 champs ci-dessus.
+          <strong style="color:#fbbf24">Adsterra non configuré</strong> — colle le code ci-dessus.
           {% endif %}
         </div>
 
         <div class="form-actions">
-          <button type="submit" class="btn btn-primary"><i class="fa fa-save"></i> Sauvegarder AdSense</button>
+          <button type="submit" class="btn btn-primary"><i class="fa fa-save"></i> Sauvegarder Adsterra</button>
         </div>
       </form>
     </div>

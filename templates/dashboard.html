@@ -4,6 +4,32 @@
 
 {% block content %}
 {% if data %}
+{% if relay_mode %}
+<div class="card" style="margin-bottom:16px">
+  <div class="card-header">
+    <h3><i class="fa fa-cloud"></i> Routeur en Relais Cloud</h3>
+    {% if active_router %}
+    <a class="btn btn-primary btn-sm" href="{{ url_for('router_relay_settings', rid=active_router.id) }}">
+      <i class="fa fa-cloud"></i> Ouvrir Relais
+    </a>
+    {% endif %}
+  </div>
+  <div class="card-body">
+    <div class="info-box">
+      Relais cloud actif en complement. Les donnees affichees ci-dessous viennent du MikroTik quand il est joignable.
+      Le relais ne remplace pas les contenus reels du routeur.
+    </div>
+    {% if active_router %}
+    <div style="line-height:1.6;margin-top:10px">
+      <strong>Routeur :</strong> {{ active_router.name }} |
+      <strong>Adresse :</strong> {{ active_router.host }}:{{ active_router.get('port',8728) }} |
+      <strong>Dernier contact :</strong> {{ active_router.get('relay_last_seen') or 'en attente du MikroTik' }}
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
 <div class="stats-grid">
   <!-- Identité routeur -->
   <div class="stat-card accent-blue">
@@ -110,12 +136,41 @@
     <div class="stat-info">
       <div class="stat-label">Connexion Routeur</div>
       <div class="stat-value" style="font-size:13px">
+        {% if relay_mode %}
+        <span style="color:#38bdf8">&#9679;</span> En ligne + relais
+        {% else %}
         <span style="color:#4ade80">&#9679;</span> En ligne
+        {% endif %}
       </div>
       <div class="stat-sub">{{ data.router_host }}:{{ data.router_port }}</div>
     </div>
   </div>
 </div>
+
+{% if relay_mode %}
+<div class="card" style="margin-top:16px">
+  <div class="card-header">
+    <h3><i class="fa fa-list"></i> Dernieres commandes relais</h3>
+  </div>
+  <div class="table-responsive">
+    <table class="data-table">
+      <thead><tr><th>Date</th><th>Commande</th><th>Statut</th><th>Resultat</th></tr></thead>
+      <tbody>
+        {% for c in relay_commands %}
+        <tr>
+          <td>{{ c.created_at }}</td>
+          <td>{{ c.command }}</td>
+          <td>{{ c.status }}</td>
+          <td style="white-space:pre-wrap">{{ c.result }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="text-center text-muted">Aucune commande relais.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
 
 <!-- Widget Revenus -->
 <div class="card" style="margin-top:16px">
@@ -206,6 +261,31 @@
   <i class="fa fa-exclamation-triangle"></i>
   Impossible de récupérer les données du routeur.
   <a href="{{ url_for('sessions_list') }}">Changer de routeur</a>
+  {% if active_router %}
+  <div style="margin-top:10px;line-height:1.55">
+    <strong>Routeur :</strong> {{ active_router.name }}
+    <br><strong>Adresse principale :</strong> {{ active_router.host }}:{{ active_router.get('port',8728) }}
+    {% if active_router.get('fallback_host') %}
+    <br><strong>Adresse de secours :</strong> {{ active_router.get('fallback_host') }}:{{ active_router.get('port',8728) }}
+    {% endif %}
+  </div>
+  {% endif %}
+  {% if router_error %}
+  <div style="margin-top:8px;word-break:break-word;line-height:1.45">
+    <strong>Erreur :</strong> {{ router_error }}
+  </div>
+  {% endif %}
+  <div style="margin-top:10px;line-height:1.45">
+    Si l'adresse est <strong>10.10.10.1</strong>, elle marche seulement quand le serveur est sur le meme reseau local.
+    Pour un site heberge, activez le Relais Cloud afin que le MikroTik envoie ses donnees au site.
+  </div>
+  {% if active_router %}
+  <div style="margin-top:10px">
+    <a class="btn btn-outline btn-sm" href="{{ url_for('edit_router', rid=active_router.id) }}">
+      <i class="fa fa-edit"></i> Modifier l'adresse
+    </a>
+  </div>
+  {% endif %}
 </div>
 {% endif %}
 

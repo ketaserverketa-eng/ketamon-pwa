@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ title }} - Bons de connexion</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#f8fafc;color:#000;font-family:Arial,sans-serif;padding:16px}
+    .no-print{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+    .no-print a,.no-print button{border:0;border-radius:6px;padding:8px 14px;background:#0f2a4a;color:#fff;text-decoration:none;font-weight:700;cursor:pointer}
+    .no-print .secondary{background:#475569}
+    .pa-header{display:flex;justify-content:space-between;align-items:baseline;font-size:10px;color:#000;margin-bottom:6mm;font-weight:700}
+    .tkt-table{width:100%;border-collapse:separate;border-spacing:3px 3px;table-layout:fixed}
+    .tkt-cell{border:2.5px solid #000;padding:5px 6px;vertical-align:top;background:#fff}
+    .tkt-cell-empty{border:none;background:transparent}
+    .tkt-hdr{display:flex;justify-content:space-between;align-items:baseline;font-weight:900;font-size:11px;line-height:1.4;color:#000}
+    .tkt-hdr-l{flex:1;font-weight:900;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .tkt-hdr-r{font-weight:900;white-space:nowrap;margin-left:3px}
+    .tkt-lbl{font-size:7.5px;font-weight:900;color:#000;margin-top:2px}
+    .tkt-code{font-weight:900;font-size:20px;margin-top:2px;white-space:nowrap;overflow:hidden;font-family:"Courier New",monospace;letter-spacing:.03em;color:#000;line-height:1.2}
+    .tkt-info{font-weight:900;font-size:10px;margin-top:2px;color:#000}
+    .page-break{page-break-after:always;height:0}
+    @page{size:A4 portrait;margin:8mm}
+    @media print{.no-print{display:none!important}body{background:#fff;padding:0}.pa-header{font-size:9px;margin-bottom:4mm}}
+  </style>
+</head>
+<body>
+  <div class="no-print">
+    <a class="secondary" href="{{ url_for('vouchers') }}">Retour</a>
+    <button type="button" onclick="window.print()">Imprimer</button>
+    <strong>{{ title }} - {{ cards|length }} ticket(s)</strong>
+  </div>
+  <div class="pa-header">
+    <span>{{ printed_at }}</span>
+    <span>{{ title }} - {{ cards|length }} ticket(s)</span>
+  </div>
+  {% set cols = 4 %}
+  {% set per_page = 40 %}
+  {% for page in cards|batch(per_page, none) %}
+    <table class="tkt-table"><tbody>
+    {% for row in page|reject('equalto', none)|list|batch(cols, none) %}
+      <tr>
+      {% for card in row %}
+        {% if card %}
+        <td class="tkt-cell">
+          <div class="tkt-hdr"><span class="tkt-hdr-l">{{ wifi_name }}</span><span class="tkt-hdr-r">[{{ card.num }}]</span></div>
+          <div class="tkt-lbl">ketaserver</div>
+          <div class="tkt-code">{{ card.code }}</div>
+          <div class="tkt-info">{{ card.info }}</div>
+        </td>
+        {% else %}
+        <td class="tkt-cell-empty"></td>
+        {% endif %}
+      {% endfor %}
+      </tr>
+    {% endfor %}
+    </tbody></table>
+    {% if not loop.last %}<div class="page-break"></div>{% endif %}
+  {% endfor %}
+  {% if auto_print %}
+  <script>setTimeout(function(){window.print();},300);</script>
+  {% endif %}
+</body>
+</html>

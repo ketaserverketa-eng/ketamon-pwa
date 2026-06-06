@@ -110,6 +110,8 @@
       <div><span style="color:#64748b">Temps restant</span><br><strong id="det-left" style="color:#22c55e"></strong></div>
       <div><span style="color:#64748b">↓ Reçu</span><br><strong id="det-down"></strong></div>
       <div><span style="color:#64748b">↑ Envoyé</span><br><strong id="det-up"></strong></div>
+      <div><span style="color:#64748b">🕐 Première utilisation</span><br><strong id="det-first-used" style="color:#a78bfa"></strong></div>
+      <div><span style="color:#64748b">⏰ Expire le</span><br><strong id="det-expire" style="color:#f87171"></strong></div>
     </div>
     <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
       <button id="det-btn-toggle" class="btn btn-sm btn-warning"
@@ -135,10 +137,19 @@ function voirDetails(idx){
   document.getElementById('det-server').textContent  = s['server']       || '-';
   document.getElementById('det-ip').textContent      = s['address']      || '-';
   document.getElementById('det-mac').textContent     = s['mac-address']  || '-';
-  document.getElementById('det-uptime').textContent  = s['uptime']       || '-';
-  document.getElementById('det-left').textContent    = s['temps-restant']|| '∞';
-  document.getElementById('det-down').textContent    = s['debit-down']   || '-';
-  document.getElementById('det-up').textContent      = s['debit-up']     || '-';
+  document.getElementById('det-uptime').textContent     = s['uptime']        || '-';
+  document.getElementById('det-left').textContent       = s['temps-restant'] || '∞';
+  document.getElementById('det-down').textContent       = s['debit-down']    || '-';
+  document.getElementById('det-up').textContent         = s['debit-up']      || '-';
+  document.getElementById('det-first-used').textContent = s['first_used_at'] || 'Non enregistré';
+  var expEl = document.getElementById('det-expire');
+  if(s['expire_at']){
+    expEl.textContent = s['expire_at'] + (s['expire_estimated'] ? ' (est.)' : '');
+    expEl.style.color = '#f87171';
+  } else {
+    expEl.textContent = '∞ (illimité)';
+    expEl.style.color = '#94a3b8';
+  }
   var badge = document.getElementById('det-disabled-badge');
   badge.style.display = s['user_disabled'] ? '' : 'none';
   var btnToggle = document.getElementById('det-btn-toggle');

@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}- Relais Cloud{% endblock %}
+{% block page_title %}Relais Cloud MikroTik{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3><i class="fa fa-cloud"></i> Relais Cloud : {{ router.name }}</h3>
+    <a href="{{ url_for('sessions_list') }}" class="btn btn-secondary btn-sm">
+      <i class="fa fa-arrow-left"></i> Retour
+    </a>
+  </div>
+  <div class="card-body">
+    <div class="info-box">
+      <strong>Principe :</strong> le site web depose les commandes sur le serveur, puis le MikroTik vient les chercher.
+      C'est le bon mode pour Android/PWA et pour les routeurs derriere NAT.
+    </div>
+
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin:14px 0">
+      {% if router.get('relay_enabled') %}
+      <span class="badge badge-green"><i class="fa fa-check"></i> Relais actif</span>
+      {% else %}
+      <span class="badge badge-red"><i class="fa fa-times"></i> Relais inactif</span>
+      {% endif %}
+      <span class="badge">URL serveur : {{ relay_base_url }}</span>
+      {% if router.get('relay_last_seen') %}
+      <span class="badge">Dernier contact : {{ router.get('relay_last_seen') }}</span>
+      {% endif %}
+    </div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
+      {% if router.get('relay_enabled') %}
+      <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="disable">
+        <button class="btn btn-secondary" type="submit"><i class="fa fa-pause"></i> Desactiver</button>
+      </form>
+      {% else %}
+      <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="enable">
+        <button class="btn btn-primary" type="submit"><i class="fa fa-play"></i> Activer</button>
+      </form>
+      {% endif %}
+      <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="rotate">
+        <button class="btn btn-outline" type="submit"><i class="fa fa-refresh"></i> Nouveau token</button>
+      </form>
+      <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="queue_ping">
+        <button class="btn btn-primary" type="submit"><i class="fa fa-paper-plane"></i> Envoyer test ping</button>
+      </form>
+    </div>
+
+    {% if router.get('relay_token') %}
+    <h4>Installation MikroTik</h4>
+    <p class="text-muted">
+      Pour tester sur Android, ouvrez cette page avec l'adresse que le MikroTik peut joindre
+      (Render ou IP du PC sur le meme reseau), puis installez ce script une seule fois sur le MikroTik.
+    </p>
+    <div class="info-box">
+      Si les commandes restent <strong>queued</strong>, cela veut dire que le MikroTik n'a pas encore installe ou lance le relais.
+    </div>
+    <label>URL du script .rsc</label>
+    <input class="form-control" readonly value="{{ install_url }}" style="font-family:Consolas,monospace">
+    <label style="margin-top:12px">Commande courte MikroTik</label>
+    <textarea id="relay-bootstrap" class="form-control" rows="4" readonly style="font-family:Consolas,monospace">{{ bootstrap_command }}</textarea>
+    <button class="btn btn-outline" type="button" onclick="copierRelais()" style="margin:10px 0">
+      <i class="fa fa-copy"></i> Copier la commande courte
+    </button>
+    <h4 style="margin-top:14px">Script complet</h4>
+    <textarea class="form-control" rows="12" readonly style="font-family:Consolas,monospace">{{ install_script }}</textarea>
+    {% else %}
+    <div class="info-box">
+      Activez le relais pour generer un token et afficher le script MikroTik.
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card" style="margin-top:18px">
+  <div class="card-header">
+    <h3><i class="fa fa-list"></i> Dernieres commandes relais</h3>
+  </div>
+  <div class="table-responsive">
+    <table class="table">
+      <thead>
+        <tr><th>Date</th><th>Commande</th><th>Statut</th><th>Resultat</th></tr>
+      </thead>
+      <tbody>
+        {% for c in commands %}
+        <tr>
+          <td>{{ c.created_at }}</td>
+          <td>{{ c.command }}</td>
+          <td>{{ c.status }}</td>
+          <td style="max-width:420px;white-space:pre-wrap">{{ c.result }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="text-center text-muted">Aucune commande relais.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function copierRelais(){
+  var el = document.getElementById('relay-bootstrap');
+  if (!el) return;
+  el.focus();
+  el.select();
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(el.value).then(function(){
+        afficherNotif("Commande copiee.", "success");
+      }).catch(function(){ document.execCommand('copy'); afficherNotif("Commande copiee.", "success"); });
+    } else {
+      document.execCommand('copy');
+      afficherNotif("Commande copiee.", "success");
+    }
+  } catch(e) {
+    afficherNotif("Copie impossible, selectionnez le texte manuellement.", "warning");
+  }
+}
+</script>
+{% endblock %}

@@ -487,4 +487,18 @@ code {
   .form-row { flex-direction: column; }
   .col-4, .col-6 { flex: none; width: 100%; }
   .traffic-stats { flex-direction: column; }
+  /* Navbar mobile — cacher éléments lourds pour libérer de la place */
+  .page-title { display: none; }
+  .nav-user { display: none; }
+  #switch-router { display: none; }
+  .nav-left { flex-shrink: 0; }
+  #toggle-sidebar { font-size: 22px; color: var(--text) !important; padding: 8px; }
 }
+
+/* Overlay pour fermer sidebar en cliquant dehors sur mobile */
+#sidebar-overlay {
+  display: none;
+  position: fixed; inset: 0; z-index: 850;
+  background: rgba(0,0,0,.5);
+}
+body.sidebar-open #sidebar-overlay { display: block; }

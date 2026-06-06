@@ -30,8 +30,8 @@
         <tr>
           <th>Email / Identifiant</th>
           <th>Nom affiché</th>
-          {% if not is_local %}
           <th>Routeurs</th>
+          {% if not is_local %}
           <th>Connexions</th>
           <th>Dernière connexion</th>
           {% endif %}
@@ -46,8 +46,8 @@
         <tr id="row-{{ u.id }}">
           <td><code>{{ u.email }}</code></td>
           <td>{{ u.displayName or '—' }}</td>
-          {% if not is_local %}
           <td><span class="badge badge-blue">{{ u.routerCount or 0 }}</span></td>
+          {% if not is_local %}
           <td>{{ u.loginCount or 0 }}</td>
           <td>{{ u.lastLoginAt[:10] if u.lastLoginAt else '—' }}</td>
           {% endif %}
@@ -61,10 +61,12 @@
           </td>
           <td>{{ u.createdAt[:10] if u.createdAt else '—' }}</td>
           <td>
-            {% if u.active %}
-            <span class="badge badge-green">Actif</span>
+            {% if u.approvalPending %}
+            <span class="badge user-status-badge" style="background:#78350f;color:#fcd34d">En attente</span>
+            {% elif u.active %}
+            <span class="badge badge-green user-status-badge">Actif</span>
             {% else %}
-            <span class="badge badge-red">Inactif</span>
+            <span class="badge badge-red user-status-badge">Inactif</span>
             {% endif %}
           </td>
           <td>
@@ -89,7 +91,7 @@
         </tr>
         {% else %}
         <tr>
-          <td colspan="{% if is_local %}6{% else %}9{% endif %}" class="text-center text-muted">
+          <td colspan="{% if is_local %}7{% else %}9{% endif %}" class="text-center text-muted">
             Aucun utilisateur trouvé.
           </td>
         </tr>
@@ -117,16 +119,33 @@ function basculerUser(id, btn){
   }).then(r => r.json()).then(d => {
     if(d.ok){
       const row  = document.getElementById("row-" + id);
-      const badge = row ? row.querySelector(".badge") : null;
+      const badge = row ? row.querySelector(".user-status-badge") : null;
       const isNowActive = d.active !== undefined ? d.active : btn.style.background.includes("166534");
       if(isNowActive){
         btn.innerHTML = '<i class="fa fa-toggle-on"></i> Désactiver';
         btn.style.background = '#78350f'; btn.style.color = '#fcd34d';
-        if(badge){ badge.className="badge badge-green"; badge.textContent="Actif"; }
+        if(badge){
+          badge.className="badge badge-green user-status-badge";
+          badge.style.background = '';
+          badge.style.color = '';
+          badge.textContent="Actif";
+        }
       } else {
         btn.innerHTML = '<i class="fa fa-toggle-off"></i> Activer';
         btn.style.background = '#166534'; btn.style.color = '#86efac';
-        if(badge){ badge.className="badge badge-red"; badge.textContent="Inactif"; }
+        if(badge){
+          if(d.approvalPending){
+            badge.className="badge user-status-badge";
+            badge.style.background = '#78350f';
+            badge.style.color = '#fcd34d';
+            badge.textContent="En attente";
+          } else {
+            badge.className="badge badge-red user-status-badge";
+            badge.style.background = '';
+            badge.style.color = '';
+            badge.textContent="Inactif";
+          }
+        }
       }
       afficherNotif("Statut mis à jour.", "success");
     } else {

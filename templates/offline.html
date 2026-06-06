@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0EA5E9">
+<title>KetaMon — Hors ligne</title>
+<link rel="manifest" href="/static/manifest.json">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0B1220;
+    color: #d9e0ea;
+    font-family: system-ui, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    text-align: center;
+    padding: 20px;
+  }
+  .card {
+    background: #0f172a;
+    border: 1px solid #1e2d42;
+    border-radius: 16px;
+    padding: 40px 32px;
+    max-width: 380px;
+    width: 100%;
+  }
+  .icon {
+    font-size: 56px;
+    margin-bottom: 20px;
+    display: block;
+  }
+  h1 {
+    font-size: 22px;
+    color: #f1f5f9;
+    margin-bottom: 12px;
+  }
+  p {
+    font-size: 14px;
+    color: #94a3b8;
+    line-height: 1.6;
+    margin-bottom: 28px;
+  }
+  button {
+    background: #0ea5e9;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 12px 28px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    width: 100%;
+  }
+  button:active { opacity: 0.85; }
+</style>
+</head>
+<body>
+<div class="card">
+  <span class="icon">📡</span>
+  <h1>Vous êtes hors ligne</h1>
+  <p>KetaMon ne peut pas se connecter au serveur. Vérifiez votre connexion réseau puis réessayez.</p>
+  <button onclick="location.reload()">Réessayer</button>
+</div>
+</body>
+</html>

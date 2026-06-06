@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: ketamon-web
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 180
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - key: KETAMON_ENV
+        value: production
+      - key: KETAMON_SECRET_KEY
+        generateValue: true
+      - key: KETAMON_TICKET_BATCH_SIZE
+        value: "100"
+      - key: KETAMON_TICKET_BATCH_PAUSE
+        value: "0.05"
+    disk:
+      name: ketamon-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1

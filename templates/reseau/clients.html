@@ -51,7 +51,7 @@
       <tbody>
         {% for u in users %}
         <tr class="{% if u.get('disabled','no')=='yes' %}row-disabled{% endif %}">
-          <td><input type="checkbox" class="row-check" value="{{ u.get('id','') }}"></td>
+          <td><input type="checkbox" class="row-check" value="{{ u.get('id','') or u.get('.id','') or u.get('name','') }}" data-name="{{ u.get('name','') }}"></td>
           <td><strong>{{ u.get('name','') }}</strong></td>
           <td><span class="badge badge-blue">{{ u.get('profile','—') }}</span></td>
           <td>{{ u.get('server','—') }}</td>
@@ -67,26 +67,26 @@
           </td>
           <td>
             <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
-              <a href="{{ url_for('reseau_modifier_client', uid=u.get('id','')) }}"
+              <a href="{{ url_for('reseau_modifier_client', uid=(u.get('id','') or u.get('.id','') or u.get('name',''))) }}"
                 style="background:#1e3a5f;color:#93c5fd;border:none;border-radius:5px;padding:3px 8px;font-size:11px;text-decoration:none;white-space:nowrap;display:inline-block">
                 <i class="fa fa-edit"></i> Modifier
               </a>
               {% if u.get('disabled','no') == 'yes' %}
-              <button onclick="basculerClient('{{ u.get('id','') }}','no')"
+              <button onclick="basculerClient('{{ u.get('id','') or u.get('.id','') or u.get('name','') }}','no','{{ u.get('name','') }}')"
                 style="background:#166534;color:#86efac;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
                 <i class="fa fa-toggle-off"></i> Activer
               </button>
               {% else %}
-              <button onclick="basculerClient('{{ u.get('id','') }}','yes')"
+              <button onclick="basculerClient('{{ u.get('id','') or u.get('.id','') or u.get('name','') }}','yes','{{ u.get('name','') }}')"
                 style="background:#78350f;color:#fcd34d;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
                 <i class="fa fa-toggle-on"></i> Désact.
               </button>
               {% endif %}
-              <button onclick="reinitialiserClient('{{ u.get('id','') }}','{{ u.get('name','') }}')"
+              <button onclick="reinitialiserClient('{{ u.get('id','') or u.get('.id','') or u.get('name','') }}','{{ u.get('name','') }}')"
                 style="background:#78350f;color:#fcd34d;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
                 <i class="fa fa-refresh"></i> Reset
               </button>
-              <button onclick="supprimerClient('{{ u.get('id','') }}','{{ u.get('name','') }}')"
+              <button onclick="supprimerClient('{{ u.get('id','') or u.get('.id','') or u.get('name','') }}','{{ u.get('name','') }}')"
                 style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap">
                 <i class="fa fa-trash"></i> Suppr.
               </button>
@@ -130,11 +130,11 @@ function mettreAJourBulk(){
   bar.style.display = checked.length > 0 ? "flex" : "none";
 }
 
-function basculerClient(id, disabled){
+function basculerClient(id, disabled, nom){
   fetch("{{ url_for('reseau_basculer_client') }}", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({id, disabled})
+    body: JSON.stringify({id, name: nom || id, disabled})
   }).then(async (r) => {
     const d = await r.json().catch(() => ({ok:false, msg:"Reponse invalide du serveur"}));
     if(!r.ok || !d.ok){
@@ -158,7 +158,7 @@ function supprimerClient(id, nom){
       fetch("{{ url_for('reseau_supprimer_client') }}", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({id})
+        body: JSON.stringify({id, name: nom})
       }).then(r => r.json()).then(d => {
         if(d.ok) location.reload();
         else afficherNotif(d.msg, "danger");
@@ -175,7 +175,7 @@ function reinitialiserClient(id, nom){
       fetch("{{ url_for('hotspot_reset_user') }}", {
         method:"POST",
         headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({id})
+        body: JSON.stringify({id, name: nom})
       }).then(r => r.json()).then(d => {
         if(d.ok){
           afficherNotif(d.msg || "Ticket réinitialisé.", "success");
@@ -189,15 +189,15 @@ function reinitialiserClient(id, nom){
 }
 
 function supprimerSelection(){
-  const ids = Array.from(document.querySelectorAll(".row-check:checked")).map(cb => cb.value);
-  if(!ids.length) return;
+  const items = Array.from(document.querySelectorAll(".row-check:checked")).map(cb => ({id: cb.value, name: cb.dataset.name || cb.value}));
+  if(!items.length) return;
   ouvrirModal(
-    `Supprimer ${ids.length} client(s) ?`,
+    `Supprimer ${items.length} client(s) ?`,
     "Cette action est irréversible.",
     async () => {
-      for(const id of ids){
+      for(const item of items){
         await fetch("{{ url_for('reseau_supprimer_client') }}", {
-          method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})
+          method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(item)
         });
       }
       location.reload();

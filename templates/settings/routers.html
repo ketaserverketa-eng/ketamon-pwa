@@ -19,7 +19,19 @@
       <div class="router-card-info">
         <div class="router-card-name">{{ r.name }}</div>
         <div class="router-card-host">{{ r.host }}:{{ r.get('port',8728) }}</div>
+        {% set router_host = (r.host|string).strip() %}
+        {% if router_host.startswith('10.') or router_host.startswith('192.168.') or router_host.startswith('172.') %}
+        <div class="router-card-user" style="color:#fbbf24">
+          Local seulement : pour site heberge, activez le Relais Cloud.
+        </div>
+        {% endif %}
+        {% if r.get('fallback_host') %}
+        <div class="router-card-user">Secours : {{ r.get('fallback_host') }}</div>
+        {% endif %}
         <div class="router-card-user">{{ r.get('user') or r.get('username', 'admin') }} - {{ r.get('currency','FCFA') }}</div>
+        {% if r.get('relay_enabled') %}
+        <div class="router-card-user" style="color:#4ade80">Relais cloud actif{% if r.get('relay_last_seen') %} - vu {{ r.get('relay_last_seen') }}{% endif %}</div>
+        {% endif %}
       </div>
       <div class="router-card-actions">
         {% if active_router and active_router.id == r.id %}
@@ -30,7 +42,10 @@
         </a>
         {% endif %}
         <button class="btn btn-outline btn-sm"
+                data-router-id="{{ r.id }}"
+                data-relay-enabled="{{ 1 if r.get('relay_enabled') else 0 }}"
                 data-host="{{ r.get('host','') }}"
+                data-fallback-host="{{ r.get('fallback_host','') }}"
                 data-user="{{ r.get('user') or r.get('username','admin') }}"
                 data-port="{{ r.get('port',8728) }}"
                 data-password="{{ r.get('password','') }}"
@@ -39,6 +54,9 @@
         </button>
         <a href="{{ url_for('edit_router', rid=r.id) }}" class="btn btn-outline btn-sm">
           <i class="fa fa-edit"></i> Modifier
+        </a>
+        <a href="{{ url_for('router_relay_settings', rid=r.id) }}" class="btn btn-outline btn-sm">
+          <i class="fa fa-cloud"></i> Relais
         </a>
         <button class="btn btn-danger btn-sm" onclick="supprimerRouteur('{{ r.id }}','{{ r.name }}')">
           <i class="fa fa-trash"></i> Supprimer
@@ -58,8 +76,38 @@
   {% endif %}
 </div>
 
+<div class="card" style="margin-top:18px;">
+  <div class="card-header">
+    <h3><i class="fa fa-code"></i> Scripts MikroTik</h3>
+  </div>
+  <div class="card-body" style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+    <p style="margin:0;flex:1;color:var(--text-muted,#888);">
+      Met à jour les scripts d'expiration des tickets sur le routeur MikroTik connecté.
+      À faire après chaque mise à jour de KetaMon ou en cas de problème d'expiration des tickets.
+    </p>
+    <button class="btn btn-primary" onclick="reinstallerScripts()">
+      <i class="fa fa-refresh"></i> Réinstaller les scripts
+    </button>
+  </div>
+</div>
+
 <script>
 const _CSRF = window._KETAMON_CSRF || '';
+
+function reinstallerScripts(){
+  ouvrirModal("Réinstaller les scripts MikroTik ?",
+    "Met à jour les scripts d'expiration et de login sur le routeur connecté.",
+    () => {
+      afficherNotif("Mise à jour des scripts MikroTik…","info");
+      fetch("/hotspot/scripts/reinstaller", {
+        method:"POST",
+        headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF}
+      }).then(r=>r.json()).then(d=>{
+        afficherNotif(d.msg || (d.ok ? "Scripts installés avec succès." : "Erreur."), d.ok ? "success" : "danger");
+      }).catch(()=>afficherNotif("Erreur réseau.","danger"));
+    }
+  );
+}
 
 function supprimerRouteur(id, nom){
   ouvrirModal(`Supprimer le routeur « ${nom} » ?`, "Cette action supprimera la configuration enregistrée.", () => {
@@ -72,7 +120,20 @@ function supprimerRouteur(id, nom){
 }
 
 function testerConnexion(btn){
+  var routerId = btn.dataset.routerId || "";
+  var relayEnabled = btn.dataset.relayEnabled === "1";
+  if (relayEnabled && routerId){
+    afficherNotif("Test relais cloud en cours...","info");
+    fetch(`/api/relay/routers/${routerId}/ping`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF}
+    }).then(r=>r.json()).then(d=>{
+      afficherNotif(d.msg || (d.ok ? "Test relais envoye" : "Echec relais"), d.ok ? "success" : "danger");
+    }).catch(()=>afficherNotif("Erreur reseau.","danger"));
+    return;
+  }
   var host     = btn.dataset.host;
+  var fallbackHost = btn.dataset.fallbackHost || "";
   var user     = btn.dataset.user;
   var port     = parseInt(btn.dataset.port) || 8728;
   var password = btn.dataset.password || "";
@@ -80,7 +141,7 @@ function testerConnexion(btn){
   fetch('/api/test-connexion', {
     method:"POST",
     headers:{"Content-Type":"application/json","X-CSRF-Token":_CSRF},
-    body: JSON.stringify({host, user, port, password})
+    body: JSON.stringify({host, fallback_host: fallbackHost, user, port, password})
   }).then(r=>r.json()).then(d=>{
     afficherNotif(d.msg || (d.ok ? "Connexion OK" : "Echec"), d.ok ? "success" : "danger");
   }).catch(()=>afficherNotif("Erreur réseau.","danger"));

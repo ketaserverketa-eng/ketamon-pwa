@@ -9,13 +9,13 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="KetaMon">
 <title>KetaMon {% block title %}{% endblock %}</title>
-<link rel="manifest" href="/static/manifest.json">
-<link rel="apple-touch-icon" href="/static/img/default-ticket-logo.png">
+<link rel="manifest" href="/static/manifest.json?v={{ _pwa_ver }}">
+<link rel="apple-touch-icon" href="/static/img/default-ticket-logo.png?v={{ _pwa_ver }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v={{ _css_ver }}">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
-{% if adsense_pub_id %}
-<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={{ adsense_pub_id }}" crossorigin="anonymous"></script>
-{% endif %}
+<script>
+window._KETAMON_CSRF = "{{ csrf_token }}" || "";
+</script>
 </head>
 <body class="dark">
 
@@ -23,7 +23,7 @@
 <!-- Barre de navigation -->
 <div id="navbar">
   <div class="nav-left">
-    <button id="toggle-sidebar" class="nav-btn"><i class="fa fa-bars"></i></button>
+    <button id="toggle-sidebar" class="nav-btn" style="font-size:26px;color:#d9e0ea;background:none;border:none;cursor:pointer;padding:6px 10px;line-height:1">&#9776;</button>
     <a href="{{ url_for('index') }}" class="brand" style="display:flex;align-items:center;gap:8px">
       {% if ticket_logo_url %}
       <img src="{{ ticket_logo_url }}" alt="logo" style="height:28px;width:28px;object-fit:contain;border-radius:6px">
@@ -45,11 +45,22 @@
       </option>
       {% endfor %}
     </select>
-    <a href="{{ url_for('abonnement') }}" class="nav-link" title="Mon abonnement Premium"><i class="fa fa-star"></i></a>
+    {% if session.get('role') == 'concepteur' %}
+    <a href="{{ url_for('concepteur_incidents') }}" class="nav-link" title="Incidents Agent"
+       style="position:relative{% if agent_open_count > 0 %};color:#f87171{% endif %}">
+      <i class="fa fa-bell"></i>
+      {% if agent_open_count > 0 %}
+      <span style="position:absolute;top:-4px;right:-6px;background:#ef4444;color:#fff;border-radius:50%;width:16px;height:16px;font-size:9px;display:flex;align-items:center;justify-content:center;font-weight:700">{{ agent_open_count }}</span>
+      {% endif %}
+    </a>
+    {% endif %}
     <span class="nav-user"><i class="fa fa-user-circle"></i> {{ session.username }}</span>
     <a href="{{ url_for('logout') }}" class="nav-link"><i class="fa fa-sign-out"></i> Déconnexion</a>
   </div>
 </div>
+
+<!-- Overlay fermeture sidebar mobile -->
+<div id="sidebar-overlay"></div>
 
 <!-- Sidebar -->
 <div id="sidenav">
@@ -156,15 +167,11 @@
     <i class="fa fa-money"></i> Rapport de Ventes
   </a>
 
-  <!-- ABONNEMENT PREMIUM -->
-  <div class="sidebar-divider"></div>
-  <a href="{{ url_for('abonnement') }}" class="menu-item {% if current_page=='abonnement' %}active{% endif %}"
-     style="color:#fbbf24;font-weight:600">
-    <i class="fa fa-star"></i> Abonnement Premium
-  </a>
-  <div class="sidebar-divider"></div>
-
   <!-- PARAMÈTRES -->
+  <a href="{{ url_for('abonnement') }}" class="menu-item {% if current_page=='abonnement' %}active{% endif %}">
+    <i class="fa fa-credit-card"></i> Abonnement
+  </a>
+
   <div class="menu-group-btn {% if 'settings' in current_page or 'upload_logo' in current_page %}open{% endif %}" onclick="toggleMenu(this)">
     <i class="fa fa-cog"></i> Paramètres <i class="fa fa-caret-down float-right"></i>
   </div>
@@ -207,17 +214,11 @@
     <a href="{{ url_for('concepteur_users') }}" class="{% if current_page=='concepteur_users' %}active{% endif %}">
       <i class="fa fa-users"></i> Utilisateurs Cloud
     </a>
-    <a href="{{ url_for('concepteur_pubs') }}" class="{% if current_page=='concepteur_pubs' %}active{% endif %}">
-      <i class="fa fa-play-circle"></i> Publicités
-    </a>
     <a href="{{ url_for('concepteur_tickets') }}" class="{% if current_page=='concepteur_tickets' %}active{% endif %}">
       <i class="fa fa-ticket"></i> Tickets & Revenus
     </a>
     <a href="{{ url_for('concepteur_paiements') }}" class="{% if current_page=='concepteur_paiements' %}active{% endif %}">
       <i class="fa fa-money"></i> Paiements
-    </a>
-    <a href="{{ url_for('concepteur_abonnements') }}" class="{% if current_page in ['concepteur_abonnements','concepteur_plans','concepteur_paiements_config'] %}active{% endif %}">
-      <i class="fa fa-credit-card"></i> Abonnements Premium
     </a>
     <a href="{{ url_for('concepteur_routeurs_cloud') }}" class="{% if current_page=='concepteur_routeurs_cloud' %}active{% endif %}">
       <i class="fa fa-server"></i> Routeurs Cloud
@@ -237,6 +238,13 @@
     <a href="{{ url_for('concepteur_credentials') }}" class="{% if current_page=='concepteur_credentials' %}active{% endif %}">
       <i class="fa fa-key"></i> Mes Identifiants
     </a>
+    <a href="{{ url_for('concepteur_incidents') }}" class="{% if current_page=='concepteur_incidents' %}active{% endif %}"
+       style="{% if agent_open_count > 0 %}color:#f87171;font-weight:700{% endif %}">
+      <i class="fa fa-bell"></i> Incidents Agent
+      {% if agent_open_count > 0 %}
+      <span style="background:#ef4444;color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;font-weight:700;margin-left:4px">{{ agent_open_count }}</span>
+      {% endif %}
+    </a>
     <a href="{{ url_for('concepteur_mise_a_jour') }}" class="{% if current_page=='concepteur_mise_a_jour' %}active{% endif %}"
        style="color:#4ade80;font-weight:600">
       <i class="fa fa-cloud-download"></i> Mise à jour
@@ -244,9 +252,6 @@
   </div>
   {% endif %}
 
-  <a href="{{ url_for('about') }}" class="menu-item {% if current_page=='about' %}active{% endif %}">
-    <i class="fa fa-info-circle"></i> A Propos
-  </a>
 </div>
 
 <!-- Contenu principal -->
@@ -265,12 +270,6 @@
 </div>
 {% endif %}
 {% endwith %}
-
-{% if session.get('logged_in') and not ks_enabled and not standalone_mode %}
-<div class="flash-container">
-<div class="flash flash-warning">Mode degrade : KetaServer est indisponible. Les fonctions cloud sont limitees tant que le service ne repond pas.</div>
-</div>
-{% endif %}
 
 <div class="content-body">
 {% block content %}{% endblock %}
@@ -292,106 +291,95 @@
   </div>
 </div>
 
-{% if session.get('role') != 'concepteur' %}
-<!-- Bannière AdSense (alternée via JS) -->
-<div id="ad-banner-wrap" style="display:none;text-align:center;padding:8px 0;background:#0d1526;border-top:1px solid #1e2d42;">
-  {% if adsense_pub_id and adsense_banner_slot %}
-  <ins class="adsbygoogle"
-       style="display:block"
-       data-ad-client="{{ adsense_pub_id }}"
-       data-ad-slot="{{ adsense_banner_slot }}"
-       data-ad-format="auto"
-       data-full-width-responsive="true"></ins>
-  <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
-  {% else %}
-  <div style="background:#1e2d42;color:#94a3b8;font-size:11px;padding:10px;border-radius:6px;display:inline-block;min-width:320px;">
-    <i class="fa fa-bullhorn"></i> Bannière AdSense —
-    <a href="/concepteur/pubs" style="color:#0ea5e9;text-decoration:none;">configurer l'ID Publisher &amp; Slot</a>
-  </div>
-  {% endif %}
-</div>
-{% endif %}
-
 <!-- Footer légal -->
-<footer style="text-align:center;padding:12px 20px 16px;font-size:12px;color:#94a3b8;border-top:1px solid #1e2d42;background:#0b1220;">
-  <span style="margin:0 6px;color:#cbd5e1;font-weight:600;"><i class="fa fa-wifi" style="color:#0ea5e9"></i> KetaMon</span>
-  <span style="color:#334155;margin:0 4px;">|</span>
-  <a href="{{ url_for('about') }}" style="color:#94a3b8;text-decoration:none;margin:0 6px;">À propos</a>
-  <span style="color:#334155;margin:0 4px;">|</span>
-  <a href="{{ url_for('contact') }}" style="color:#94a3b8;text-decoration:none;margin:0 6px;">Contact</a>
-  <span style="color:#334155;margin:0 4px;">|</span>
-  <a href="{{ url_for('privacy') }}" style="color:#94a3b8;text-decoration:none;margin:0 6px;">Confidentialité</a>
+<footer style="text-align:center;padding:10px 16px 14px;font-size:12px;color:#94a3b8;border-top:1px solid #1e2d42;background:#0b1220;">
+  <span style="color:#cbd5e1;font-weight:600;"><i class="fa fa-wifi" style="color:#0ea5e9"></i> KetaMon</span>
 </footer>
 
-{% if session.get('role') != 'concepteur' %}
-<!-- Interstitielle AdSense (overlay plein écran) -->
-<div id="ad-interstitial" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:99999;align-items:center;justify-content:center;flex-direction:column;">
-  <div style="background:#0f172a;border:1px solid #334155;border-radius:14px;padding:24px;max-width:420px;width:90%;text-align:center;position:relative;">
-    <button onclick="document.getElementById('ad-interstitial').style.display='none'"
-            id="ad-close-btn" disabled
-            style="position:absolute;top:10px;right:12px;background:none;border:none;color:#94a3b8;font-size:20px;cursor:pointer;opacity:.4">✕</button>
-    <div id="ad-countdown" style="font-size:11px;color:#64748b;margin-bottom:10px;">Fermeture dans <b id="ad-sec">5</b>s</div>
-    {% if adsense_pub_id and adsense_inter_slot %}
-    <ins class="adsbygoogle"
-         style="display:block;min-height:250px;"
-         data-ad-client="{{ adsense_pub_id }}"
-         data-ad-slot="{{ adsense_inter_slot }}"
-         data-ad-format="auto"></ins>
-    <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
-    {% else %}
-    <div style="background:#1e2d42;color:#94a3b8;font-size:11px;padding:30px;border-radius:8px;">
-      <i class="fa fa-bullhorn" style="font-size:28px;display:block;margin-bottom:8px;color:#0ea5e9"></i>
-      Espace interstitielle AdSense<br>
-      <a href="/concepteur/pubs" style="color:#0ea5e9;text-decoration:none;">→ Configurer dans Concepteur / Publicités</a>
-    </div>
-    {% endif %}
-  </div>
-</div>
-{% endif %}
+<script src="{{ url_for('static', filename='js/main.js') }}?v={{ _js_ver }}"></script>
 
-<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+<!-- Bouton installation PWA -->
+<button id="pwa-install-btn"
+        style="display:none;position:fixed;bottom:72px;right:16px;z-index:9998;background:#0ea5e9;color:#fff;border:none;border-radius:10px;padding:10px 18px;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 4px 14px rgba(14,165,233,.4);align-items:center;gap:8px">
+  <i class="fa fa-download"></i> Installer KetaMon
+</button>
+
 <script>
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(function(){});
-}
-
-/* ── Alternance bannière / interstitielle (utilisateurs uniquement) ── */
-{% if session.get('role') != 'concepteur' %}
 (function(){
-  var BANNER_EVERY  = 2;
-  var INTER_EVERY   = 6;
-  var INTER_DELAY   = 5;
-
-  var visits = parseInt(localStorage.getItem('_ktm_visits') || '0') + 1;
-  localStorage.setItem('_ktm_visits', visits);
-
-  // Bannière
-  if (visits % BANNER_EVERY === 0) {
-    var b = document.getElementById('ad-banner-wrap');
-    if (b) b.style.display = 'block';
+if (!('serviceWorker' in navigator)) return;
+  var pwaVersion = {{ _pwa_ver|tojson }};
+  var currentCache = 'ketamon-v' + pwaVersion;
+  function storageGet(key) {
+    try { return sessionStorage.getItem(key); } catch(e) { return window[key] || ''; }
   }
-
-  // Interstitielle
-  if (visits % INTER_EVERY === 0) {
-    var ov = document.getElementById('ad-interstitial');
-    var btn = document.getElementById('ad-close-btn');
-    var sec = document.getElementById('ad-sec');
-    if (ov) {
-      ov.style.display = 'flex';
-      var t = INTER_DELAY;
-      sec.textContent = t;
-      var iv = setInterval(function(){
-        t--;
-        sec.textContent = t;
-        if (t <= 0) {
-          clearInterval(iv);
-          if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
-        }
-      }, 1000);
-    }
+  function storageSet(key, value) {
+    try { sessionStorage.setItem(key, value); } catch(e) { window[key] = value; }
   }
+  function clearKetaMonCaches() {
+    if (!('caches' in window)) return Promise.resolve();
+    return caches.keys().then(function(keys){
+      return Promise.all(keys.filter(function(k){
+        return /^ketamon-v/.test(k);
+      }).map(function(k){ return caches.delete(k); }));
+    }).catch(function(){});
+  }
+  window.KetaMonClearPwaCache = function(){
+    return Promise.all([
+      clearKetaMonCaches(),
+      navigator.serviceWorker.getRegistrations
+        ? navigator.serviceWorker.getRegistrations().then(function(regs){
+            return Promise.all(regs.map(function(reg){ return reg.unregister(); }));
+          }).catch(function(){})
+        : Promise.resolve()
+    ]).then(function(){
+      window.location.replace('/login?cache=cleaned&t=' + Date.now());
+    });
+  };
+  if (/[?&]pwa_reset=1\b/.test(window.location.search) || window.location.hash === '#pwa-reset') {
+    window.KetaMonClearPwaCache();
+    return;
+  }
+  if ('caches' in window) {
+    caches.keys().then(function(keys){
+      return Promise.all(keys.filter(function(k){
+        return /^ketamon-v/.test(k) && k !== currentCache;
+      }).map(function(k){ return caches.delete(k); }));
+    }).catch(function(){});
+  }
+  navigator.serviceWorker.register('/sw.js?v=' + encodeURIComponent(pwaVersion)).then(function(reg){
+    if (reg && reg.update) reg.update();
+  }).catch(function(){});
+  navigator.serviceWorker.addEventListener('controllerchange', function(){
+    var reloadKey = 'ktm_sw_reloaded_' + pwaVersion;
+    if (storageGet(reloadKey)) return;
+    storageSet(reloadKey, '1');
+    setTimeout(function(){ window.location.reload(); }, 100);
+  });
 })();
-{% endif %}
+
+// PWA Install prompt
+(function(){
+  var btn = document.getElementById('pwa-install-btn');
+  var deferredPrompt = null;
+  window.addEventListener('beforeinstallprompt', function(e){
+    e.preventDefault();
+    deferredPrompt = e;
+    if (btn) btn.style.display = 'flex';
+  });
+  if (btn) btn.addEventListener('click', function(){
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    deferredPrompt.userChoice.then(function(){
+      deferredPrompt = null;
+      btn.style.display = 'none';
+    });
+  });
+  window.addEventListener('appinstalled', function(){
+    if (btn) btn.style.display = 'none';
+    deferredPrompt = null;
+  });
+})();
+
 </script>
 <script>
 // Vérification automatique des mises à jour (toutes les 5 min)
@@ -423,6 +411,8 @@ if ('serviceWorker' in navigator) {
 
 // Inject CSRF token into all forms and set header for fetch() calls
 window._KETAMON_CSRF = "{{ csrf_token }}" || "";
+
+// Inject CSRF into forms + fetch (tous les utilisateurs)
 document.addEventListener('DOMContentLoaded', function(){
   try{
     document.querySelectorAll('form').forEach(function(f){
@@ -432,18 +422,176 @@ document.addEventListener('DOMContentLoaded', function(){
         f.appendChild(i);
       }
     });
-    // wrap fetch to add CSRF header automatically
     if (window.fetch){
       const _fetch = window.fetch.bind(window);
       window.fetch = function(resource, init){
         init = init || {};
-        init.headers = init.headers || {};
-        if (!init.headers['X-CSRF-Token']) init.headers['X-CSRF-Token'] = window._KETAMON_CSRF;
-        return _fetch(resource, init);
+        var baseHeaders = init.headers;
+        if (!baseHeaders && typeof Request !== 'undefined' && resource instanceof Request) {
+          baseHeaders = resource.headers;
+        }
+        var headers = new Headers(baseHeaders || {});
+        if (!headers.get('X-CSRF-Token')) headers.set('X-CSRF-Token', window._KETAMON_CSRF);
+        init.headers = headers;
+        return _fetch(resource, init).then(function(response){
+          try{
+            var targetUrl = response.url || (typeof resource === 'string' ? resource : (resource && resource.url) || '');
+            var sameOrigin = !targetUrl || new URL(targetUrl, window.location.href).origin === window.location.origin;
+            if (sameOrigin && response.status === 402 && window.location.pathname !== '/abonnement'){
+              response.clone().json().then(function(data){
+                if (data && data.subscription_required) window.location.href = '/abonnement';
+              }).catch(function(){ window.location.href = '/abonnement'; });
+            }
+          }catch(e){}
+          return response;
+        });
       };
     }
   }catch(e){console.warn('CSRF auto-inject failed', e)}
 });
 </script>
+
+{% if session.get('role') == 'concepteur' %}
+<!-- ═══ AGENT CHAT WIDGET (concepteur uniquement) ═══ -->
+<style>
+#agent-fab{position:fixed;bottom:24px;right:24px;z-index:10000;width:54px;height:54px;border-radius:50%;background:linear-gradient(135deg,#0ea5e9,#6366f1);border:none;cursor:pointer;box-shadow:0 4px 18px rgba(14,165,233,.5);display:flex;align-items:center;justify-content:center;font-size:22px;transition:transform .2s}
+#agent-fab:hover{transform:scale(1.08)}
+#agent-fab .fab-badge{position:absolute;top:-3px;right:-3px;background:#ef4444;color:#fff;border-radius:50%;width:18px;height:18px;font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center}
+#agent-panel{position:fixed;bottom:90px;right:24px;z-index:10000;width:340px;max-width:95vw;background:#0f172a;border:1px solid #1e3a5f;border-radius:16px;box-shadow:0 8px 40px rgba(0,0,0,.6);display:none;flex-direction:column;overflow:hidden}
+#agent-panel-header{background:linear-gradient(135deg,#0ea5e9,#6366f1);padding:12px 16px;display:flex;align-items:center;gap:10px}
+#agent-panel-header .av{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.2);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+#agent-panel-header .info .name{font-weight:700;color:#fff;font-size:14px}
+#agent-panel-header .info .sub{font-size:11px;color:rgba(255,255,255,.75)}
+#agent-panel-header .close-btn{margin-left:auto;background:none;border:none;color:rgba(255,255,255,.8);font-size:18px;cursor:pointer;padding:2px 6px}
+#agent-msgs{padding:12px;height:300px;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
+#agent-msgs::-webkit-scrollbar{width:4px}
+#agent-msgs::-webkit-scrollbar-track{background:#0a1120}
+#agent-msgs::-webkit-scrollbar-thumb{background:#334155;border-radius:2px}
+.agent-msg{max-width:85%;padding:8px 12px;border-radius:12px;font-size:13px;line-height:1.5;word-break:break-word;white-space:pre-wrap}
+.agent-msg.bot{background:#1e3a5f;color:#e2e8f0;border-bottom-left-radius:4px;align-self:flex-start}
+.agent-msg.user{background:#0ea5e9;color:#fff;border-bottom-right-radius:4px;align-self:flex-end}
+.agent-msg.typing{color:#64748b;font-style:italic}
+#agent-suggestions{padding:6px 12px;display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid #1e2d42}
+.sug-btn{background:#1e2d42;color:#94a3b8;border:none;border-radius:12px;padding:4px 10px;font-size:11px;cursor:pointer;white-space:nowrap;transition:background .15s}
+.sug-btn:hover{background:#0ea5e9;color:#fff}
+#agent-input-row{display:flex;gap:8px;padding:10px 12px;border-top:1px solid #1e2d42}
+#agent-input{flex:1;background:#0a1120;border:1px solid #1e3a5f;color:#f1f5f9;border-radius:20px;padding:8px 14px;font-size:13px;outline:none}
+#agent-input:focus{border-color:#0ea5e9}
+#agent-send{background:#0ea5e9;color:#fff;border:none;border-radius:50%;width:36px;height:36px;cursor:pointer;font-size:15px;flex-shrink:0;transition:background .15s}
+#agent-send:hover{background:#0284c7}
+</style>
+
+<!-- Bouton flottant -->
+<button id="agent-fab" onclick="agentToggle()" title="Agent KetaMon">
+  🤖
+  <div class="fab-badge" id="agent-fab-badge" style="display:none">!</div>
+</button>
+
+<!-- Panneau chat -->
+<div id="agent-panel">
+  <div id="agent-panel-header">
+    <div class="av">🤖</div>
+    <div class="info">
+      <div class="name">Agent KetaMon</div>
+      <div class="sub" id="agent-status-sub">Actif — prêt à répondre</div>
+    </div>
+    <button class="close-btn" onclick="agentToggle()">✕</button>
+  </div>
+  <div id="agent-msgs">
+    <div class="agent-msg bot">Bonjour ! Je surveille ton système en temps réel.<br>Tape <b>aide</b> pour voir ce que je sais faire.</div>
+  </div>
+  <div id="agent-suggestions">
+    <button class="sug-btn" onclick="agentSend('statut')">statut</button>
+    <button class="sug-btn" onclick="agentSend('incidents')">incidents</button>
+    <button class="sug-btn" onclick="agentSend('tickets')">tickets</button>
+    <button class="sug-btn" onclick="agentSend('revenus')">revenus</button>
+    <button class="sug-btn" onclick="agentSend('routeurs')">routeurs</button>
+  </div>
+  <div id="agent-input-row">
+    <input id="agent-input" placeholder="Pose une question..." onkeydown="if(event.key==='Enter')agentSend()">
+    <button id="agent-send" onclick="agentSend()"><i class="fa fa-paper-plane"></i></button>
+  </div>
+</div>
+
+<script>
+(function(){
+  var _open = false;
+
+  window.agentToggle = function(){
+    _open = !_open;
+    document.getElementById('agent-panel').style.display = _open ? 'flex' : 'none';
+    if(_open){
+      document.getElementById('agent-input').focus();
+      document.getElementById('agent-fab-badge').style.display = 'none';
+    }
+  };
+
+  window.agentSend = function(preset){
+    var inp = document.getElementById('agent-input');
+    var msg = preset || inp.value.trim();
+    if(!msg) return;
+    inp.value = '';
+    _agentAddMsg(msg, 'user');
+    _agentTyping();
+    fetch('/api/agent/chat', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({message: msg})
+    }).then(function(r){ return r.json(); }).then(function(d){
+      _agentRemoveTyping();
+      if(d.ok){
+        _agentAddMsg(d.reply, 'bot');
+      } else {
+        _agentAddMsg("Erreur de traitement.", 'bot');
+      }
+    }).catch(function(){
+      _agentRemoveTyping();
+      _agentAddMsg("Erreur réseau.", 'bot');
+    });
+  };
+
+  function _agentAddMsg(text, who){
+    var msgs = document.getElementById('agent-msgs');
+    var el   = document.createElement('div');
+    el.className = 'agent-msg ' + who;
+    el.innerHTML = text.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/\n/g,'<br>');
+    msgs.appendChild(el);
+    msgs.scrollTop = msgs.scrollHeight;
+    if(!_open && who === 'bot'){
+      document.getElementById('agent-fab-badge').style.display = 'flex';
+    }
+  }
+
+  function _agentTyping(){
+    var msgs = document.getElementById('agent-msgs');
+    var el   = document.createElement('div');
+    el.className = 'agent-msg bot typing';
+    el.id = '_agent-typing';
+    el.textContent = 'En cours...';
+    msgs.appendChild(el);
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function _agentRemoveTyping(){
+    var el = document.getElementById('_agent-typing');
+    if(el) el.remove();
+  }
+
+  setInterval(function(){
+    fetch('/api/agent/incidents/count').then(function(r){return r.json();}).then(function(d){
+      var badge = document.getElementById('agent-fab-badge');
+      if(d.count > 0){
+        badge.style.display = 'flex';
+        badge.textContent   = d.count;
+        document.getElementById('agent-status-sub').textContent = d.count + ' incident(s) en attente';
+      } else {
+        if(!_open) badge.style.display = 'none';
+        document.getElementById('agent-status-sub').textContent = 'Actif — prêt à répondre';
+      }
+    }).catch(function(){});
+  }, 60000);
+})();
+</script>
+{% endif %}
 </body>
 </html>

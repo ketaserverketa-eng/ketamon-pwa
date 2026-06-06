@@ -1,7 +1,9 @@
 // ─── Sidebar toggle ──────────────────────────────────────────────────────────
 document.getElementById("toggle-sidebar")?.addEventListener("click", function(){
-  document.body.classList.toggle("sidebar-closed");
   document.body.classList.toggle("sidebar-open");
+});
+document.getElementById("sidebar-overlay")?.addEventListener("click", function(){
+  document.body.classList.remove("sidebar-open");
 });
 
 // ─── Menus déroulants sidebar ────────────────────────────────────────────────

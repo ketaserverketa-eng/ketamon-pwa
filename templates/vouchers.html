@@ -105,9 +105,9 @@
     <a href="{{ url_for('reseau_creer_comptes') }}" class="btn btn-success btn-sm">
       <i class="fa fa-magic"></i> Créer des tickets
     </a>
-    <button onclick="imprimerTout()" class="btn btn-outline btn-sm">
+    <a href="{{ url_for('vouchers_print_view', profile='all', print='1') }}" class="btn btn-outline btn-sm">
       <i class="fa fa-print"></i> Imprimer tout
-    </button>
+    </a>
   </div>
 </div>
 
@@ -134,9 +134,9 @@
       <div class="pc-count">{{ total_users }} Items</div>
     </div>
     <div class="pc-btns">
-      <button class="pc-btn" onclick="openSection('sec-all')"><i class="fa fa-external-link"></i> Open</button>
-      <a href="{{ url_for('reseau_creer_comptes') }}" class="pc-btn"><i class="fa fa-users"></i> Generate</a>
-      <button class="pc-btn" onclick="imprimerSection('grid-all','Tous les bons')"><i class="fa fa-print"></i> Imprimer</button>
+      <a class="pc-btn" href="{{ url_for('vouchers_print_view', profile='all') }}" onclick="if(window.openSection){openSection('grid-all');return false;}"><i class="fa fa-external-link"></i> Open</a>
+      <a href="{{ url_for('reseau_creer_comptes') }}" class="pc-btn"><i class="fa fa-users"></i> Generer</a>
+      <a class="pc-btn" href="{{ url_for('vouchers_print_view', profile='all', print='1') }}" onclick="if(window.imprimerSection){imprimerSection('grid-all','Tous les bons');return false;}"><i class="fa fa-print"></i> Imprimer</a>
     </div>
   </div>
 
@@ -161,9 +161,9 @@
       {% endif %}
     </div>
     <div class="pc-btns">
-      <button class="pc-btn" onclick="openSection('{{ gid }}')"><i class="fa fa-external-link"></i> Open</button>
-      <a href="{{ url_for('reseau_creer_comptes') }}?profile={{ pname|urlencode }}" class="pc-btn"><i class="fa fa-users"></i> Generate</a>
-      <button class="pc-btn" onclick="imprimerSection('{{ gid }}','{{ pname }}')"><i class="fa fa-print"></i> Imprimer</button>
+      <a class="pc-btn" href="{{ url_for('vouchers_print_view', profile=pname) }}" onclick="if(window.openSection){openSection({{ gid|tojson }});return false;}"><i class="fa fa-external-link"></i> Open</a>
+      <a href="{{ url_for('reseau_creer_comptes') }}?profile={{ pname|urlencode }}" class="pc-btn"><i class="fa fa-users"></i> Generer</a>
+      <a class="pc-btn" href="{{ url_for('vouchers_print_view', profile=pname, print='1') }}" onclick="if(window.imprimerSection){imprimerSection({{ gid|tojson }},{{ pname|tojson }});return false;}"><i class="fa fa-print"></i> Imprimer</a>
     </div>
   </div>
   {% endfor %}
@@ -225,19 +225,35 @@
 
 <script>
 /* ── WiFi name + numérotation écran ── */
+window._savedWifiName = '';
 (function(){
   var inp = document.getElementById('wifi-name-input');
-  var saved = localStorage.getItem('ktm_wifi_name');
-  if(saved) inp.value = saved;
+  // Charger depuis le serveur (persistant par utilisateur/routeur)
+  fetch('/api/wifi-name').then(r=>r.json()).then(d=>{
+    if(d.wifi_name){
+      window._savedWifiName = d.wifi_name;
+      inp.value = d.wifi_name;
+      refreshScreenCards();
+    }
+  }).catch(()=>{});
+
+  var _saveTimer = null;
   inp.addEventListener('input', function(){
-    localStorage.setItem('ktm_wifi_name', inp.value);
     refreshScreenCards();
+    clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(function(){
+      var name = inp.value.trim();
+      if(name){
+        fetch('/api/wifi-name',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':(window._KETAMON_CSRF||'')},body:JSON.stringify({wifi_name:name})}).catch(()=>{});
+      }
+    }, 800);
   });
   refreshScreenCards();
 })();
 
 function getWifiName(){
-  return (document.getElementById('wifi-name-input').value||'').trim() || 'WiFi';
+  var inp = document.getElementById('wifi-name-input');
+  return ((inp && inp.value) || window._savedWifiName || 'WiFi').trim() || 'WiFi';
 }
 
 function refreshScreenCards(){
@@ -252,7 +268,47 @@ function refreshScreenCards(){
   });
 }
 
-function openSection(){ /* sections supprimées */ }
+function openSection(gridId){
+  var el = document.getElementById(gridId);
+  if(!el){ if(typeof afficherNotif==='function') afficherNotif('Section introuvable.','warning'); return; }
+  var cards = Array.from(el.querySelectorAll('.voucher-card'));
+  if(!cards.length){ if(typeof afficherNotif==='function') afficherNotif('Aucun ticket dans cette section.','warning'); return; }
+  var wn = getWifiName();
+  var titre = gridId==='grid-all' ? 'Tous les bons' : gridId.replace('grid-','').replace(/_/g,' ');
+  var previewWindow=window.open('','_blank','width=960,height=750');
+  if(!previewWindow){ alert('Fenetre bloquee par le navigateur. Autoriser les pop-ups pour ce site.'); return; }
+  previewWindow.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>'+_esc(titre)+'</title></head><body style="font-family:Arial,sans-serif;padding:24px">Preparation...</body></html>');
+  previewWindow.document.close();
+  var d=new Date(); var pad=function(n){return n<10?'0'+n:''+n;};
+  var dateStr=pad(d.getDate())+'/'+pad(d.getMonth()+1)+'/'+d.getFullYear()+' '+pad(d.getHours())+':'+pad(d.getMinutes());
+  var css=[
+    '*{box-sizing:border-box;margin:0;padding:0;}',
+    'body{background:#f8fafc;font-family:Arial,sans-serif;padding:10mm;color:#000;}',
+    '.pa-header{display:flex;justify-content:space-between;align-items:baseline;',
+    '  font-size:10px;color:#333;margin-bottom:6mm;font-family:Arial,sans-serif;font-weight:700;',
+    '  border-bottom:1px solid #ccc;padding-bottom:4px;}',
+    '.tkt-table{width:100%;border-collapse:separate;border-spacing:4px 4px;table-layout:fixed;}',
+    '.tkt-cell{border:2.5px solid #000;padding:5px 6px;vertical-align:top;background:#fff;}',
+    '.tkt-cell-empty{border:none;background:transparent;}',
+    '.tkt-hdr{display:flex;justify-content:space-between;align-items:baseline;',
+    '  font-weight:900;font-size:11px;line-height:1.4;font-family:Arial,sans-serif;color:#000;}',
+    '.tkt-hdr-l{flex:1;font-weight:900;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+    '.tkt-hdr-r{font-weight:900;white-space:nowrap;margin-left:3px;}',
+    '.tkt-lbl{font-size:7.5px;font-weight:900;color:#555;font-family:Arial,sans-serif;margin-top:2px;}',
+    '.tkt-code{font-weight:900;font-size:20px;margin-top:2px;white-space:nowrap;overflow:hidden;',
+    '  font-family:"Courier New",monospace;letter-spacing:.03em;color:#000;line-height:1.2;}',
+    '.tkt-info{font-weight:900;font-size:10px;margin-top:2px;font-family:Arial,sans-serif;color:#000;}',
+    '.page-break{page-break-after:always;height:0;}'
+  ].join('');
+  var body='<div class="pa-header"><span>'+dateStr+'</span><span>'+_esc(titre)+' — '+cards.length+' ticket(s)</span></div>'
+    +_buildTable(cards, wn);
+  var w=previewWindow;
+  w.document.open();
+  if(!w){ alert('Fenêtre bloquée par le navigateur. Autoriser les pop-ups pour ce site.'); return; }
+  w.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>'+_esc(titre)+'</title>'
+    +'<style>'+css+'</style></head><body>'+body+'</body></html>');
+  w.document.close();
+}
 
 /* ── Helpers impression ── */
 function _esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -307,6 +363,10 @@ function _doPrint(title, cards){
     return;
   }
   var wn = getWifiName();
+  var printWindow=window.open('','_blank','width=900,height=700');
+  if(!printWindow){ alert('Fenetre bloquee par le navigateur. Autoriser les pop-ups.'); return; }
+  printWindow.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>'+_esc(title)+'</title></head><body style="font-family:Arial,sans-serif;padding:24px">Preparation impression...</body></html>');
+  printWindow.document.close();
   var d = new Date();
   var pad=function(n){return n<10?'0'+n:''+n;};
   var dateStr=pad(d.getDate())+'/'+pad(d.getMonth()+1)+'/'+d.getFullYear()
@@ -332,7 +392,8 @@ function _doPrint(title, cards){
   ].join('');
   var body='<div class="pa-header"><span>'+dateStr+'</span><span>'+_esc(title)+'</span></div>'
     +_buildTable(cards, wn);
-  var w=window.open('','_blank','width=900,height=700');
+  var w=printWindow;
+  w.document.open();
   if(!w){ alert('Fenêtre bloquée par le navigateur. Autoriser les pop-ups.'); return; }
   w.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>'+_esc(title)+'</title>'
     +'<style>'+css+'</style></head><body>'+body
@@ -348,8 +409,88 @@ function imprimerSection(gridId, titre){
 }
 
 function imprimerTout(){
-  var allCards = Array.from(document.querySelectorAll('.voucher-card'));
+  var allCards = Array.from(document.querySelectorAll('#grid-all .voucher-card'));
   _doPrint('Tous les bons', allCards);
 }
+
+/* Version robuste sans popup: fiable sur mobile et navigateurs stricts. */
+function _ensureBonsPreview(){
+  var preview = document.getElementById('bons-preview');
+  if(preview) return preview;
+  preview = document.createElement('div');
+  preview.id = 'bons-preview';
+  preview.className = 'card no-print';
+  preview.style.cssText = 'display:none;margin-top:18px;';
+  preview.innerHTML =
+    '<div class="card-header" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
+    + '<h3 style="margin:0;flex:1"><i class="fa fa-ticket"></i> <span id="bons-preview-title">Bons</span></h3>'
+    + '<button type="button" class="btn btn-sm btn-outline" onclick="imprimerSection(window._bonsPreviewGridId, window._bonsPreviewTitle)">'
+    + '<i class="fa fa-print"></i> Imprimer</button>'
+    + '</div>'
+    + '<div class="card-body"><div id="bons-preview-grid" class="vouchers-grid"></div></div>';
+  var anchor = document.querySelector('.profile-cards') || document.getElementById('print-area') || document.body;
+  anchor.insertAdjacentElement('afterend', preview);
+  return preview;
+}
+
+function _setPrintArea(title, cards){
+  var area = document.getElementById('print-area');
+  if(!area){
+    area = document.createElement('div');
+    area.id = 'print-area';
+    document.body.appendChild(area);
+  }
+  var d = new Date();
+  var pad=function(n){return n<10?'0'+n:''+n;};
+  var dateStr=pad(d.getDate())+'/'+pad(d.getMonth()+1)+'/'+d.getFullYear()
+    +' '+pad(d.getHours())+':'+pad(d.getMinutes());
+  area.innerHTML = '<div class="pa-header"><span>'+dateStr+'</span><span>'+_esc(title)+'</span></div>'
+    + _buildTable(cards, getWifiName());
+}
+
+openSection = function(gridId){
+  var el = document.getElementById(gridId);
+  if(!el){ if(typeof afficherNotif==='function') afficherNotif('Section introuvable.','warning'); return; }
+  var cards = Array.from(el.querySelectorAll('.voucher-card'));
+  if(!cards.length){ if(typeof afficherNotif==='function') afficherNotif('Aucun ticket dans cette section.','warning'); return; }
+  var title = gridId==='grid-all' ? 'Tous les bons' : gridId.replace('grid-','').replace(/_/g,' ');
+  var preview = _ensureBonsPreview();
+  var grid = document.getElementById('bons-preview-grid');
+  grid.innerHTML = '';
+  cards.forEach(function(card, i){
+    var clone = card.cloneNode(true);
+    var wEl = clone.querySelector('.vch-wifi');
+    var nEl = clone.querySelector('.vch-num');
+    if(wEl) wEl.textContent = getWifiName();
+    if(nEl) nEl.textContent = '[' + (i+1) + ']';
+    grid.appendChild(clone);
+  });
+  window._bonsPreviewGridId = gridId;
+  window._bonsPreviewTitle = title;
+  document.getElementById('bons-preview-title').textContent = title + ' - ' + cards.length + ' ticket(s)';
+  preview.style.display = 'block';
+  preview.scrollIntoView({behavior:'smooth', block:'start'});
+};
+
+_doPrint = function(title, cards){
+  if(!cards.length){
+    if(typeof afficherNotif==='function') afficherNotif('Aucun ticket a imprimer.','warning');
+    return;
+  }
+  _setPrintArea(title, cards);
+  setTimeout(function(){ window.print(); }, 60);
+};
+
+imprimerSection = function(gridId, titre){
+  var el = document.getElementById(gridId);
+  if(!el){ if(typeof afficherNotif==='function') afficherNotif('Section introuvable.','warning'); return; }
+  var cards = Array.from(el.querySelectorAll('.voucher-card'));
+  _doPrint(titre || (gridId==='grid-all' ? 'Tous les bons' : gridId), cards);
+};
+
+imprimerTout = function(){
+  var allCards = Array.from(document.querySelectorAll('#grid-all .voucher-card'));
+  _doPrint('Tous les bons', allCards);
+};
 </script>
 {% endblock %}

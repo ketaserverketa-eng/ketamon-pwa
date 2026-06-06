@@ -171,7 +171,7 @@ body{background:#fff;font-family:'Segoe UI',Arial,sans-serif;padding:4mm;color:#
 `;
 
 function _ticketHTML(t, idx){
-  const wifi  = (t.network || 'WIFI').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const wifi  = (t.network || window._savedWifiName || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const code  = t.name.replace(/</g,'&lt;');
   const tl    = (t.time_limit && t.time_limit !== '0') ? ' · '+t.time_limit : '';
   const prof  = (t.profile + tl).replace(/</g,'&lt;');
@@ -197,6 +197,14 @@ function genererEtImprimer(id, btn){
   const orig = btn.innerHTML;
   btn.disabled = true;
   btn.innerHTML = '<i class="fa fa-spinner fa-spin"></i> Génération...';
+  let printWin = null;
+  try{
+    printWin = window.open('', '_blank', 'width=1000,height=700');
+    if(printWin){
+      printWin.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>Generation tickets</title></head><body style="font-family:Arial,sans-serif;padding:24px">Generation des tickets en cours...</body></html>');
+      printWin.document.close();
+    }
+  }catch(e){}
 
   fetch("{{ url_for('quick_print_generer') }}", {
     method: "POST",
@@ -208,11 +216,13 @@ function genererEtImprimer(id, btn){
     btn.disabled = false;
     btn.innerHTML = orig;
     if(!d.ok){
+      if(printWin && !printWin.closed) printWin.close();
       afficherNotif(d.msg || "Erreur de génération.", "danger");
       return;
     }
     const tickets = d.tickets || [];
     if(!tickets.length){
+      if(printWin && !printWin.closed) printWin.close();
       afficherNotif("Aucun ticket généré.", "warning");
       return;
     }
@@ -227,8 +237,9 @@ function genererEtImprimer(id, btn){
       pages += `<div class="print-page"><div class="print-grid">${cells}</div></div>`;
     }
     const pageCount = Math.ceil(tickets.length / CHUNK);
-    const w = window.open('', '_blank', 'width=1000,height=700');
+    const w = printWin || window.open('', '_blank', 'width=1000,height=700');
     if(!w){ afficherNotif("Fenêtre bloquée par le navigateur.", "warning"); return; }
+    w.document.open();
     w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8">
       <title>KetaMon — ${tickets.length} tickets</title>
       <style>${_QP_CSS}</style></head><body>
@@ -244,6 +255,7 @@ function genererEtImprimer(id, btn){
   .catch(() => {
     btn.disabled = false;
     btn.innerHTML = orig;
+    if(printWin && !printWin.closed) printWin.close();
     afficherNotif("Erreur réseau.", "danger");
   });
 }
@@ -269,6 +281,22 @@ function supprimerModele(id, nom){
   );
 }
 
+// Charger + sauvegarder nom WiFi
+window._savedWifiName = '';
+fetch('/api/wifi-name').then(r=>r.json()).then(d=>{
+  if(d.wifi_name){
+    window._savedWifiName = d.wifi_name;
+    var inp = document.getElementById('qp-network');
+    if(inp && !inp.value) inp.value = d.wifi_name;
+  }
+}).catch(()=>{});
+
+function _saveWifiName(name){
+  if(!name) return;
+  window._savedWifiName = name;
+  fetch('/api/wifi-name',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':(window._KETAMON_CSRF||'')},body:JSON.stringify({wifi_name:name})}).catch(()=>{});
+}
+
 function creerModele(){
   const name    = document.getElementById('qp-name').value.trim();
   const profile = document.getElementById('qp-profile').value;
@@ -281,6 +309,7 @@ function creerModele(){
   const network = document.getElementById('qp-network').value.trim();
 
   if(!name){ afficherNotif("Le nom du modèle est requis.", "warning"); return; }
+  if(network) _saveWifiName(network);
 
   fetch("{{ url_for('quick_print_creer') }}", {
     method: "POST",

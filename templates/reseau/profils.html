@@ -44,7 +44,7 @@
           </td>
           <td>{{ p.get('address-pool','-') or '-' }}</td>
           <td class="actions">
-            <button onclick="supprimerProfil('{{ p.get('id','') }}','{{ p.get('name','') }}')"
+            <button onclick="supprimerProfil('{{ p.get('id','') or p.get('.id','') or p.get('name','') }}','{{ p.get('name','') }}')"
               style="background:#7f1d1d;color:#fca5a5;border:none;border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer">
               <i class="fa fa-trash"></i> Supprimer
             </button>
@@ -65,7 +65,7 @@ function supprimerProfil(id, nom){
     "Tous les clients de ce profil seront affectes.",
     () => {
       fetch("{{ url_for('reseau_supprimer_profil') }}", {
-        method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id})
+        method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({id, name: nom})
       }).then(r=>r.json()).then(d=>{
         if(d.ok) location.reload();
         else afficherNotif(d.msg,"danger");
