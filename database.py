@@ -7,6 +7,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -33,6 +34,23 @@ if psycopg is not None:
     DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
 
 _PG_NOW_TEXT = "TO_CHAR(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS')"
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+ALLOW_LEGACY_JSON_IMPORT = _env_truthy(
+    "KETAMON_IMPORT_LEGACY_JSON",
+    default=not USE_POSTGRES,
+)
+
+
+def _boot_log(message: str):
+    print(f"[KETAMON][DB] {message}", flush=True)
 
 
 class CompatRow(dict):
@@ -498,7 +516,16 @@ def get_conn():
             raise RuntimeError(
                 "DATABASE_URL est configure mais le paquet psycopg n'est pas installe."
             )
-        raw_conn = psycopg.connect(_postgres_dsn(), connect_timeout=15)
+        connect_timeout = int(os.environ.get("KETAMON_PG_CONNECT_TIMEOUT", "8"))
+        statement_timeout = int(os.environ.get("KETAMON_PG_STATEMENT_TIMEOUT_MS", "30000"))
+        options = f"-c statement_timeout={statement_timeout} -c lock_timeout={statement_timeout}"
+        _boot_log(f"connexion PostgreSQL en cours (timeout={connect_timeout}s)")
+        raw_conn = psycopg.connect(
+            _postgres_dsn(),
+            connect_timeout=connect_timeout,
+            options=options,
+        )
+        _boot_log("connexion PostgreSQL OK")
         conn = PostgresConnection(raw_conn)
         _local.conn = conn
         return conn
@@ -615,6 +642,9 @@ def _normalize_router(router):
 
 
 def _migrate_legacy_local_users(conn):
+    if not ALLOW_LEGACY_JSON_IMPORT:
+        _boot_log("import users.json ignore en mode PostgreSQL/cloud")
+        return
     if conn.execute("SELECT COUNT(*) FROM local_users").fetchone()[0] > 0:
         return
     users = _load_json_file(LEGACY_USERS_PATH, [])
@@ -638,6 +668,9 @@ def _migrate_legacy_local_users(conn):
 
 
 def _migrate_legacy_routers(conn):
+    if not ALLOW_LEGACY_JSON_IMPORT:
+        _boot_log("import routers.json ignore en mode PostgreSQL/cloud")
+        return
     if conn.execute("SELECT COUNT(*) FROM routers").fetchone()[0] > 0:
         return
     routers = _load_json_file(LEGACY_ROUTERS_PATH, [])
@@ -804,8 +837,11 @@ def _migrate_ventes_v1(conn):
 
 def init_db():
     """Crée les tables si elles n'existent pas."""
+    started = time.monotonic()
+    _boot_log(f"initialisation schema demarree ({'postgres' if USE_POSTGRES else 'sqlite'})")
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = get_conn()
+    _boot_log("creation/verif tables principales")
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS plans (
         id         TEXT PRIMARY KEY,
@@ -970,6 +1006,7 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_agent_incidents_resolved ON agent_incidents(resolved, created_at);
     """)
+    _boot_log("migrations schema complementaires")
     _ensure_subscription_reference_constraint(conn)
     _ensure_hotspot_profile_metadata_columns(conn)
     _ensure_ticket_pricing_columns(conn)
@@ -1060,6 +1097,7 @@ def init_db():
             ]
         )
         conn.commit()
+    _boot_log(f"initialisation schema terminee en {time.monotonic() - started:.2f}s")
 
 
 # ── Plans ─────────────────────────────────────────────────────────────────────
