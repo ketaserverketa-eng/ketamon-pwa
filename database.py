@@ -525,6 +525,10 @@ def get_conn():
             connect_timeout=connect_timeout,
             options=options,
         )
+        # SQLite accepte qu'une migration "ADD COLUMN" echoue sans casser la suite.
+        # En PostgreSQL, une erreur laisse la transaction inutilisable; autocommit
+        # garde ces migrations idempotentes independantes les unes des autres.
+        raw_conn.autocommit = True
         _boot_log("connexion PostgreSQL OK")
         conn = PostgresConnection(raw_conn)
         _local.conn = conn
