@@ -215,6 +215,43 @@ def _escape_psycopg_percent_literals(sql: str):
     return "".join(out)
 
 
+def _quote_postgres_user_identifier(sql: str):
+    """Quote legacy `user` columns for PostgreSQL without touching :user params."""
+    out = []
+    in_single = in_double = False
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+        if ch == "'" and not in_double:
+            out.append(ch)
+            if in_single and nxt == "'":
+                out.append(nxt)
+                i += 2
+                continue
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+        if (
+            not in_single
+            and not in_double
+            and sql[i : i + 4].lower() == "user"
+            and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == "_" or sql[i - 1] == ":"))
+            and (i + 4 >= len(sql) or not (sql[i + 4].isalnum() or sql[i + 4] == "_"))
+        ):
+            out.append('"user"')
+            i += 4
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _translate_postgres_sql(sql: str, params=None):
     translated = str(sql)
     translated = re.sub(
@@ -250,6 +287,7 @@ def _translate_postgres_sql(sql: str, params=None):
               AND a.user=b.user
               AND a.ctid > b.ctid
         """
+    translated = _quote_postgres_user_identifier(translated)
     if isinstance(params, dict):
         translated = _convert_named_placeholders(translated)
     else:
