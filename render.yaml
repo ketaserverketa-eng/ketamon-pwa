@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: ketamon-web
+    name: ketamon-pwa-cloud
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
