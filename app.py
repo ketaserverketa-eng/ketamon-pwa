@@ -9448,6 +9448,13 @@ def concepteur_database():
         stats = st or {}
     if not status:
         is_local = True
+        try:
+            status = db_mod.db_status()
+            stats = db_mod.db_table_stats()
+        except Exception:
+            status = {"connected": False, "uri": "Base de donnees indisponible", "dbName": "", "pingMs": 0}
+            stats = {}
+        return render_template("concepteur/base_de_donnees.html", status=status, stats=stats, is_local=is_local)
         db_path = os.path.join(os.path.dirname(__file__), "data", "ketamon.db")
         db_size = 0
         if os.path.exists(db_path):

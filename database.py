@@ -5,15 +5,395 @@ Gère : plans, abonnements, config paiement.
 import sqlite3
 import json
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timedelta
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+try:
+    import psycopg
+except Exception:  # psycopg is only required when DATABASE_URL is configured.
+    psycopg = None
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 DB_PATH = os.path.join(DATA_DIR, "ketamon.db")
 LEGACY_USERS_PATH = os.path.join(DATA_DIR, "users.json")
 LEGACY_ROUTERS_PATH = os.path.join(DATA_DIR, "routers.json")
 _local  = threading.local()
+DATABASE_URL = (
+    os.environ.get("DATABASE_URL")
+    or os.environ.get("POSTGRES_URL")
+    or os.environ.get("POSTGRESQL_URL")
+    or ""
+).strip()
+USE_POSTGRES = bool(DATABASE_URL)
+DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
+if psycopg is not None:
+    DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
+
+_PG_NOW_TEXT = "TO_CHAR(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS')"
+
+
+class CompatRow(dict):
+    """Small row object compatible with sqlite3.Row key and index access."""
+
+    def __init__(self, keys, values):
+        super().__init__(zip(keys, values))
+        self._values = list(values)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return super().__getitem__(key)
+
+
+class _VirtualCursor:
+    def __init__(self, rows=None, rowcount=-1):
+        self._rows = list(rows or [])
+        self._index = 0
+        self.rowcount = rowcount
+
+    def fetchone(self):
+        if self._index >= len(self._rows):
+            return None
+        row = self._rows[self._index]
+        self._index += 1
+        return row
+
+    def fetchall(self):
+        rows = self._rows[self._index :]
+        self._index = len(self._rows)
+        return rows
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+def _postgres_dsn():
+    dsn = DATABASE_URL
+    if dsn.startswith("postgres://"):
+        dsn = "postgresql://" + dsn[len("postgres://") :]
+    parsed = urlparse(dsn)
+    host = (parsed.hostname or "").lower()
+    is_local = host in {"localhost", "127.0.0.1", "::1"}
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    has_sslmode = any(k.lower() == "sslmode" for k, _ in query)
+    if parsed.scheme.startswith("postgres") and not has_sslmode and not is_local:
+        query.append(("sslmode", os.environ.get("KETAMON_POSTGRES_SSLMODE", "require")))
+        dsn = urlunparse(parsed._replace(query=urlencode(query)))
+    return dsn
+
+
+def _public_database_uri():
+    if not USE_POSTGRES:
+        return f"SQLite local - {DB_PATH}"
+    parsed = urlparse(_postgres_dsn())
+    if parsed.password:
+        safe_netloc = parsed.netloc.replace(f":{parsed.password}@", ":***@")
+        parsed = parsed._replace(netloc=safe_netloc)
+    return urlunparse(parsed)
+
+
+def _split_sql_script(script: str):
+    statements, buf = [], []
+    in_single = in_double = False
+    i = 0
+    while i < len(script):
+        ch = script[i]
+        nxt = script[i + 1] if i + 1 < len(script) else ""
+        if ch == "'" and not in_double:
+            buf.append(ch)
+            if in_single and nxt == "'":
+                buf.append(nxt)
+                i += 2
+                continue
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            buf.append(ch)
+        elif ch == ";" and not in_single and not in_double:
+            stmt = "".join(buf).strip()
+            if stmt:
+                statements.append(stmt)
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def _convert_qmark_placeholders(sql: str):
+    out = []
+    in_single = in_double = False
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+        if ch == "'" and not in_double:
+            out.append(ch)
+            if in_single and nxt == "'":
+                out.append(nxt)
+                i += 2
+                continue
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+        elif ch == "?" and not in_single and not in_double:
+            out.append("%s")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _convert_named_placeholders(sql: str):
+    out = []
+    in_single = in_double = False
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+        if ch == "'" and not in_double:
+            out.append(ch)
+            if in_single and nxt == "'":
+                out.append(nxt)
+                i += 2
+                continue
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+        if (
+            ch == ":"
+            and not in_single
+            and not in_double
+            and nxt
+            and (nxt.isalpha() or nxt == "_")
+        ):
+            j = i + 1
+            while j < len(sql) and (sql[j].isalnum() or sql[j] == "_"):
+                j += 1
+            name = sql[i + 1 : j]
+            out.append(f"%({name})s")
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _escape_psycopg_percent_literals(sql: str):
+    out = []
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        if ch != "%":
+            out.append(ch)
+            i += 1
+            continue
+        if sql.startswith("%s", i):
+            out.append("%s")
+            i += 2
+            continue
+        if sql.startswith("%(", i):
+            end = sql.find(")s", i + 2)
+            if end != -1:
+                out.append(sql[i : end + 2])
+                i = end + 2
+                continue
+        out.append("%%")
+        i += 1
+    return "".join(out)
+
+
+def _translate_postgres_sql(sql: str, params=None):
+    translated = str(sql)
+    translated = re.sub(
+        r"datetime\(\s*'now'\s*(?:,\s*'localtime'\s*)?\)",
+        _PG_NOW_TEXT,
+        translated,
+        flags=re.IGNORECASE,
+    )
+    translated = re.sub(
+        r"\bINSERT\s+OR\s+IGNORE\s+INTO\b",
+        "INSERT INTO",
+        translated,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if re.search(r"^\s*INSERT\s+INTO\b", translated, flags=re.IGNORECASE) and re.search(
+        r"\bOR\s+IGNORE\b", str(sql), flags=re.IGNORECASE
+    ):
+        translated = translated.rstrip().rstrip(";")
+        if not re.search(r"\bON\s+CONFLICT\b", translated, flags=re.IGNORECASE):
+            translated += " ON CONFLICT DO NOTHING"
+    translated = re.sub(
+        r"\bALTER\s+TABLE\s+(\S+)\s+ADD\s+COLUMN\s+(?!IF\s+NOT\s+EXISTS\b)",
+        r"ALTER TABLE \1 ADD COLUMN IF NOT EXISTS ",
+        translated,
+        flags=re.IGNORECASE,
+    )
+    if re.search(r"DELETE\s+FROM\s+ventes\s+WHERE\s+rowid\s+NOT\s+IN", translated, flags=re.IGNORECASE | re.DOTALL):
+        translated = """
+            DELETE FROM ventes a
+            USING ventes b
+            WHERE a.router_id=b.router_id
+              AND a.user=b.user
+              AND a.ctid > b.ctid
+        """
+    if isinstance(params, dict):
+        translated = _convert_named_placeholders(translated)
+    else:
+        translated = _convert_qmark_placeholders(translated)
+    translated = _escape_psycopg_percent_literals(translated)
+    return translated, params
+
+
+class PostgresCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    def _columns(self):
+        return [
+            getattr(col, "name", col[0] if col else "")
+            for col in (self._cursor.description or [])
+        ]
+
+    def _wrap(self, row):
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return CompatRow(list(row.keys()), list(row.values()))
+        return CompatRow(self._columns(), row)
+
+    def fetchone(self):
+        return self._wrap(self._cursor.fetchone())
+
+    def fetchall(self):
+        return [self._wrap(row) for row in self._cursor.fetchall()]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class PostgresConnection:
+    def __init__(self, conn):
+        self._conn = conn
+        self.total_changes = 0
+
+    def _ensure_meta(self):
+        with self._conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ketamon_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            cur.execute("""
+                INSERT INTO ketamon_meta(key, value)
+                VALUES('user_version', '0')
+                ON CONFLICT(key) DO NOTHING
+            """)
+
+    def _execute_pragma(self, sql: str):
+        text = " ".join(str(sql).strip().split())
+        table_match = re.match(r"PRAGMA\s+table_info\(([^)]+)\)", text, flags=re.IGNORECASE)
+        if table_match:
+            table = table_match.group(1).strip().strip('"').strip("'")
+            with self._conn.cursor() as cur:
+                cur.execute("""
+                    SELECT column_name, data_type, is_nullable, column_default
+                    FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name=%s
+                    ORDER BY ordinal_position
+                """, (table,))
+                rows = []
+                for idx, (name, data_type, nullable, default) in enumerate(cur.fetchall()):
+                    rows.append(CompatRow(
+                        ["cid", "name", "type", "notnull", "dflt_value", "pk"],
+                        [idx, name, data_type, 1 if nullable == "NO" else 0, default, 0],
+                    ))
+                return _VirtualCursor(rows)
+        version_set = re.match(r"PRAGMA\s+user_version\s*=\s*(\d+)", text, flags=re.IGNORECASE)
+        if version_set:
+            self._ensure_meta()
+            with self._conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO ketamon_meta(key, value)
+                    VALUES('user_version', %s)
+                    ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
+                """, (version_set.group(1),))
+            return _VirtualCursor(rowcount=1)
+        if re.match(r"PRAGMA\s+user_version\b", text, flags=re.IGNORECASE):
+            self._ensure_meta()
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT value FROM ketamon_meta WHERE key='user_version'")
+                row = cur.fetchone()
+            version = int(row[0] if row else 0)
+            return _VirtualCursor([CompatRow(["user_version"], [version])])
+        return _VirtualCursor([])
+
+    def execute(self, sql, params=None):
+        if str(sql).strip().upper().startswith("PRAGMA"):
+            return self._execute_pragma(sql)
+        translated, translated_params = _translate_postgres_sql(sql, params)
+        cur = self._conn.cursor()
+        if translated_params is None:
+            cur.execute(translated)
+        else:
+            cur.execute(translated, translated_params)
+        if cur.rowcount and cur.rowcount > 0:
+            self.total_changes += cur.rowcount
+        return PostgresCursor(cur)
+
+    def executemany(self, sql, seq_of_params):
+        rows = list(seq_of_params or [])
+        if not rows:
+            return _VirtualCursor(rowcount=0)
+        translated, _ = _translate_postgres_sql(sql, rows[0])
+        cur = self._conn.cursor()
+        cur.executemany(translated, rows)
+        if cur.rowcount and cur.rowcount > 0:
+            self.total_changes += cur.rowcount
+        return PostgresCursor(cur)
+
+    def executescript(self, script):
+        last = _VirtualCursor([])
+        for statement in _split_sql_script(script):
+            last = self.execute(statement)
+        return last
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type:
+            self.rollback()
+        else:
+            self.commit()
+        return False
 
 
 class DuplicateReferenceError(ValueError):
@@ -74,6 +454,16 @@ def get_conn():
             except Exception:
                 pass
             _local.conn = None
+
+    if USE_POSTGRES:
+        if psycopg is None:
+            raise RuntimeError(
+                "DATABASE_URL est configure mais le paquet psycopg n'est pas installe."
+            )
+        raw_conn = psycopg.connect(_postgres_dsn(), connect_timeout=15)
+        conn = PostgresConnection(raw_conn)
+        _local.conn = conn
+        return conn
 
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -636,6 +1026,55 @@ def init_db():
 
 # ── Plans ─────────────────────────────────────────────────────────────────────
 
+def db_backend_name() -> str:
+    return "postgres" if USE_POSTGRES else "sqlite"
+
+
+def db_status() -> dict:
+    conn = get_conn()
+    conn.execute("SELECT 1")
+    return {
+        "connected": True,
+        "backend": db_backend_name(),
+        "uri": _public_database_uri(),
+        "dbName": urlparse(_postgres_dsn()).path.lstrip("/") if USE_POSTGRES else os.path.basename(DB_PATH),
+        "pingMs": 0,
+    }
+
+
+def db_table_stats() -> dict:
+    conn = get_conn()
+    collections = []
+    if USE_POSTGRES:
+        rows = conn.execute("""
+            SELECT table_name AS name
+            FROM information_schema.tables
+            WHERE table_schema='public' AND table_type='BASE TABLE'
+            ORDER BY table_name
+        """).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+    for row in rows:
+        try:
+            tname = str(row["name"])
+        except Exception:
+            tname = str(row[0])
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tname):
+            continue
+        cnt = conn.execute(f'SELECT COUNT(*) FROM "{tname}"').fetchone()[0]
+        collections.append({"name": tname, "count": int(cnt or 0), "size": "-"})
+    total_size = "-"
+    if not USE_POSTGRES:
+        try:
+            db_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+            total_size = f"{db_size // 1024} KB" if db_size < 1024 * 1024 else f"{db_size // (1024 * 1024)} MB"
+        except Exception:
+            total_size = "-"
+    return {"collections": collections, "totalSize": total_size}
+
+
 def db_get_local_users():
     conn = get_conn()
     return [
@@ -676,8 +1115,13 @@ def db_insert_local_user(user: dict):
         """, record)
         conn.commit()
         return db_get_local_user(record["id"])
-    except sqlite3.IntegrityError as exc:
-        if "local_users.username" in str(exc) or "local_users.email" in str(exc):
+    except DB_INTEGRITY_ERRORS as exc:
+        if (
+            "local_users.username" in str(exc)
+            or "local_users.email" in str(exc)
+            or "uq_local_users_username" in str(exc)
+            or "uq_local_users_email_nonempty" in str(exc)
+        ):
             raise DuplicateLocalUserError(record["username"] or record["email"]) from exc
         raise
 
@@ -1352,8 +1796,11 @@ def db_insert_subscription(sub: dict):
              :demande_le,:active_le,:expire_le)
         """, {**sub, "reference": reference, "fraude_flags": json.dumps(flags)})
         conn.commit()
-    except sqlite3.IntegrityError as exc:
-        if reference and "subscriptions.reference" in str(exc):
+    except DB_INTEGRITY_ERRORS as exc:
+        if reference and (
+            "subscriptions.reference" in str(exc)
+            or "uq_subscriptions_reference_nonempty" in str(exc)
+        ):
             raise DuplicateReferenceError(reference) from exc
         raise
 

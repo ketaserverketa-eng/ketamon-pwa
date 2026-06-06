@@ -15,3 +15,7 @@ services:
         value: "100"
       - key: KETAMON_TICKET_BATCH_PAUSE
         value: "0.05"
+      - key: KETAMON_POSTGRES_SSLMODE
+        value: require
+      - key: DATABASE_URL
+        sync: false
