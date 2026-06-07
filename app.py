@@ -1755,6 +1755,15 @@ def get_hotspot_profile_metadata_map(router_id):
     for row in metadata_rows:
         profile_name = str(row.get("profile_name") or "").strip()
         if profile_name:
+            inferred_time = _infer_time_limit_from_profile_name(profile_name)
+            stored_time = str(row.get("time_limit") or "").strip().lower()
+            if inferred_time and stored_time in {"", "0", "0s", "none"}:
+                row = dict(row)
+                row["time_limit"] = inferred_time
+                if str(row.get("expire_mode") or "").strip().lower() in {"", "none"}:
+                    row["expire_mode"] = "remove and record"
+                if str(row.get("lock_user") or "").strip().lower() in {"", "no", "false", "0"}:
+                    row["lock_user"] = "yes"
             mapping[profile_name] = row
     return mapping
 
@@ -1989,6 +1998,142 @@ def _relay_snapshot_rows_from_db(router_id, resource):
         return [dict(row) for row in rows if isinstance(row, dict)]
     except Exception:
         return []
+
+
+def _nonzero_time_limit(value):
+    text = str(value or "").strip()
+    return bool(text and text.lower() not in {"0", "0s", "none"})
+
+
+def _sync_relay_profile_metadata(router_id, profile_rows):
+    router_id = str(router_id or "").strip()
+    if not router_id:
+        return 0
+    synced = 0
+    for profile_row in profile_rows or []:
+        row = dict(profile_row or {})
+        profile_name = str(row.get("name") or "").strip()
+        if not profile_name:
+            continue
+        parsed = parse_profile_comment_metadata(row)
+        existing = db_mod.db_get_hotspot_profile_metadata(router_id, profile_name) or {}
+        inferred_time = _infer_time_limit_from_profile_name(profile_name)
+        existing_time = str(existing.get("time_limit") or "").strip()
+        parsed_time = str(parsed.get("time_limit") or "").strip()
+        if _nonzero_time_limit(parsed_time):
+            time_limit = parsed_time
+        elif _nonzero_time_limit(existing_time):
+            time_limit = existing_time
+        elif inferred_time:
+            time_limit = inferred_time
+        else:
+            time_limit = existing_time or "0"
+
+        price = str(parsed.get("price") if parsed.get("price") is not None else existing.get("price") or "0").strip() or "0"
+        currency = str(parsed.get("currency") or existing.get("currency") or "FCFA").strip() or "FCFA"
+        expire_mode = str(parsed.get("expire_mode") or existing.get("expire_mode") or "").strip()
+        if not expire_mode or (expire_mode.lower() == "none" and inferred_time):
+            expire_mode = "remove and record" if inferred_time else "none"
+        lock_user = str(parsed.get("lock_user") or existing.get("lock_user") or row.get("add-mac-cookie") or "").strip()
+        if not lock_user or (lock_user.lower() in {"no", "false", "0"} and inferred_time):
+            lock_user = "yes" if inferred_time else "no"
+        try:
+            db_mod.db_upsert_hotspot_profile_metadata(
+                router_id,
+                profile_name,
+                price=price,
+                currency=currency,
+                expire_mode=expire_mode,
+                lock_user=lock_user,
+                time_limit=time_limit,
+            )
+            synced += 1
+        except Exception:
+            continue
+    return synced
+
+
+def _sync_relay_ticket_pricing_from_users(router_id, user_rows):
+    router_id = str(router_id or "").strip()
+    if not router_id:
+        return 0
+    metadata_map = get_hotspot_profile_metadata_map(router_id)
+    conn = db_mod.get_conn()
+    existing_rows = conn.execute(
+        "SELECT user, prix, profil FROM ticket_pricing WHERE router_id=?",
+        (router_id,),
+    ).fetchall()
+    existing = {
+        str(row["user"] or "").strip(): {
+            "prix": float(row["prix"] or 0),
+            "profil": str(row["profil"] or "").strip(),
+        }
+        for row in existing_rows
+        if str(row["user"] or "").strip()
+    }
+    batch = []
+    for user_row in user_rows or []:
+        row = dict(user_row or {})
+        username = str(row.get("name") or "").strip()
+        if not username:
+            continue
+        profile = str(row.get("profile") or "").strip() or "default"
+        meta = metadata_map.get(profile, {})
+        try:
+            meta_price = float(str(meta.get("price") or "0").strip() or 0)
+        except Exception:
+            meta_price = 0.0
+        old = existing.get(username)
+        if old and old.get("profil") and (old.get("prix") or 0) > 0:
+            continue
+        if old and old.get("profil") == profile and (old.get("prix") or 0) == meta_price:
+            continue
+        batch.append({
+            "router_id": router_id,
+            "user": username,
+            "password": row.get("password") or username,
+            "prix": meta_price,
+            "devise": meta.get("currency") or "FCFA",
+            "profil": profile,
+            "reseau": row.get("server") or "",
+        })
+    if not batch:
+        return 0
+    db_mod.db_batch_upsert_ticket_pricing(batch)
+    return len(batch)
+
+
+def _sync_relay_snapshot_database(router_id, resources):
+    resources = resources if isinstance(resources, dict) else {}
+    profile_rows = resources.get("/ip/hotspot/user/profile") or []
+    user_rows = resources.get("/ip/hotspot/user") or []
+    profiles = _sync_relay_profile_metadata(router_id, profile_rows)
+    tickets = _sync_relay_ticket_pricing_from_users(router_id, user_rows)
+    return {"profiles": profiles, "tickets": tickets}
+
+
+def _profile_metadata_map_for_display(router_id, profiles):
+    metadata_map = get_hotspot_profile_metadata_map(router_id)
+    for profile in profiles or []:
+        profile_row = dict(profile or {})
+        name = str(profile_row.get("name") or "").strip()
+        if not name:
+            continue
+        normalized = normalize_hotspot_profile(profile_row, metadata_map.get(name, {}))
+        meta = dict(metadata_map.get(name, {}) or {})
+        meta.setdefault("profile_name", name)
+        if not _nonzero_time_limit(meta.get("time_limit")) and _nonzero_time_limit(normalized.get("time-limit")):
+            meta["time_limit"] = normalized.get("time-limit")
+        else:
+            meta["time_limit"] = meta.get("time_limit") or normalized.get("time-limit") or "0"
+        meta["price"] = meta.get("price") or normalized.get("price") or "0"
+        meta["currency"] = meta.get("currency") or normalized.get("currency") or "FCFA"
+        if str(meta.get("expire_mode") or "").strip().lower() in {"", "none"}:
+            meta["expire_mode"] = normalized.get("expire-mode") or "none"
+        if str(meta.get("lock_user") or "").strip().lower() in {"", "no", "false", "0"}:
+            meta["lock_user"] = normalized.get("add-mac-cookie") or "no"
+        metadata_map[name] = meta
+    return metadata_map
 
 
 def _relay_expired_cleanup_source(expired_rows):
@@ -2541,7 +2686,10 @@ agent_mod.start()
 
 def get_profile_time_limit(router_id, profile_name):
     metadata = db_mod.db_get_hotspot_profile_metadata(router_id, profile_name) or {}
-    return normalize_profile_time_limit(metadata.get("time_limit"))
+    stored_time = normalize_profile_time_limit(metadata.get("time_limit"))
+    if stored_time and stored_time.lower() not in {"0", "0s", "none"}:
+        return stored_time
+    return _infer_time_limit_from_profile_name(profile_name) or stored_time
 
 
 def resolve_ticket_time_limit(router_id, profile_name, requested_time_limit):
@@ -2863,6 +3011,15 @@ def normalize_hotspot_profile(profile, metadata=None):
     meta = dict(metadata or {})
     if not meta:
         meta = parse_profile_comment_metadata(row)
+    profile_name = str(row.get("name") or meta.get("profile_name") or "").strip()
+    inferred_time = _infer_time_limit_from_profile_name(profile_name)
+    meta_time = str(meta.get("time_limit") or "").strip()
+    if inferred_time and meta_time.lower() in {"", "0", "0s", "none"}:
+        meta["time_limit"] = inferred_time
+        if str(meta.get("expire_mode") or "").strip().lower() in {"", "none"}:
+            meta["expire_mode"] = "remove and record"
+        if str(meta.get("lock_user") or "").strip().lower() in {"", "no", "false", "0"}:
+            meta["lock_user"] = "yes"
     if meta.get("expire_mode"):
         row["expire-mode"] = meta.get("expire_mode")
     if meta.get("lock_user"):
@@ -5083,7 +5240,7 @@ def vouchers():
             _flash_err("Erreur lors du chargement des utilisateurs.", e)
         if not profiles and vouchers_data:
             profiles = [{"name": k} for k in vouchers_data]
-        profiles_meta = get_hotspot_profile_metadata_map(router_id)
+        profiles_meta = _profile_metadata_map_for_display(router_id, profiles)
     return render_template("vouchers.html", profiles=profiles, vouchers_data=vouchers_data,
                            profiles_meta=profiles_meta)
 
@@ -5104,7 +5261,11 @@ def vouchers_print_view():
     router = get_active_router() or {}
     selected_profile = (request.args.get("profile", "all") or "all").strip()
     auto_print = str(request.args.get("print", "")).lower() in {"1", "true", "yes", "on"}
-    profiles_meta = get_hotspot_profile_metadata_map(router_id)
+    try:
+        profile_rows_for_meta = api.get_resource("/ip/hotspot/user/profile").get()
+    except Exception:
+        profile_rows_for_meta = []
+    profiles_meta = _profile_metadata_map_for_display(router_id, profile_rows_for_meta)
     cards = []
 
     try:
@@ -5859,10 +6020,12 @@ def api_relay_snapshot():
         resources = _parse_relay_snapshot_text(request.get_data(as_text=True))
     saved = db_mod.db_upsert_router_relay_snapshots(router["id"], resources)
     db_mod.db_touch_router_relay(router["id"], "snapshot")
+    synced = _sync_relay_snapshot_database(router["id"], resources)
     expiry = _enforce_relay_snapshot_expirations(router)
     return jsonify({
         "ok": True,
         "saved": saved,
+        "synced": synced,
         "router_id": router["id"],
         "expiry": expiry,
         "server_time": datetime.now().isoformat(),
