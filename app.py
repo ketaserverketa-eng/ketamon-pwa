@@ -684,19 +684,33 @@ def _get_requested_router(payload=None):
         return active_router
     return routers[0]
 
-def local_register(email, password, display_name=None):
-    """Enregistre un utilisateur local dans SQLite. Retourne user dict."""
+def _local_concepteur_exists() -> bool:
+    """Retourne True si un compte concepteur/admin actif existe deja."""
     try:
+        for user in db_mod.db_get_local_users():
+            role = str(user.get("role") or "").strip().lower()
+            if role in {"admin", "concepteur"} and _local_user_is_approved(user) and _local_user_is_active(user):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def local_register(email, password, display_name=None):
+    """Enregistre un utilisateur local dans la base. Retourne user dict."""
+    try:
+        bootstrap_owner = not _local_concepteur_exists()
         user = db_mod.db_upsert_local_email_user(
             email,
             password_hash=generate_password_hash(password),
             display_name=display_name or email,
-            role="utilisateur",
-            approved=0,
-            disabled=1,
+            role="concepteur" if bootstrap_owner else "utilisateur",
+            approved=1 if bootstrap_owner else 0,
+            disabled=0 if bootstrap_owner else 1,
         )
         if user:
             user["displayName"] = user.get("display_name") or user.get("displayName") or email
+            user["_bootstrap_owner"] = bool(bootstrap_owner)
         return user
     except db_mod.DuplicateLocalUserError:
         return None
@@ -3521,12 +3535,32 @@ def login():
                 flash("Mot de passe min. 8 caracteres.", "danger")
             else:
                 existing_local = db_mod.db_get_local_user(email)
-                if existing_local and _local_user_is_approved(existing_local) and _local_user_is_active(existing_local):
+                if (
+                    existing_local
+                    and _local_concepteur_exists()
+                    and _local_user_is_approved(existing_local)
+                    and _local_user_is_active(existing_local)
+                ):
                     flash("Ce compte Gmail existe deja. Connectez-vous.", "warning")
                     tpl_vars["submode"] = "login"
                     return render_template("login.html", **tpl_vars)
 
                 shadow = local_register(email, password, display)
+                if shadow and shadow.get("_bootstrap_owner"):
+                    _clear_login_failures()
+                    session.permanent = True
+                    session.update({
+                        "logged_in": True,
+                        "ks_token": None,
+                        "ks_refresh_token": None,
+                        "username": shadow.get("displayName") or email,
+                        "role": shadow.get("role", "concepteur"),
+                        "user_id": shadow.get("email") or email,
+                        "auth_source": "local",
+                    })
+                    flash("Compte concepteur cloud cree. Vous pouvez maintenant activer les autres comptes.", "success")
+                    return redirect(url_for("index"))
+
                 resp, err = ks_post("/api/auth/register",
                                     {"email": email, "password": password, "displayName": display})
                 if not shadow:
