@@ -52,6 +52,11 @@
         <input type="hidden" name="action" value="queue_ping">
         <button class="btn btn-primary" type="submit"><i class="fa fa-paper-plane"></i> Envoyer test ping</button>
       </form>
+      <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="queue_upgrade">
+        <button class="btn btn-warning" type="submit"><i class="fa fa-wrench"></i> Forcer mise a jour relais</button>
+      </form>
     </div>
 
     {% if router.get('relay_token') %}
@@ -62,6 +67,7 @@
     </p>
     <div class="info-box">
       Si les commandes restent <strong>queued</strong>, cela veut dire que le MikroTik n'a pas encore installe ou lance le relais.
+      Le bouton <strong>Forcer mise a jour relais</strong> repousse le script universel actuel sans changer le token du routeur.
     </div>
     <label>URL du script .rsc</label>
     <input class="form-control" readonly value="{{ install_url }}" style="font-family:Consolas,monospace">

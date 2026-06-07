@@ -6515,6 +6515,22 @@ def router_relay_settings(rid):
             else:
                 db_mod.db_enqueue_router_relay_command(rid, router.get("owner_id", ""), "ping", {"from": "web"})
                 flash("Commande test envoyee. Le MikroTik la prendra au prochain polling.", "success")
+        elif action == "queue_upgrade":
+            router = db_mod.db_get_router(rid, owner_id)
+            token = str((router or {}).get("relay_token") or "").strip()
+            if not int((router or {}).get("relay_enabled") or 0) or not token:
+                flash("Activez d'abord le relais cloud pour ce routeur.", "warning")
+            else:
+                command = db_mod.db_enqueue_router_relay_command(
+                    rid,
+                    router.get("owner_id", ""),
+                    "routeros-script",
+                    {"source": _relay_auto_upgrade_source(token), "from": "web-force-upgrade"},
+                )
+                if command:
+                    flash("Mise a jour relais envoyee. Le MikroTik l'appliquera au prochain polling.", "success")
+                else:
+                    flash("Impossible de creer la commande de mise a jour relais.", "danger")
         return redirect(url_for("router_relay_settings", rid=rid))
 
     router = db_mod.db_get_router(rid, owner_id)
