@@ -6349,6 +6349,7 @@ def _build_routeros_relay_script(base_url, token):
         "# KetaMon Cloud Relay - polling + real snapshot",
         "/system script remove [find name=\"ketamon-relay-poll\"]",
         "/system scheduler remove [find name=\"ketamon-relay-poll\"]",
+        "/system scheduler remove [find name=\"ketamon-relay-watchdog\"]",
         "/system script add name=\"ketamon-relay-poll\" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon source={",
         "  :global ktmEsc do={",
         "    :local v [:tostr $1];",
@@ -6389,8 +6390,9 @@ def _build_routeros_relay_script(base_url, token):
         "  /file remove [find name=\"ketamon-relay-next.rsc\"];",
         "}",
         "/system scheduler add name=\"ketamon-relay-poll\" interval=30s on-event=\"/system script run ketamon-relay-poll\" disabled=no",
+        "/system scheduler add name=\"ketamon-relay-watchdog\" interval=2m on-event=\":do { /system script run ketamon-relay-poll; } on-error={}\" disabled=no",
         ":delay 2s",
-        "/system script run ketamon-relay-poll",
+        ":do { /system script run ketamon-relay-poll; } on-error={}",
     ])
 
 
@@ -6411,6 +6413,7 @@ def _build_routeros_relay_script(base_url, token):
         "# KetaMon Cloud Relay - safe snapshots by resource",
         "/system script remove [find name=\"ketamon-relay-poll\"]",
         "/system scheduler remove [find name=\"ketamon-relay-poll\"]",
+        "/system scheduler remove [find name=\"ketamon-relay-watchdog\"]",
         "/system script add name=\"ketamon-relay-poll\" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon source={",
         "  :global ktmEsc do={",
         "    :local v [:tostr $1];",
@@ -6462,8 +6465,9 @@ def _build_routeros_relay_script(base_url, token):
         "  }",
         "}",
         "/system scheduler add name=\"ketamon-relay-poll\" interval=30s on-event=\"/system script run ketamon-relay-poll\" disabled=no",
+        "/system scheduler add name=\"ketamon-relay-watchdog\" interval=2m on-event=\":do { /system script run ketamon-relay-poll; } on-error={}\" disabled=no",
         ":delay 2s",
-        "/system script run ketamon-relay-poll",
+        ":do { /system script run ketamon-relay-poll; } on-error={}",
     ])
 
 
