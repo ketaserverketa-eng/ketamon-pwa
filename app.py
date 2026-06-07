@@ -2139,6 +2139,32 @@ def _relay_auto_upgrade_source(token):
     ])
 
 
+def _fresh_relay_snapshot_count(snapshots, resource, fallback=0, max_age_seconds=600):
+    try:
+        fallback = int(fallback or 0)
+    except Exception:
+        fallback = 0
+    if not isinstance(snapshots, dict):
+        return fallback
+    meta = snapshots.get(resource)
+    if not isinstance(meta, dict):
+        return fallback
+    rows = meta.get("data")
+    if not isinstance(rows, list):
+        return fallback
+    updated_at = str(meta.get("updated_at") or "")
+    if updated_at and max_age_seconds:
+        try:
+            updated_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            if updated_dt.tzinfo is not None:
+                updated_dt = updated_dt.replace(tzinfo=None)
+            if (datetime.now() - updated_dt).total_seconds() > int(max_age_seconds):
+                return fallback
+        except Exception:
+            pass
+    return len(rows)
+
+
 def _maybe_queue_relay_auto_upgrade(router, token, counts):
     router = dict(router or {})
     router_id = str(router.get("id") or "").strip()
@@ -2147,9 +2173,18 @@ def _maybe_queue_relay_auto_upgrade(router, token, counts):
     profile_count = int((counts or {}).get("/ip/hotspot/user/profile") or 0)
     user_count = int((counts or {}).get("/ip/hotspot/user") or 0)
     active_count = int((counts or {}).get("/ip/hotspot/active") or 0)
-    # Un MikroTik Hotspot a au minimum le profil default. Si profiles=0,
-    # ou si des sessions actives existent sans lignes user, le relais est ancien/incomplet.
-    if profile_count > 0 and (user_count > 0 or active_count == 0):
+    try:
+        snapshots = db_mod.db_get_router_relay_snapshot(router_id)
+        profile_count = _fresh_relay_snapshot_count(snapshots, "/ip/hotspot/user/profile", profile_count)
+        user_count = _fresh_relay_snapshot_count(snapshots, "/ip/hotspot/user", user_count)
+        active_count = _fresh_relay_snapshot_count(snapshots, "/ip/hotspot/active", active_count)
+    except Exception:
+        pass
+    # On met a jour seulement quand le snapshot prouve que le relais est incomplet:
+    # sessions actives presentes mais aucun ticket/profil remonte.
+    incomplete_user_snapshot = active_count > 0 and user_count == 0
+    incomplete_profile_snapshot = active_count > 0 and profile_count == 0
+    if not (incomplete_user_snapshot or incomplete_profile_snapshot):
         return False
     now = time.time()
     last = float(_RELAY_AUTO_UPGRADE_LAST.get(router_id) or 0)
@@ -2162,7 +2197,8 @@ def _maybe_queue_relay_auto_upgrade(router, token, counts):
         "routeros-script",
         {"source": source},
     )
-    _RELAY_AUTO_UPGRADE_LAST[router_id] = now
+    if command:
+        _RELAY_AUTO_UPGRADE_LAST[router_id] = now
     return bool(command)
 
 
@@ -6318,7 +6354,7 @@ def _build_routeros_relay_script(base_url, token):
         "  :do { :set payload ($payload . \"R=/system/clock|time=\" . [$ktmEsc [/system clock get time]] . \"|date=\" . [$ktmEsc [/system clock get date]] . $NL); } on-error={};",
         "  :do { :set payload ($payload . \"R=/system/routerboard|model=\" . [$ktmEsc [/system routerboard get model]] . $NL); } on-error={};",
         "  :do { :foreach i in=[/ip hotspot print as-value] do={ :set payload ($payload . \"R=/ip/hotspot|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|interface=\" . [$ktmEsc ($i->\"interface\")] . \"|address-pool=\" . [$ktmEsc ($i->\"address-pool\")] . \"|profile=\" . [$ktmEsc ($i->\"profile\")] . $NL); } } on-error={};",
-        "  :do { :foreach i in=[/ip hotspot user print as-value] do={ :set payload ($payload . \"R=/ip/hotspot/user|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|password=\" . [$ktmEsc ($i->\"password\")] . \"|profile=\" . [$ktmEsc ($i->\"profile\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|limit-uptime=\" . [$ktmEsc ($i->\"limit-uptime\")] . \"|uptime=\" . [$ktmEsc ($i->\"uptime\")] . \"|bytes-in=\" . [$ktmEsc ($i->\"bytes-in\")] . \"|bytes-out=\" . [$ktmEsc ($i->\"bytes-out\")] . \"|limit-bytes-total=\" . [$ktmEsc ($i->\"limit-bytes-total\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|comment=\" . [$ktmEsc ($i->\"comment\")] . $NL); } } on-error={};",
+        "  :do { :foreach i in=[/ip hotspot user print as-value] do={ :set payload ($payload . \"R=/ip/hotspot/user|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|profile=\" . [$ktmEsc ($i->\"profile\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|limit-uptime=\" . [$ktmEsc ($i->\"limit-uptime\")] . \"|uptime=\" . [$ktmEsc ($i->\"uptime\")] . \"|bytes-in=\" . [$ktmEsc ($i->\"bytes-in\")] . \"|bytes-out=\" . [$ktmEsc ($i->\"bytes-out\")] . \"|limit-bytes-total=\" . [$ktmEsc ($i->\"limit-bytes-total\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|comment=\" . [$ktmEsc ($i->\"comment\")] . $NL); } } on-error={};",
         "  :do { :foreach i in=[/ip hotspot user profile print as-value] do={ :set payload ($payload . \"R=/ip/hotspot/user/profile|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|rate-limit=\" . [$ktmEsc ($i->\"rate-limit\")] . \"|shared-users=\" . [$ktmEsc ($i->\"shared-users\")] . \"|address-pool=\" . [$ktmEsc ($i->\"address-pool\")] . \"|session-timeout=\" . [$ktmEsc ($i->\"session-timeout\")] . \"|idle-timeout=\" . [$ktmEsc ($i->\"idle-timeout\")] . \"|keepalive-timeout=\" . [$ktmEsc ($i->\"keepalive-timeout\")] . \"|mac-cookie-timeout=\" . [$ktmEsc ($i->\"mac-cookie-timeout\")] . \"|add-mac-cookie=\" . [$ktmEsc ($i->\"add-mac-cookie\")] . $NL); } } on-error={};",
         "  :do { :foreach i in=[/ip hotspot active print as-value] do={ :set payload ($payload . \"R=/ip/hotspot/active|.id=\" . [$ktmEsc ($i->\".id\")] . \"|user=\" . [$ktmEsc ($i->\"user\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|uptime=\" . [$ktmEsc ($i->\"uptime\")] . \"|session-time-left=\" . [$ktmEsc ($i->\"session-time-left\")] . \"|bytes-in=\" . [$ktmEsc ($i->\"bytes-in\")] . \"|bytes-out=\" . [$ktmEsc ($i->\"bytes-out\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|login-by=\" . [$ktmEsc ($i->\"login-by\")] . $NL); } } on-error={};",
         "  :do { :foreach i in=[/ip hotspot host print as-value] do={ :set payload ($payload . \"R=/ip/hotspot/host|.id=\" . [$ktmEsc ($i->\".id\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|to-address=\" . [$ktmEsc ($i->\"to-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|authorized=\" . [$ktmEsc ($i->\"authorized\")] . \"|blocked=\" . [$ktmEsc ($i->\"blocked\")] . $NL); } } on-error={};",
@@ -6390,7 +6426,7 @@ def _build_routeros_relay_script(base_url, token):
         "  :do { :foreach aid in=[/ip hotspot active find] do={ :local user [/ip hotspot active get $aid user]; :local addr [/ip hotspot active get $aid address]; :local mac [/ip hotspot active get $aid mac-address]; :if ([:len $mac] = 0) do={ :local hid [/ip hotspot host find where address=$addr]; :if ([:len $hid] > 0) do={ :set mac [/ip hotspot host get [:pick $hid 0] mac-address]; } }; :set p ($p . \"R=/ip/hotspot/active|.id=\" . [$ktmEsc $aid] . \"|user=\" . [$ktmEsc $user] . \"|address=\" . [$ktmEsc $addr] . \"|mac-address=\" . [$ktmEsc $mac] . \"|uptime=\" . [$ktmEsc [/ip hotspot active get $aid uptime]] . \"|session-time-left=\" . [$ktmEsc [/ip hotspot active get $aid session-time-left]] . \"|bytes-in=\" . [$ktmEsc [/ip hotspot active get $aid bytes-in]] . \"|bytes-out=\" . [$ktmEsc [/ip hotspot active get $aid bytes-out]] . \"|server=\" . [$ktmEsc [/ip hotspot active get $aid server]] . $NL); } } on-error={};",
         send_line(),
         "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
-        "  :do { :local c 0; :foreach i in=[/ip hotspot user print as-value] do={ :if ($c < 500) do={ :set p ($p . \"R=/ip/hotspot/user|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|password=\" . [$ktmEsc ($i->\"password\")] . \"|profile=\" . [$ktmEsc ($i->\"profile\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|limit-uptime=\" . [$ktmEsc ($i->\"limit-uptime\")] . \"|uptime=\" . [$ktmEsc ($i->\"uptime\")] . \"|bytes-in=\" . [$ktmEsc ($i->\"bytes-in\")] . \"|bytes-out=\" . [$ktmEsc ($i->\"bytes-out\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|comment=\" . [$ktmEsc ($i->\"comment\")] . $NL); :set c ($c + 1); } } } on-error={};",
+        "  :do { :local c 0; :foreach i in=[/ip hotspot user print as-value] do={ :if ($c < 500) do={ :set p ($p . \"R=/ip/hotspot/user|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|profile=\" . [$ktmEsc ($i->\"profile\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|limit-uptime=\" . [$ktmEsc ($i->\"limit-uptime\")] . \"|uptime=\" . [$ktmEsc ($i->\"uptime\")] . \"|bytes-in=\" . [$ktmEsc ($i->\"bytes-in\")] . \"|bytes-out=\" . [$ktmEsc ($i->\"bytes-out\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|comment=\" . [$ktmEsc ($i->\"comment\")] . $NL); :set c ($c + 1); } } } on-error={};",
         send_line(),
         "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
         "  :do { :local c 0; :foreach i in=[/ip hotspot host print as-value] do={ :if ($c < 500) do={ :set p ($p . \"R=/ip/hotspot/host|.id=\" . [$ktmEsc ($i->\".id\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|to-address=\" . [$ktmEsc ($i->\"to-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|authorized=\" . [$ktmEsc ($i->\"authorized\")] . $NL); :set c ($c + 1); } } } on-error={};",
