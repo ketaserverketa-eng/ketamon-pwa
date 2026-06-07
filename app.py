@@ -2131,10 +2131,20 @@ def _relay_auto_upgrade_source(token):
     return "\n".join([
         ':put "KETAMON_RELAY_AUTO_UPGRADE";',
         ':do {',
-        f'  /tool fetch url="{install_url}" dst-path="ketamon-relay-install.rsc";',
-        '  :delay 1s;',
-        '  /import file-name="ketamon-relay-install.rsc";',
-        '  /file remove [find name="ketamon-relay-install.rsc"];',
+        '  :do { /system scheduler remove [find name="ketamon-relay-auto-upgrade"]; } on-error={};',
+        '  :do { /system script remove [find name="ketamon-relay-auto-upgrade"]; } on-error={};',
+        '  /system script add name="ketamon-relay-auto-upgrade" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon source={',
+        '    :delay 3s;',
+        '    :do {',
+        f'      /tool fetch url="{install_url}" dst-path="ketamon-relay-install.rsc";',
+        '      :delay 1s;',
+        '      /import file-name="ketamon-relay-install.rsc";',
+        '      /file remove [find name="ketamon-relay-install.rsc"];',
+        '    } on-error={ :put "KetaMon relay auto-upgrade failed"; }',
+        '    :do { /system scheduler remove [find name="ketamon-relay-auto-upgrade"]; } on-error={};',
+        '    :do { /system script remove [find name="ketamon-relay-auto-upgrade"]; } on-error={};',
+        '  };',
+        '  /system scheduler add name="ketamon-relay-auto-upgrade" interval=5s on-event="/system script run ketamon-relay-auto-upgrade" disabled=no;',
         '} on-error={ :put "KetaMon relay auto-upgrade failed"; }',
     ])
 
@@ -6254,6 +6264,12 @@ def api_relay_routeros_next():
     command = db_mod.db_claim_next_router_relay_command(router["id"])
     if not command:
         return ":put \"KetaMon relay: aucune commande\"\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
+    print(
+        "[RELAY][NEXT] "
+        f"router={router.get('name') or router.get('id')} "
+        f"command={command.get('command')} id={command.get('id')}",
+        flush=True,
+    )
     command_id = command["id"]
     result_url = (
         f"{_relay_public_base_url()}/api/relay/routeros/result"
@@ -6456,6 +6472,11 @@ def api_relay_routeros_install_script():
     router, token = _relay_router_from_request()
     if not router:
         return ":put \"KetaMon relay: token invalide\"\n", 401, {"Content-Type": "text/plain; charset=utf-8"}
+    print(
+        "[RELAY][INSTALL] "
+        f"router={router.get('name') or router.get('id')} script=safe-snapshot-v2",
+        flush=True,
+    )
     return _build_routeros_relay_script(_relay_public_base_url(), token) + "\n", 200, {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "no-store",
