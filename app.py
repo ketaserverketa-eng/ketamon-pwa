@@ -2112,6 +2112,60 @@ def _sync_relay_snapshot_database(router_id, resources):
     return {"profiles": profiles, "tickets": tickets}
 
 
+_RELAY_AUTO_UPGRADE_LAST = {}
+
+
+def _relay_resource_counts(resources):
+    resources = resources if isinstance(resources, dict) else {}
+    return {
+        str(resource): len(rows or []) if isinstance(rows, list) else 0
+        for resource, rows in resources.items()
+    }
+
+
+def _relay_auto_upgrade_source(token):
+    install_url = (
+        f"{_relay_public_base_url()}/api/relay/routeros/install.rsc"
+        f"?token={quote(str(token or ''))}"
+    )
+    return "\n".join([
+        ':put "KETAMON_RELAY_AUTO_UPGRADE";',
+        ':do {',
+        f'  /tool fetch url="{install_url}" dst-path="ketamon-relay-install.rsc";',
+        '  :delay 1s;',
+        '  /import file-name="ketamon-relay-install.rsc";',
+        '  /file remove [find name="ketamon-relay-install.rsc"];',
+        '} on-error={ :put "KetaMon relay auto-upgrade failed"; }',
+    ])
+
+
+def _maybe_queue_relay_auto_upgrade(router, token, counts):
+    router = dict(router or {})
+    router_id = str(router.get("id") or "").strip()
+    if not router_id:
+        return False
+    profile_count = int((counts or {}).get("/ip/hotspot/user/profile") or 0)
+    user_count = int((counts or {}).get("/ip/hotspot/user") or 0)
+    active_count = int((counts or {}).get("/ip/hotspot/active") or 0)
+    # Un MikroTik Hotspot a au minimum le profil default. Si profiles=0,
+    # ou si des sessions actives existent sans lignes user, le relais est ancien/incomplet.
+    if profile_count > 0 and (user_count > 0 or active_count == 0):
+        return False
+    now = time.time()
+    last = float(_RELAY_AUTO_UPGRADE_LAST.get(router_id) or 0)
+    if now - last < 1800:
+        return False
+    source = _relay_auto_upgrade_source(token)
+    command = db_mod.db_enqueue_router_relay_command(
+        router_id,
+        router.get("owner_id", ""),
+        "routeros-script",
+        {"source": source},
+    )
+    _RELAY_AUTO_UPGRADE_LAST[router_id] = now
+    return bool(command)
+
+
 def _profile_metadata_map_for_display(router_id, profiles):
     metadata_map = get_hotspot_profile_metadata_map(router_id)
     for profile in profiles or []:
@@ -6010,7 +6064,7 @@ def _parse_relay_snapshot_text(text):
 
 @app.route("/api/relay/snapshot", methods=["POST"])
 def api_relay_snapshot():
-    router, _token = _relay_router_from_request()
+    router, token = _relay_router_from_request()
     if not router:
         return jsonify({"ok": False, "msg": "Token relais invalide."}), 401
     data = request.get_json(silent=True)
@@ -6018,14 +6072,27 @@ def api_relay_snapshot():
         resources = data.get("resources") if isinstance(data.get("resources"), dict) else data
     else:
         resources = _parse_relay_snapshot_text(request.get_data(as_text=True))
+    counts = _relay_resource_counts(resources)
     saved = db_mod.db_upsert_router_relay_snapshots(router["id"], resources)
     db_mod.db_touch_router_relay(router["id"], "snapshot")
     synced = _sync_relay_snapshot_database(router["id"], resources)
     expiry = _enforce_relay_snapshot_expirations(router)
+    upgrade_queued = _maybe_queue_relay_auto_upgrade(router, token, counts)
+    print(
+        "[RELAY][SNAPSHOT] "
+        f"router={router.get('name') or router.get('id')} "
+        f"profiles={counts.get('/ip/hotspot/user/profile', 0)} "
+        f"users={counts.get('/ip/hotspot/user', 0)} "
+        f"active={counts.get('/ip/hotspot/active', 0)} "
+        f"synced={synced} expiry={expiry} upgrade={upgrade_queued}",
+        flush=True,
+    )
     return jsonify({
         "ok": True,
         "saved": saved,
         "synced": synced,
+        "counts": counts,
+        "upgrade_queued": upgrade_queued,
         "router_id": router["id"],
         "expiry": expiry,
         "server_time": datetime.now().isoformat(),
