@@ -355,6 +355,14 @@ def _close_request_mikrotik_apis(_exc=None):
     for api in getattr(g, "_mikrotik_apis", []) or []:
         _close_api_quietly(api)
     g._mikrotik_apis = []
+    # Liberer la connexion PostgreSQL apres chaque requete
+    conn = getattr(db_mod._local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        db_mod._local.conn = None
 
 @app.context_processor
 def inject_csrf_token():
@@ -2857,6 +2865,13 @@ def _bg_ventes_loop():
                     }})
         except Exception as _e:
             _logger.error("[SYNC] boucle erreur: %s", _e)
+        finally:
+            # Liberer la connexion entre chaque iteration
+            _c = getattr(db_mod._local, "conn", None)
+            if _c is not None:
+                try: _c.close()
+                except Exception: pass
+                db_mod._local.conn = None
         time.sleep(max(60, BG_REVENUE_SYNC_INTERVAL))
 
 
@@ -2884,6 +2899,12 @@ def _bg_runtime_support_loop():
                     _close_api_quietly(api)
         except Exception as _e:
             _logger.error("[RUNTIME] boucle erreur: %s", _e)
+        finally:
+            _c = getattr(db_mod._local, "conn", None)
+            if _c is not None:
+                try: _c.close()
+                except Exception: pass
+                db_mod._local.conn = None
         time.sleep(900)
 
 
