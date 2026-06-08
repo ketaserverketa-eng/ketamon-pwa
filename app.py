@@ -3416,17 +3416,30 @@ def _relay_database_dashboard_data(router):
         ORDER BY COUNT(*) DESC
         LIMIT 1
     """, (router_id,)).fetchone()
+    # Lire les ressources systeme depuis le snapshot relay
+    res = {}
+    try:
+        res_rows = db_mod.db_get_router_relay_snapshot(router_id, "/system/resource")
+        if res_rows and isinstance(res_rows, list) and res_rows:
+            res = dict(res_rows[0])
+    except Exception:
+        pass
+    total_mem = int(res.get("total-memory", 0) or 0)
+    free_mem  = int(res.get("free-memory",  0) or 0)
+    total_hdd = int(res.get("total-hdd-space", 0) or 0)
+    free_hdd  = int(res.get("free-hdd-space",  0) or 0)
+    mem_pct   = round((total_mem - free_mem) / total_mem * 100) if total_mem else 0
     return {
-        "identity": router.get("name") or "MikroTik",
+        "identity": res.get("board-name") or router.get("name") or "MikroTik",
         "board": "Donnees restaurees",
-        "version": "Base KetaMon",
-        "uptime": "",
-        "cpu_load": "0",
-        "total_mem": "",
-        "free_mem": "",
-        "mem_pct": 0,
-        "total_hdd": "",
-        "free_hdd": "",
+        "version": res.get("version") or "Base KetaMon",
+        "uptime": res.get("uptime") or "",
+        "cpu_load": str(res.get("cpu-load") or "0"),
+        "total_mem": mk.format_bytes(total_mem) if total_mem else "",
+        "free_mem": mk.format_bytes(free_mem) if free_mem else "",
+        "mem_pct": mem_pct,
+        "total_hdd": mk.format_bytes(total_hdd) if total_hdd else "",
+        "free_hdd": mk.format_bytes(free_hdd) if free_hdd else "",
         "time": "",
         "date": router.get("relay_last_seen") or "",
         "hs_users": tickets,
