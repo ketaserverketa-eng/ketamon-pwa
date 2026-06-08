@@ -265,8 +265,8 @@ def _disconnect_hotspot_entities(api, usernames=None, addresses=None, mac_addres
                 if active_id:
                     active_resource.remove(id=active_id)
                     removed["active_sessions"] += 1
-    except Exception:
-        pass
+    except Exception as _e:
+        _add_error(f"disconnect active sessions: {_e}")
 
     try:
         cookie_resource = api.get_resource("/ip/hotspot/cookie")
@@ -280,8 +280,8 @@ def _disconnect_hotspot_entities(api, usernames=None, addresses=None, mac_addres
                 if cookie_id:
                     cookie_resource.remove(id=cookie_id)
                     removed["cookies"] += 1
-    except Exception:
-        pass
+    except Exception as _e:
+        _add_error(f"disconnect cookies: {_e}")
 
     try:
         host_resource = api.get_resource("/ip/hotspot/host")
@@ -293,8 +293,8 @@ def _disconnect_hotspot_entities(api, usernames=None, addresses=None, mac_addres
                 if host_id:
                     host_resource.remove(id=host_id)
                     removed["hosts"] += 1
-    except Exception:
-        pass
+    except Exception as _e:
+        _add_error(f"disconnect hosts: {_e}")
 
     return removed
 
@@ -548,6 +548,8 @@ def _run_expiry_engine():
                     host   = router.get("host", "?")
                     rid    = router.get("id") or host
                     rname  = router.get("name") or host
+                    if int(router.get("relay_enabled") or 0):
+                        continue  # expiration geree par _enforce_relay_snapshot_expirations
                     api    = None
                     try:
                         api, err = mk.safe_connect_router(router, timeout=ROUTER_TIMEOUT)
@@ -640,6 +642,18 @@ def _check_routers():
         rid   = router.get("id") or router.get("host","")
         host  = router.get("host","?")
         rname = router.get("name") or host
+        if int(router.get("relay_enabled") or 0):
+            relay_status = str(router.get("relay_status") or "").strip()
+            relay_last   = str(router.get("relay_last_seen") or "").strip()
+            if relay_status in ("online", "snapshot") and relay_last:
+                db_mod.db_agent_resolve_by_category("router", router_id=rid)
+            else:
+                _new_incident("warning", "router",
+                              f"Router '{rname}' relais inactif",
+                              f"Le script relais n'a pas contacte le serveur. Derniere vue : {relay_last or 'jamais'}",
+                              router_id=rid, router_name=rname,
+                              fix_action="check_router_connection")
+            continue
         api = None
         try:
             api, err = mk.safe_connect_router(router, timeout=ROUTER_TIMEOUT)

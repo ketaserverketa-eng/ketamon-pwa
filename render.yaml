@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 180
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 32 --timeout 180
     healthCheckPath: /health
     envVars:
       - key: KETAMON_ENV
@@ -19,3 +19,5 @@ services:
         value: require
       - key: DATABASE_URL
         sync: false
+      - key: KETAMON_PUBLIC_URL
+        value: https://ketamon-pwa-cloud.onrender.com

@@ -2687,9 +2687,7 @@ def _sync_ventes_for_router(router_info, timeout=8):
 
         return new_count
     except Exception as _e:
-        import traceback
-        print(f"[SYNC] ERREUR router {router_info.get('host','?')}: {_e}")
-        traceback.print_exc()
+        _logger.exception("[SYNC] ERREUR router %s", router_info.get("host", "?"))
         return 0
     finally:
         _close_api_quietly(api)
@@ -2711,6 +2709,107 @@ def _expire_tickets_for_router(api, host="?"):
     return 0
 
 
+def _sync_ventes_from_relay(router):
+    """Sync revenus depuis le snapshot relais (pas de connexion directe MikroTik)."""
+    router_id = str(router.get("id") or router.get("host") or "").strip()
+    if not router_id:
+        return 0
+    if not _router_has_relay_snapshots(router):
+        return 0
+
+    import uuid as _uuid
+    conn = db_mod.get_conn()
+    # SELECT ticket_key en premier pour que r[0]=ticket_key, r[1]=user
+    existing_rows = conn.execute(
+        "SELECT ticket_key, user FROM ventes WHERE router_id=?", (router_id,)
+    ).fetchall()
+    existing_keys  = {str(r[0] or "").strip() for r in existing_rows}  # ticket_key
+    existing_users = {str(r[1] or "").strip() for r in existing_rows}  # user
+
+    # Utilisateurs actifs depuis snapshot relais (bytes-in en cours de session)
+    active_snap = db_mod.db_get_router_relay_snapshot(router_id, "/ip/hotspot/active") or []
+    active_with_traffic = set()
+    for sess in active_snap:
+        try:
+            b = int(sess.get("bytes-in", 0) or 0)
+        except (ValueError, TypeError):
+            b = 0
+        if b > 0:
+            active_with_traffic.add(str(sess.get("user") or "").strip())
+
+    user_snap = db_mod.db_get_router_relay_snapshot(router_id, "/ip/hotspot/user") or []
+    profiles_meta = get_hotspot_profile_metadata_map(router_id)
+    now_dt   = datetime.now()
+    date_str = now_dt.strftime("%Y-%m-%d")
+    time_str = now_dt.strftime("%H:%M:%S")
+    new_count = 0
+
+    for u in user_snap:
+        username = str(u.get("name") or "").strip()
+        if not username:
+            continue
+        try:
+            bytes_in = int(u.get("bytes-in", 0) or 0)
+        except (ValueError, TypeError):
+            bytes_in = 0
+        if bytes_in == 0 and username not in active_with_traffic:
+            continue
+
+        comment    = str(u.get("comment") or "")
+        ticket_key = _extract_ticket_key(username, comment)
+
+        if ticket_key in existing_keys:
+            continue
+        if username in existing_users:
+            if ticket_key != username:
+                conn.execute(
+                    "UPDATE ventes SET ticket_key=? WHERE router_id=? AND user=? AND ticket_key=?",
+                    (ticket_key, router_id, username, username)
+                )
+                conn.commit()
+            continue
+
+        profile = str(u.get("profile") or "default").strip() or "default"
+        pricing = conn.execute(
+            "SELECT prix, devise, profil, reseau FROM ticket_pricing WHERE router_id=? AND user=?",
+            (router_id, username)
+        ).fetchone()
+        if pricing:
+            price    = float(pricing[0] or 0)
+            currency = pricing[1] or "FCFA"
+            profile  = pricing[2] or profile
+            reseau   = pricing[3] or ""
+        elif profile in profiles_meta:
+            meta     = profiles_meta[profile]
+            price    = float(meta.get("price", "0") or "0")
+            currency = meta.get("currency", "FCFA") or "FCFA"
+            reseau   = ""
+        else:
+            continue
+
+        if price <= 0:
+            continue
+
+        db_mod.db_insert_vente({
+            "id":         _uuid.uuid4().hex,
+            "router_id":  router_id,
+            "user":       username,
+            "profil":     profile,
+            "prix":       price,
+            "devise":     currency,
+            "reseau":     reseau,
+            "data_limit": "",
+            "date":       date_str,
+            "heure":      time_str,
+            "ticket_key": ticket_key,
+        })
+        existing_keys.add(ticket_key)
+        existing_users.add(username)
+        new_count += 1
+
+    return new_count
+
+
 def _bg_ventes_loop():
     """Thread daemon : sync revenus. Intervalle allonge pour les gros routeurs."""
     time.sleep(120)
@@ -2720,7 +2819,10 @@ def _bg_ventes_loop():
                 rid  = router.get("id") or router.get("host", "")
                 host = router.get("host", "?")
                 try:
-                    n = _sync_ventes_for_router(router, timeout=6)
+                    if int(router.get("relay_enabled") or 0):
+                        n = _sync_ventes_from_relay(router)
+                    else:
+                        n = _sync_ventes_for_router(router, timeout=6)
                     _sync_stats[rid] = {
                         "last_sync": datetime.now().isoformat(timespec="seconds"),
                         "new":       n,
@@ -2730,7 +2832,7 @@ def _bg_ventes_loop():
                         "name":      router.get("name", ""),
                     }
                     if n:
-                        print(f"[SYNC] {host} : {n} nouvelle(s) vente(s)")
+                        _logger.info("[SYNC] %s : %d nouvelle(s) vente(s)", host, n)
                     # Partage des stats avec l'agent moniteur
                     agent_mod.set_sync_stats({rid: {
                         "last_ok":    datetime.now().isoformat(timespec="seconds"),
@@ -2754,7 +2856,7 @@ def _bg_ventes_loop():
                         "name":       router.get("name",""),
                     }})
         except Exception as _e:
-            print(f"[SYNC] boucle erreur: {_e}")
+            _logger.error("[SYNC] boucle erreur: %s", _e)
         time.sleep(max(60, BG_REVENUE_SYNC_INTERVAL))
 
 
@@ -2764,6 +2866,8 @@ def _bg_runtime_support_loop():
     while True:
         try:
             for router in db_mod.db_get_routers():
+                if int(router.get("relay_enabled") or 0):
+                    continue  # scripts installes via commande relais, pas connexion directe
                 api = None
                 try:
                     api, err = mk.safe_connect_router(router, timeout=8)
@@ -2771,11 +2875,11 @@ def _bg_runtime_support_loop():
                         continue
                     ensure_ticket_runtime_support(api)
                 except Exception as _e:
-                    print(f"[RUNTIME] erreur {router.get('host','?')}: {_e}")
+                    _logger.warning("[RUNTIME] erreur %s: %s", router.get("host", "?"), _e)
                 finally:
                     _close_api_quietly(api)
         except Exception as _e:
-            print(f"[RUNTIME] boucle erreur: {_e}")
+            _logger.error("[RUNTIME] boucle erreur: %s", _e)
         time.sleep(900)
 
 
@@ -3697,7 +3801,8 @@ def login():
                             creds_ok = True
                             display = creds.get("displayName", username)
                     else:
-                        print("WARNING: plaintext concepteur password ignored; use a Werkzeug hash in concepteur.json.")
+                        _logger.warning("Mot de passe concepteur non hashé dans concepteur.json — utilisez un hash Werkzeug (pbkdf2: ou scrypt:).")
+                        flash("Mot de passe concepteur non hashé. Regénérez-le avec un hash Werkzeug.", "danger")
                 except Exception:
                     pass
                 if creds_ok:
@@ -4770,7 +4875,7 @@ def hotspot_active():
                 fu = first_used_map.get(uname, "")
                 if not fu:
                     uptime_sec = parse_routeros_duration(str(a.get("uptime", "") or ""))
-                    if uptime_sec > 0:
+                    if uptime_sec is not None and uptime_sec > 0:
                         fu_dt = datetime.now() - timedelta(seconds=uptime_sec)
                         fu = fu_dt.strftime("%Y-%m-%d %H:%M")
                 a["first_used_at"] = fu
@@ -6456,8 +6561,36 @@ def _build_routeros_relay_script(base_url, token):
         "  :do { :foreach aid in=[/ip hotspot active find] do={ :local user [/ip hotspot active get $aid user]; :local addr [/ip hotspot active get $aid address]; :local mac [/ip hotspot active get $aid mac-address]; :if ([:len $mac] = 0) do={ :local hid [/ip hotspot host find where address=$addr]; :if ([:len $hid] > 0) do={ :set mac [/ip hotspot host get [:pick $hid 0] mac-address]; } }; :set p ($p . \"R=/ip/hotspot/active|.id=\" . [$ktmEsc $aid] . \"|user=\" . [$ktmEsc $user] . \"|address=\" . [$ktmEsc $addr] . \"|mac-address=\" . [$ktmEsc $mac] . \"|uptime=\" . [$ktmEsc [/ip hotspot active get $aid uptime]] . \"|session-time-left=\" . [$ktmEsc [/ip hotspot active get $aid session-time-left]] . \"|bytes-in=\" . [$ktmEsc [/ip hotspot active get $aid bytes-in]] . \"|bytes-out=\" . [$ktmEsc [/ip hotspot active get $aid bytes-out]] . \"|server=\" . [$ktmEsc [/ip hotspot active get $aid server]] . $NL); } } on-error={};",
         send_line(),
         "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
-        "  :do { :local c 0; :foreach uid in=[/ip hotspot user find] do={ :if ($c < 1000) do={ :local name \"\"; :local profile \"\"; :local disabled \"\"; :local limitUptime \"\"; :local uptime \"\"; :local bytesIn \"\"; :local bytesOut \"\"; :local mac \"\"; :local server \"\"; :local comment \"\"; :do { :set name [/ip hotspot user get $uid name]; } on-error={}; :do { :set profile [/ip hotspot user get $uid profile]; } on-error={}; :do { :set disabled [/ip hotspot user get $uid disabled]; } on-error={}; :do { :set limitUptime [/ip hotspot user get $uid limit-uptime]; } on-error={}; :do { :set uptime [/ip hotspot user get $uid uptime]; } on-error={}; :do { :set bytesIn [/ip hotspot user get $uid bytes-in]; } on-error={}; :do { :set bytesOut [/ip hotspot user get $uid bytes-out]; } on-error={}; :do { :set mac [/ip hotspot user get $uid mac-address]; } on-error={}; :do { :set server [/ip hotspot user get $uid server]; } on-error={}; :do { :set comment [/ip hotspot user get $uid comment]; } on-error={}; :set p ($p . \"R=/ip/hotspot/user|.id=\" . [$ktmEsc $uid] . \"|name=\" . [$ktmEsc $name] . \"|profile=\" . [$ktmEsc $profile] . \"|disabled=\" . [$ktmEsc $disabled] . \"|limit-uptime=\" . [$ktmEsc $limitUptime] . \"|uptime=\" . [$ktmEsc $uptime] . \"|bytes-in=\" . [$ktmEsc $bytesIn] . \"|bytes-out=\" . [$ktmEsc $bytesOut] . \"|mac-address=\" . [$ktmEsc $mac] . \"|server=\" . [$ktmEsc $server] . \"|comment=\" . [$ktmEsc $comment] . $NL); :set c ($c + 1); } } } on-error={};",
-        send_line(),
+        "  :do {",
+        "    :local c 0;",
+        "    :local total 0;",
+        "    :foreach uid in=[/ip hotspot user find] do={",
+        "      :if ($total < 5000) do={",
+        "        :local name \"\"; :local profile \"\"; :local disabled \"\";",
+        "        :local limitUptime \"\"; :local bytesIn \"\"; :local bytesOut \"\";",
+        "        :local mac \"\"; :local server \"\"; :local comment \"\";",
+        "        :do { :set name [/ip hotspot user get $uid name]; } on-error={};",
+        "        :do { :set profile [/ip hotspot user get $uid profile]; } on-error={};",
+        "        :do { :set disabled [/ip hotspot user get $uid disabled]; } on-error={};",
+        "        :do { :set limitUptime [/ip hotspot user get $uid limit-uptime]; } on-error={};",
+        "        :do { :set bytesIn [/ip hotspot user get $uid bytes-in]; } on-error={};",
+        "        :do { :set bytesOut [/ip hotspot user get $uid bytes-out]; } on-error={};",
+        "        :do { :set mac [/ip hotspot user get $uid mac-address]; } on-error={};",
+        "        :do { :set server [/ip hotspot user get $uid server]; } on-error={};",
+        "        :do { :set comment [/ip hotspot user get $uid comment]; } on-error={};",
+        "        :set p ($p . \"R=/ip/hotspot/user|.id=\" . [$ktmEsc $uid]",
+        "          . \"|name=\" . [$ktmEsc $name] . \"|profile=\" . [$ktmEsc $profile]",
+        "          . \"|disabled=\" . [$ktmEsc $disabled] . \"|limit-uptime=\" . [$ktmEsc $limitUptime]",
+        "          . \"|bytes-in=\" . [$ktmEsc $bytesIn] . \"|bytes-out=\" . [$ktmEsc $bytesOut]",
+        "          . \"|mac-address=\" . [$ktmEsc $mac] . \"|server=\" . [$ktmEsc $server]",
+        "          . \"|comment=\" . [$ktmEsc $comment] . $NL);",
+        "        :set c ($c + 1);",
+        "        :set total ($total + 1);",
+        f"        :if ($c >= 100) do={{ :do {{ /tool fetch url=\"{snapshot_url}\" http-method=post http-header-field=\"Content-Type: text/plain\" http-data=$p keep-result=no; }} on-error={{}}; :set p (\"KETAMON_SNAPSHOT_V1\" . $NL); :set c 0; }}",
+        "      }",
+        "    }",
+        f"    :if ($c > 0) do={{ :do {{ /tool fetch url=\"{snapshot_url}\" http-method=post http-header-field=\"Content-Type: text/plain\" http-data=$p keep-result=no; }} on-error={{}}; }}",
+        "  } on-error={};",
         "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
         "  :do { :local c 0; :foreach i in=[/ip hotspot host print as-value] do={ :if ($c < 500) do={ :set p ($p . \"R=/ip/hotspot/host|.id=\" . [$ktmEsc ($i->\".id\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|to-address=\" . [$ktmEsc ($i->\"to-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|authorized=\" . [$ktmEsc ($i->\"authorized\")] . $NL); :set c ($c + 1); } } } on-error={};",
         send_line(),
@@ -8339,34 +8472,43 @@ def _fmt_bytes(b):
 
 @app.route("/api/network/traffic", methods=["GET"])
 def api_network_traffic():
-    """Débit réseau en temps réel — 2 mesures à 1s d'écart (auth Basic requise)."""
+    """Débit réseau en temps réel — différentiel mis en cache, aucun blocage."""
     auth_ok, _ = _check_basic_auth()
     if not auth_ok:
         return jsonify({"ok": False, "msg": "Authentification requise"}), 401
-    api, err = _mk_connect_first_router()
+    payload = request.get_json(silent=True) or request.form or request.args
+    router = _get_requested_router(payload)
+    if not router:
+        return jsonify({"ok": False, "msg": "Aucun routeur configuré"}), 503
+    router_id = str(router.get("id") or router.get("host") or "")
+    api, err = _mk_connect_request_router(payload)
     if err:
         return jsonify({"ok": False, "msg": err}), 503
     try:
-        ifaces1 = {i.get("name", ""): i for i in api.get_resource("/interface").get()}
-        time.sleep(1)
-        ifaces2 = {i.get("name", ""): i for i in api.get_resource("/interface").get()}
+        now = time.time()
+        ifaces = {i.get("name", ""): i for i in api.get_resource("/interface").get()}
         result = []
-        for nom, i2 in ifaces2.items():
-            disabled = str(i2.get("disabled", "no")).lower() == "yes"
-            running  = str(i2.get("running",  "no")).lower() == "yes"
-            i1       = ifaces1.get(nom, {})
-            rx1 = int(i1.get("rx-byte", 0) or 0)
-            rx2 = int(i2.get("rx-byte", 0) or 0)
-            tx1 = int(i1.get("tx-byte", 0) or 0)
-            tx2 = int(i2.get("tx-byte", 0) or 0)
-            rx_bps = max(0, rx2 - rx1)
-            tx_bps = max(0, tx2 - tx1)
+        for nom, iface in ifaces.items():
+            disabled = str(iface.get("disabled", "no")).lower() == "yes"
+            running  = str(iface.get("running",  "no")).lower() == "yes"
+            rx2 = int(iface.get("rx-byte", 0) or 0)
+            tx2 = int(iface.get("tx-byte", 0) or 0)
+            key  = f"{router_id}:{nom}"
+            last = _last_iface_bytes.get(key)
+            if last:
+                prev_rx, prev_tx, prev_t = last
+                elapsed = now - prev_t
+                rx_bps = int(max(0, (rx2 - prev_rx) / elapsed)) if elapsed > 0 else 0
+                tx_bps = int(max(0, (tx2 - prev_tx) / elapsed)) if elapsed > 0 else 0
+            else:
+                rx_bps = tx_bps = 0
+            _last_iface_bytes[key] = (rx2, tx2, now)
             result.append({
-                "nom":      nom,
-                "actif":    running and not disabled,
+                "nom":       nom,
+                "actif":     running and not disabled,
                 "desactive": disabled,
-                "rxBps":    (_fmt_bytes(rx_bps) + "/s") if rx_bps > 0 else "0 o/s",
-                "txBps":    (_fmt_bytes(tx_bps) + "/s") if tx_bps > 0 else "0 o/s",
+                "rxBps":     (_fmt_bytes(rx_bps) + "/s") if rx_bps > 0 else "0 o/s",
+                "txBps":     (_fmt_bytes(tx_bps) + "/s") if tx_bps > 0 else "0 o/s",
                 "_rx":      rx_bps,
                 "_tx":      tx_bps,
             })
@@ -8378,6 +8520,8 @@ def api_network_traffic():
         return jsonify({"ok": True, "interfaces": result})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        _close_api_quietly(api)
 
 
 @app.route("/api/network/ping", methods=["GET"])
