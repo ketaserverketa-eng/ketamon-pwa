@@ -2867,7 +2867,11 @@ def _bg_runtime_support_loop():
         try:
             for router in db_mod.db_get_routers():
                 if int(router.get("relay_enabled") or 0):
-                    continue  # scripts installes via commande relais, pas connexion directe
+                    try:
+                        _relay_queue_expiry_install(router)
+                    except Exception as _e:
+                        _logger.warning("[RUNTIME] relay %s: %s", router.get("host", "?"), _e)
+                    continue
                 api = None
                 try:
                     api, err = mk.safe_connect_router(router, timeout=8)
@@ -2883,8 +2887,24 @@ def _bg_runtime_support_loop():
         time.sleep(900)
 
 
+def _bg_keepalive_loop():
+    """Empeche Render (free tier) de s'endormir : ping /health toutes les 4 min."""
+    time.sleep(90)
+    import urllib.request as _ur
+    while True:
+        try:
+            url = (os.environ.get("KETAMON_PUBLIC_URL") or "").rstrip("/")
+            if url:
+                _ur.urlopen(f"{url}/health", timeout=8)
+        except Exception:
+            pass
+        time.sleep(240)
+
+
 threading.Thread(target=_bg_ventes_loop, daemon=True).start()
 threading.Thread(target=_bg_runtime_support_loop, daemon=True).start()
+if KETAMON_ENV in {"prod", "production"}:
+    threading.Thread(target=_bg_keepalive_loop, daemon=True).start()
 agent_mod.start()
 
 
@@ -3208,6 +3228,36 @@ def ensure_ticket_runtime_support(api, profile_name=None):
 
     for profile_row in profiles:
         _ensure_ticket_runtime_profile_binding(api, profile_resource, profile_row)
+
+
+def _relay_queue_expiry_install(router):
+    """
+    Routeur relais : met en file un script RouterOS qui installe ou met à jour
+    le script d'expiry et son scheduler, directement sur le routeur.
+    Idempotent — s'exécute sans connexion directe, indépendamment de l'état du serveur.
+    """
+    router_id = str(router.get("id") or router.get("host") or "").strip()
+    owner_id  = str(router.get("owner_id") or "").strip()
+    if not router_id:
+        return
+    policy   = "ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon"
+    exp_name = KETAMON_TICKET_EXPIRY_SCRIPT
+    sch_name = KETAMON_TICKET_EXPIRY_SCHEDULER
+    escaped  = _relay_routeros_quote(build_ketamon_ticket_expiry_script_source())
+    source = "\n".join([
+        f':if ([:len [/system script find name="{exp_name}"]] > 0) do={{',
+        f'  /system script set [find name="{exp_name}"] source={escaped} policy="{policy}";',
+        f'}} else={{',
+        f'  /system script add name="{exp_name}" source={escaped} policy="{policy}";',
+        f'}};',
+        f':if ([:len [/system scheduler find name="{sch_name}"]] > 0) do={{',
+        f'  /system scheduler set [find name="{sch_name}"] interval=30s on-event="{exp_name}" disabled=no;',
+        f'}} else={{',
+        f'  /system scheduler add name="{sch_name}" interval=30s on-event="{exp_name}"'
+        f' start-time=00:00:00 disabled=no;',
+        f'}};',
+    ])
+    db_mod.db_enqueue_router_relay_command(router_id, owner_id, "routeros-script", {"source": source})
 
 
 def normalize_hotspot_profile(profile, metadata=None):
