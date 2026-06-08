@@ -540,31 +540,40 @@ def get_conn():
                 "DATABASE_URL est configure mais le paquet psycopg n'est pas installe."
             )
         sem = _get_pg_sem()
-        acquired = sem.acquire(timeout=30)
+        acquired = sem.acquire(timeout=60)
         if not acquired:
-            raise RuntimeError("Impossible d'obtenir un slot de connexion PostgreSQL (timeout 30s)")
-        try:
-            connect_timeout = int(os.environ.get("KETAMON_PG_CONNECT_TIMEOUT", "8"))
-            statement_timeout = int(os.environ.get("KETAMON_PG_STATEMENT_TIMEOUT_MS", "30000"))
-            options = f"-c statement_timeout={statement_timeout} -c lock_timeout={statement_timeout}"
-            _boot_log(f"connexion PostgreSQL en cours (timeout={connect_timeout}s)")
-            raw_conn = psycopg.connect(
-                _postgres_dsn(),
-                connect_timeout=connect_timeout,
-                options=options,
-            )
-            # SQLite accepte qu'une migration "ADD COLUMN" echoue sans casser la suite.
-            # En PostgreSQL, une erreur laisse la transaction inutilisable; autocommit
-            # garde ces migrations idempotentes independantes les unes des autres.
-            raw_conn.autocommit = True
-            _boot_log("connexion PostgreSQL OK")
-            conn = PostgresConnection(raw_conn)
-            _local.conn = conn
-            _local._pg_sem_held = True
-            return conn
-        except Exception:
-            sem.release()
-            raise
+            raise RuntimeError("Impossible d'obtenir un slot de connexion PostgreSQL (timeout 60s)")
+        connect_timeout = int(os.environ.get("KETAMON_PG_CONNECT_TIMEOUT", "8"))
+        statement_timeout = int(os.environ.get("KETAMON_PG_STATEMENT_TIMEOUT_MS", "30000"))
+        options = f"-c statement_timeout={statement_timeout} -c lock_timeout={statement_timeout}"
+        last_exc = None
+        for _attempt in range(6):
+            try:
+                _boot_log(f"connexion PostgreSQL en cours (tentative {_attempt + 1}/6)")
+                raw_conn = psycopg.connect(
+                    _postgres_dsn(),
+                    connect_timeout=connect_timeout,
+                    options=options,
+                )
+                # SQLite accepte qu'une migration "ADD COLUMN" echoue sans casser la suite.
+                # En PostgreSQL, une erreur laisse la transaction inutilisable; autocommit
+                # garde ces migrations idempotentes independantes les unes des autres.
+                raw_conn.autocommit = True
+                _boot_log("connexion PostgreSQL OK")
+                conn = PostgresConnection(raw_conn)
+                _local.conn = conn
+                _local._pg_sem_held = True
+                return conn
+            except Exception as _e:
+                last_exc = _e
+                if "remaining connection slots" in str(_e).lower() and _attempt < 5:
+                    _boot_log(f"DB saturee, attente 15s avant tentative {_attempt + 2}/6")
+                    time.sleep(15)
+                    continue
+                sem.release()
+                raise
+        sem.release()
+        raise last_exc  # type: ignore[misc]
 
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row

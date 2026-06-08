@@ -390,6 +390,7 @@ db_mod.DB_PATH = os.path.join(DATA_DIR, "ketamon.db")
 db_mod.LEGACY_USERS_PATH = USERS_F
 db_mod.LEGACY_ROUTERS_PATH = ROUTERS_F
 db_mod.init_db()
+db_mod.release_thread_conn()  # libere le slot PG apres init, inutile de garder ouverte
 
 
 def list_uploaded_logos():
