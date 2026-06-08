@@ -384,13 +384,24 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOGOS_DIR, exist_ok=True)
 os.makedirs(STATIC_IMG_DIR, exist_ok=True)
 
-# Initialiser SQLite au dÃ©marrage
 db_mod.DATA_DIR = DATA_DIR
 db_mod.DB_PATH = os.path.join(DATA_DIR, "ketamon.db")
 db_mod.LEGACY_USERS_PATH = USERS_F
 db_mod.LEGACY_ROUTERS_PATH = ROUTERS_F
-db_mod.init_db()
-db_mod.release_thread_conn()  # libere le slot PG apres init, inutile de garder ouverte
+
+def _bg_init_db():
+    """Init DB en fond : l'app demarre sans attendre, /health repond tout de suite."""
+    while True:
+        try:
+            db_mod.init_db()
+            db_mod.release_thread_conn()
+            print("[INIT] DB initialisee avec succes")
+            return
+        except Exception as _e:
+            print(f"[INIT] DB indisponible, retry dans 15s : {_e}")
+            time.sleep(15)
+
+threading.Thread(target=_bg_init_db, daemon=True, name="db-init").start()
 
 
 def list_uploaded_logos():
