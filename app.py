@@ -5032,8 +5032,7 @@ def hotspot_remove_active():
             removed_this = False
             if t["id"]:
                 try:
-                    # librouteros 4.x : path.remove(*ids) envoie .id=<id>
-                    api._lrt.path("/ip/hotspot/active").remove(t["id"])
+                    active_resource.remove(id=t["id"])
                     removed_this = True
                 except Exception as e:
                     last_err = str(e)
@@ -6628,12 +6627,7 @@ def _build_routeros_relay_script(base_url, token):
         "        :do { :set mac [/ip hotspot user get $uid mac-address]; } on-error={};",
         "        :do { :set server [/ip hotspot user get $uid server]; } on-error={};",
         "        :do { :set comment [/ip hotspot user get $uid comment]; } on-error={};",
-        "        :set p ($p . \"R=/ip/hotspot/user|.id=\" . [$ktmEsc $uid]",
-        "          . \"|name=\" . [$ktmEsc $name] . \"|profile=\" . [$ktmEsc $profile]",
-        "          . \"|disabled=\" . [$ktmEsc $disabled] . \"|limit-uptime=\" . [$ktmEsc $limitUptime]",
-        "          . \"|bytes-in=\" . [$ktmEsc $bytesIn] . \"|bytes-out=\" . [$ktmEsc $bytesOut]",
-        "          . \"|mac-address=\" . [$ktmEsc $mac] . \"|server=\" . [$ktmEsc $server]",
-        "          . \"|comment=\" . [$ktmEsc $comment] . $NL);",
+        "        :set p ($p . \"R=/ip/hotspot/user|.id=\" . [$ktmEsc $uid] . \"|name=\" . [$ktmEsc $name] . \"|profile=\" . [$ktmEsc $profile] . \"|disabled=\" . [$ktmEsc $disabled] . \"|limit-uptime=\" . [$ktmEsc $limitUptime] . \"|bytes-in=\" . [$ktmEsc $bytesIn] . \"|bytes-out=\" . [$ktmEsc $bytesOut] . \"|mac-address=\" . [$ktmEsc $mac] . \"|server=\" . [$ktmEsc $server] . \"|comment=\" . [$ktmEsc $comment] . $NL);",
         "        :set c ($c + 1);",
         "        :set total ($total + 1);",
         f"        :if ($c >= 100) do={{ :do {{ /tool fetch url=\"{snapshot_url}\" http-method=post http-header-field=\"Content-Type: text/plain\" http-data=$p keep-result=no; }} on-error={{}}; :set p (\"KETAMON_SNAPSHOT_V1\" . $NL); :set c 0; }}",
