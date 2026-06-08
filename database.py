@@ -545,14 +545,15 @@ def get_conn():
             raise RuntimeError("Impossible d'obtenir un slot de connexion PostgreSQL (timeout 20s)")
         try:
             connect_timeout = int(os.environ.get("KETAMON_PG_CONNECT_TIMEOUT", "8"))
-            statement_timeout = int(os.environ.get("KETAMON_PG_STATEMENT_TIMEOUT_MS", "30000"))
-            options = f"-c statement_timeout={statement_timeout} -c lock_timeout={statement_timeout}"
+            dsn = _postgres_dsn()
+            # Les poolers (PgBouncer/Neon) rejettent les options de session au demarrage
+            use_pooler = "-pooler." in dsn or "pgbouncer" in dsn.lower()
+            connect_kwargs: dict = {"connect_timeout": connect_timeout}
+            if not use_pooler:
+                st = int(os.environ.get("KETAMON_PG_STATEMENT_TIMEOUT_MS", "30000"))
+                connect_kwargs["options"] = f"-c statement_timeout={st} -c lock_timeout={st}"
             _boot_log("connexion PostgreSQL en cours")
-            raw_conn = psycopg.connect(
-                _postgres_dsn(),
-                connect_timeout=connect_timeout,
-                options=options,
-            )
+            raw_conn = psycopg.connect(dsn, **connect_kwargs)
             # SQLite accepte qu'une migration "ADD COLUMN" echoue sans casser la suite.
             # En PostgreSQL, une erreur laisse la transaction inutilisable; autocommit
             # garde ces migrations idempotentes independantes les unes des autres.
