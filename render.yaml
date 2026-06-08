@@ -20,4 +20,4 @@ services:
       - key: DATABASE_URL
         sync: false
       - key: KETAMON_PUBLIC_URL
-        value: https://ketamon-pwa-cloud.onrender.com
+        value: https://ketamon-pwa-cloud-uu7m.onrender.com
