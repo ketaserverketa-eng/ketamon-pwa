@@ -420,7 +420,20 @@ def _bg_init_db():
             print(f"[INIT] DB indisponible, retry dans 15s : {_db_init_error}")
             time.sleep(15)
 
-threading.Thread(target=_bg_init_db, daemon=True, name="db-init").start()
+if db_mod.USE_POSTGRES:
+    # PostgreSQL : init en fond pour ne pas bloquer /health durant le rolling deploy
+    threading.Thread(target=_bg_init_db, daemon=True, name="db-init").start()
+else:
+    # SQLite : init synchrone (<1s), pas de thread necessaire
+    try:
+        db_mod.init_db()
+        db_mod.release_thread_conn()
+        _db_ready.set()
+        print("[INIT] DB SQLite initialisee")
+    except Exception as _e:
+        _db_init_error = f"{type(_e).__name__}: {_e}"
+        print(f"[INIT] DB SQLite erreur, retry en thread: {_e}")
+        threading.Thread(target=_bg_init_db, daemon=True, name="db-init").start()
 
 
 def list_uploaded_logos():
