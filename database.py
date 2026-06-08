@@ -25,7 +25,7 @@ _local  = threading.local()
 
 # Semaphore: limite le nombre de connexions PostgreSQL simultanées ouvertes.
 # Evite la saturation sur les plans cloud avec max_connections faible (Aiven free ~5-8).
-_PG_MAX_CONN = int(os.environ.get("KETAMON_PG_MAX_CONN", "3"))
+_PG_MAX_CONN = int(os.environ.get("KETAMON_PG_MAX_CONN", "1"))
 _pg_sem: threading.Semaphore | None = None
 _pg_sem_lock = threading.Lock()
 
