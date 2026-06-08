@@ -22,6 +22,33 @@ DB_PATH = os.path.join(DATA_DIR, "ketamon.db")
 LEGACY_USERS_PATH = os.path.join(DATA_DIR, "users.json")
 LEGACY_ROUTERS_PATH = os.path.join(DATA_DIR, "routers.json")
 _local  = threading.local()
+
+# Semaphore: limite le nombre de connexions PostgreSQL simultanées ouvertes.
+# Evite la saturation sur les plans cloud avec max_connections faible (Aiven free ~5-8).
+_PG_MAX_CONN = int(os.environ.get("KETAMON_PG_MAX_CONN", "3"))
+_pg_sem: threading.Semaphore | None = None
+_pg_sem_lock = threading.Lock()
+
+def _get_pg_sem() -> threading.Semaphore:
+    global _pg_sem
+    if _pg_sem is None:
+        with _pg_sem_lock:
+            if _pg_sem is None:
+                _pg_sem = threading.Semaphore(_PG_MAX_CONN)
+    return _pg_sem
+
+def release_thread_conn():
+    """Ferme la connexion thread-local et libere le slot de semaphore."""
+    c = getattr(_local, "conn", None)
+    if c is not None:
+        try: c.close()
+        except Exception: pass
+        _local.conn = None
+        if USE_POSTGRES and getattr(_local, "_pg_sem_held", False):
+            try: _get_pg_sem().release()
+            except Exception: pass
+            _local._pg_sem_held = False
+
 DATABASE_URL = (
     os.environ.get("DATABASE_URL")
     or os.environ.get("POSTGRES_URL")
@@ -505,34 +532,39 @@ def get_conn():
             conn.execute("SELECT 1")
             return conn
         except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            _local.conn = None
+            release_thread_conn()  # libere aussi le semaphore si postgres
 
     if USE_POSTGRES:
         if psycopg is None:
             raise RuntimeError(
                 "DATABASE_URL est configure mais le paquet psycopg n'est pas installe."
             )
-        connect_timeout = int(os.environ.get("KETAMON_PG_CONNECT_TIMEOUT", "8"))
-        statement_timeout = int(os.environ.get("KETAMON_PG_STATEMENT_TIMEOUT_MS", "30000"))
-        options = f"-c statement_timeout={statement_timeout} -c lock_timeout={statement_timeout}"
-        _boot_log(f"connexion PostgreSQL en cours (timeout={connect_timeout}s)")
-        raw_conn = psycopg.connect(
-            _postgres_dsn(),
-            connect_timeout=connect_timeout,
-            options=options,
-        )
-        # SQLite accepte qu'une migration "ADD COLUMN" echoue sans casser la suite.
-        # En PostgreSQL, une erreur laisse la transaction inutilisable; autocommit
-        # garde ces migrations idempotentes independantes les unes des autres.
-        raw_conn.autocommit = True
-        _boot_log("connexion PostgreSQL OK")
-        conn = PostgresConnection(raw_conn)
-        _local.conn = conn
-        return conn
+        sem = _get_pg_sem()
+        acquired = sem.acquire(timeout=30)
+        if not acquired:
+            raise RuntimeError("Impossible d'obtenir un slot de connexion PostgreSQL (timeout 30s)")
+        try:
+            connect_timeout = int(os.environ.get("KETAMON_PG_CONNECT_TIMEOUT", "8"))
+            statement_timeout = int(os.environ.get("KETAMON_PG_STATEMENT_TIMEOUT_MS", "30000"))
+            options = f"-c statement_timeout={statement_timeout} -c lock_timeout={statement_timeout}"
+            _boot_log(f"connexion PostgreSQL en cours (timeout={connect_timeout}s)")
+            raw_conn = psycopg.connect(
+                _postgres_dsn(),
+                connect_timeout=connect_timeout,
+                options=options,
+            )
+            # SQLite accepte qu'une migration "ADD COLUMN" echoue sans casser la suite.
+            # En PostgreSQL, une erreur laisse la transaction inutilisable; autocommit
+            # garde ces migrations idempotentes independantes les unes des autres.
+            raw_conn.autocommit = True
+            _boot_log("connexion PostgreSQL OK")
+            conn = PostgresConnection(raw_conn)
+            _local.conn = conn
+            _local._pg_sem_held = True
+            return conn
+        except Exception:
+            sem.release()
+            raise
 
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
