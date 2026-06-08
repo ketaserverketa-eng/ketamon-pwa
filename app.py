@@ -7990,11 +7990,15 @@ def _agent_chat_reply(msg: str):
 
 @app.route("/health")
 def health_check():
+    bg_thread = next((t for t in threading.enumerate() if t.name == "db-init"), None)
     return jsonify({
         "ok": True,
         "time": datetime.now().isoformat(),
         "db_ready": _db_ready.is_set(),
         "db_error": _db_init_error if not _db_ready.is_set() else None,
+        "db_thread": bg_thread.is_alive() if bg_thread else None,
+        "threads": [t.name for t in threading.enumerate()],
+        "thread_count": threading.active_count(),
     })
 
 
