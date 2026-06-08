@@ -256,6 +256,19 @@ def _clear_login_failures():
 
 # ── CSRF : génération + protection ────────────────────────────────────────────
 @app.before_request
+def _wait_for_db():
+    """Retourne 503 si la DB n'est pas encore prete (init en cours)."""
+    if _db_ready.is_set():
+        return
+    path = request.path or "/"
+    if path == "/health" or path.startswith("/static/") or path == "/sw.js":
+        return
+    if request.is_json or request.headers.get("Accept","").startswith("application/json"):
+        return jsonify({"ok": False, "msg": "Serveur en cours d'initialisation, reessayez dans quelques secondes"}), 503
+    return "<html><body style='font-family:sans-serif;padding:2rem'><h2>Demarrage en cours...</h2><p>Le serveur initialise la base de donnees. Rechargez la page dans 10 secondes.</p><script>setTimeout(()=>location.reload(),8000)</script></body></html>", 503
+
+
+@app.before_request
 def _ensure_csrf_and_protect():
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_hex(16)
@@ -389,12 +402,15 @@ db_mod.DB_PATH = os.path.join(DATA_DIR, "ketamon.db")
 db_mod.LEGACY_USERS_PATH = USERS_F
 db_mod.LEGACY_ROUTERS_PATH = ROUTERS_F
 
+_db_ready = threading.Event()
+
 def _bg_init_db():
     """Init DB en fond : l'app demarre sans attendre, /health repond tout de suite."""
     while True:
         try:
             db_mod.init_db()
             db_mod.release_thread_conn()
+            _db_ready.set()
             print("[INIT] DB initialisee avec succes")
             return
         except Exception as _e:
