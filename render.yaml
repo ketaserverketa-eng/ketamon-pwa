@@ -17,6 +17,8 @@ services:
         value: "0.05"
       - key: KETAMON_POSTGRES_SSLMODE
         value: require
+      - key: KETAMON_PG_MAX_CONN
+        value: "1"
       - key: DATABASE_URL
         sync: false
       - key: KETAMON_PUBLIC_URL
