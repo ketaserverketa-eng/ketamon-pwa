@@ -403,9 +403,11 @@ db_mod.LEGACY_USERS_PATH = USERS_F
 db_mod.LEGACY_ROUTERS_PATH = ROUTERS_F
 
 _db_ready = threading.Event()
+_db_init_error = ""
 
 def _bg_init_db():
     """Init DB en fond : l'app demarre sans attendre, /health repond tout de suite."""
+    global _db_init_error
     while True:
         try:
             db_mod.init_db()
@@ -414,7 +416,8 @@ def _bg_init_db():
             print("[INIT] DB initialisee avec succes")
             return
         except Exception as _e:
-            print(f"[INIT] DB indisponible, retry dans 15s : {_e}")
+            _db_init_error = f"{type(_e).__name__}: {_e}"
+            print(f"[INIT] DB indisponible, retry dans 15s : {_db_init_error}")
             time.sleep(15)
 
 threading.Thread(target=_bg_init_db, daemon=True, name="db-init").start()
@@ -7987,7 +7990,12 @@ def _agent_chat_reply(msg: str):
 
 @app.route("/health")
 def health_check():
-    return jsonify({"ok": True, "time": datetime.now().isoformat()})
+    return jsonify({
+        "ok": True,
+        "time": datetime.now().isoformat(),
+        "db_ready": _db_ready.is_set(),
+        "db_error": _db_init_error if not _db_ready.is_set() else None,
+    })
 
 
 # ─── Concepteur : Publicités ──────────────────────────────────────────────────
