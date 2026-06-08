@@ -582,6 +582,12 @@ def _run_expiry_engine():
             _status["epochs_written"] += total_written
             _status["tickets_expired"] += total_expired
 
+        _c = getattr(db_mod._local, "conn", None)
+        if _c is not None:
+            try: _c.close()
+            except Exception: pass
+            db_mod._local.conn = None
+
         triggered = _force_run_event.wait(cfg["expiry_interval"])
         if triggered:
             _force_run_event.clear()
@@ -616,6 +622,11 @@ def _run_revenue_engine():
                 _status["last_revenue_run"]  = datetime.now().isoformat(timespec="seconds")
                 _status["revenue_cycles"]   += 1
                 _status["ventes_synced"]    += total
+        _c = getattr(db_mod._local, "conn", None)
+        if _c is not None:
+            try: _c.close()
+            except Exception: pass
+            db_mod._local.conn = None
         time.sleep(cfg["revenue_interval"])
 
 
@@ -910,6 +921,11 @@ def _run_monitor_engine():
             with _status_lock:
                 _status["last_monitor_run"]  = datetime.now().isoformat(timespec="seconds")
                 _status["monitor_cycles"]   += 1
+        _c = getattr(db_mod._local, "conn", None)
+        if _c is not None:
+            try: _c.close()
+            except Exception: pass
+            db_mod._local.conn = None
         time.sleep(cfg["monitor_interval"])
 
 
