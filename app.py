@@ -5780,19 +5780,51 @@ def vouchers_print_view():
     )
 
 
+def _relay_logs_from_ventes(router_id, limit=300):
+    """Construit un journal de connexions depuis la table ventes (mode relay)."""
+    try:
+        rows = db_mod.db_get_ventes(router_id)
+    except Exception:
+        rows = []
+    logs = []
+    for v in reversed(rows or []):
+        user    = str(v.get("user")   or "").strip()
+        profil  = str(v.get("profil") or "").strip()
+        prix    = v.get("prix", 0)
+        devise  = str(v.get("devise") or "FCFA").strip()
+        reseau  = str(v.get("reseau") or "").strip()
+        date_s  = str(v.get("date")   or "").strip()
+        heure_s = str(v.get("heure")  or "").strip()[:5]
+        parts = [f"{user} connecte"]
+        if profil:
+            parts.append(f"profil:{profil}")
+        if prix and float(prix or 0) > 0:
+            parts.append(f"{prix} {devise}")
+        if reseau:
+            parts.append(f"reseau:{reseau}")
+        logs.append({
+            "time":    heure_s,
+            "topics":  "hotspot,info",
+            "message": "  ".join(parts),
+            "_date":   date_s,
+        })
+    return logs[:limit]
+
+
 @app.route("/journaux/hotspot")
 @login_required
 @router_required
 def log_hotspot():
     api, err = get_api()
     logs = []
+    router_id = session.get("router_id", "")
     if err:
         flash(err, "danger")
+    elif getattr(api, "is_relay_snapshot", False):
+        logs = _relay_logs_from_ventes(router_id, limit=200)
     else:
         try:
             all_logs = api.get_resource("/log").get()
-            # MikroTik double chaque event hotspot : une fois réel, une fois "->:" (proxy redirect).
-            # On ne garde que les entrées sans le préfixe "->:" pour éviter l'affichage en double.
             logs = [
                 l for l in all_logs
                 if "hotspot" in l.get("topics", "")
@@ -5809,8 +5841,11 @@ def log_hotspot():
 def log_users():
     api, err = get_api()
     logs = []
+    router_id = session.get("router_id", "")
     if err:
         flash(err, "danger")
+    elif getattr(api, "is_relay_snapshot", False):
+        logs = _relay_logs_from_ventes(router_id, limit=300)
     else:
         try:
             all_logs = api.get_resource("/log").get()
