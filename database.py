@@ -2024,6 +2024,63 @@ def db_batch_upsert_ticket_pricing(data_list: list):
     conn.commit()
 
 
+def db_backfill_ventes_from_ticket_pricing(router_id: str) -> int:
+    """Crée des entrées ventes pour tous les tickets de ticket_pricing sans vente.
+    Logique métier : un ticket créé = une vente (indépendamment de l'utilisation).
+    Utilise ticket_pricing.created_at comme date de vente."""
+    import uuid as _uuid
+    from datetime import datetime as _dt
+    router_id = str(router_id or "").strip()
+    if not router_id:
+        return 0
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT tp.router_id, tp.user, tp.profil,
+               CAST(tp.prix AS REAL) AS prix,
+               tp.devise, tp.reseau, tp.created_at
+        FROM ticket_pricing tp
+        LEFT JOIN ventes v ON v.router_id = tp.router_id AND v.user = tp.user
+        WHERE tp.router_id = ?
+          AND CAST(tp.prix AS REAL) > 0
+          AND v.id IS NULL
+    """, (router_id,)).fetchall()
+    if not rows:
+        return 0
+    ventes = []
+    for row in rows:
+        created_at = str(row["created_at"] or "")
+        try:
+            dt = _dt.fromisoformat(created_at.replace("Z", "+00:00")).replace(tzinfo=None)
+            date_str = dt.strftime("%Y-%m-%d")
+            time_str = dt.strftime("%H:%M:%S")
+        except Exception:
+            now = _dt.now()
+            date_str = now.strftime("%Y-%m-%d")
+            time_str = now.strftime("%H:%M:%S")
+        ventes.append({
+            "id":         _uuid.uuid4().hex,
+            "router_id":  row["router_id"],
+            "date":       date_str,
+            "heure":      time_str,
+            "user":       row["user"],
+            "profil":     row["profil"] or "",
+            "prix":       float(row["prix"] or 0),
+            "devise":     row["devise"] or "FCFA",
+            "reseau":     row["reseau"] or "",
+            "data_limit": "0",
+            "ticket_key": row["user"],
+        })
+    if not ventes:
+        return 0
+    conn.executemany(
+        """INSERT OR IGNORE INTO ventes(id,router_id,date,heure,user,profil,prix,devise,reseau,data_limit,ticket_key)
+           VALUES(:id,:router_id,:date,:heure,:user,:profil,:prix,:devise,:reseau,:data_limit,:ticket_key)""",
+        ventes
+    )
+    conn.commit()
+    return len(ventes)
+
+
 def db_delete_ticket_pricing(router_id: str, users) -> int:
     """Supprime de la DB les tickets/prix qui n'existent plus sur le MikroTik."""
     router_id = str(router_id or "").strip()
