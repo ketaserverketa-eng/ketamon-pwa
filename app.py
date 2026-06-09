@@ -4136,9 +4136,8 @@ def dashboard():
             ident_rows = api.get_resource("/system/identity").get()
             clock_rows = api.get_resource("/system/clock").get()
             rb_rows = api.get_resource("/system/routerboard").get()
-            if relay_mode and (not res_rows or not ident_rows):
+            if relay_mode:
                 data = _relay_database_dashboard_data(active_router_info)
-                router_error = "Affichage restaure depuis la base KetaMon en attendant le snapshot reel du MikroTik."
                 return render_template("dashboard.html", data=data, router_error=router_error, relay_mode=relay_mode, relay_commands=relay_commands)
             res   = res_rows[0] if res_rows else {}
             ident = ident_rows[0] if ident_rows else {}
