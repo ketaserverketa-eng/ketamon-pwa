@@ -2470,6 +2470,27 @@ def _record_active_revenues_from_database(router_id, active_rows):
         if not pricing:
             continue
         price = float(pricing["prix"] or 0)
+        profil = str(pricing["profil"] or "").strip()
+        # Si prix=0 dans ticket_pricing, chercher le prix reel depuis hotspot_profile_metadata
+        if price <= 0 and profil:
+            try:
+                meta_row = conn.execute(
+                    "SELECT price, currency FROM hotspot_profile_metadata"
+                    " WHERE router_id=? AND profile_name=? LIMIT 1",
+                    (router_id, profil),
+                ).fetchone()
+                if meta_row:
+                    meta_price = float(str(meta_row[0] or "0") or 0)
+                    if meta_price > 0:
+                        price = meta_price
+                        conn.execute(
+                            "UPDATE ticket_pricing SET prix=?, devise=? WHERE router_id=? AND user=?",
+                            (price, str(meta_row[1] or "FCFA"), router_id, username),
+                        )
+            except Exception:
+                pass
+        if price <= 0:
+            continue  # ticket genuinement gratuit ou profil sans prix configure
         # Utilise le debut de session comme date de premiere utilisation (plus precis que now)
         session_start = _active_started_datetime(active, now=now) or now
         try:
