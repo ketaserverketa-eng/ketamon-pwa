@@ -4291,12 +4291,58 @@ def reseau_clients():
         flash(err, "danger")
     else:
         try:
+            router_id_c = session.get("router_id", "")
             prof_filter = request.args.get("profil", "tous")
             comm_filter = request.args.get("commentaire", "")
             exp_filter  = request.args.get("expire", "")
             profiles = api.get_resource("/ip/hotspot/user/profile").get()
             servers  = api.get_resource("/ip/hotspot").get()
-            if comm_filter:
+            if getattr(api, "is_relay_snapshot", False):
+                # Relay : lire TOUS les tickets depuis ticket_pricing + hotspot_profile_metadata
+                conn_c = db_mod.get_conn()
+                if prof_filter and prof_filter != "tous":
+                    rows_c = conn_c.execute(
+                        "SELECT tp.user, tp.password, tp.profil, hp.time_limit"
+                        " FROM ticket_pricing tp"
+                        " LEFT JOIN hotspot_profile_metadata hp"
+                        "   ON hp.router_id=tp.router_id AND hp.profile_name=tp.profil"
+                        " WHERE tp.router_id=? AND tp.profil=? ORDER BY tp.user",
+                        (router_id_c, prof_filter)
+                    ).fetchall()
+                else:
+                    rows_c = conn_c.execute(
+                        "SELECT tp.user, tp.password, tp.profil, hp.time_limit"
+                        " FROM ticket_pricing tp"
+                        " LEFT JOIN hotspot_profile_metadata hp"
+                        "   ON hp.router_id=tp.router_id AND hp.profile_name=tp.profil"
+                        " WHERE tp.router_id=? ORDER BY tp.user",
+                        (router_id_c,)
+                    ).fetchall()
+                # Lire le snapshot pour les infos disabled/comment (100 max, best effort)
+                snap_users = {
+                    str(u.get("name") or "").strip(): u
+                    for u in _relay_snapshot_rows_from_db(router_id_c, "/ip/hotspot/user")
+                    if str(u.get("name") or "").strip()
+                }
+                users = []
+                for r in rows_c:
+                    uname = str(r[0] or "").strip()
+                    profil = str(r[2] or "default").strip()
+                    tl = str(r[3] or "").strip()
+                    snap = snap_users.get(uname, {})
+                    limit_uptime = coerce_ticket_time_limit_router(
+                        tl or _infer_time_limit_from_profile_name(profil),
+                        empty="0", prefer_legacy_routeros=False
+                    ) or "0"
+                    users.append({
+                        "name": uname,
+                        "password": str(r[1] or ""),
+                        "profile": profil,
+                        "limit-uptime": limit_uptime,
+                        "disabled": snap.get("disabled", "no"),
+                        "comment": snap.get("comment", ""),
+                    })
+            elif comm_filter:
                 users = api.get_resource("/ip/hotspot/user").get(**{"comment": comm_filter})
             elif exp_filter:
                 users = api.get_resource("/ip/hotspot/user").get(**{"limit-uptime": "1s"})
@@ -5640,9 +5686,18 @@ def vouchers():
         except Exception as e:
             _flash_err("Erreur lors du chargement des profils.", e)
         try:
-            all_users = api.get_resource("/ip/hotspot/user").get()
+            if getattr(api, "is_relay_snapshot", False):
+                # Relay : lire TOUS les tickets depuis ticket_pricing (pas limité à 100)
+                conn = db_mod.get_conn()
+                rows = conn.execute(
+                    "SELECT user, password, profil FROM ticket_pricing WHERE router_id=? ORDER BY user",
+                    (router_id,)
+                ).fetchall()
+                all_users = [{"name": str(r[0] or ""), "password": str(r[1] or ""), "profile": str(r[2] or "default")} for r in rows]
+            else:
+                all_users = api.get_resource("/ip/hotspot/user").get()
             for u in all_users:
-                pname = u.get("profile", "default")
+                pname = u.get("profile") or "default"
                 vouchers_data.setdefault(pname, []).append(u)
         except Exception as e:
             _flash_err("Erreur lors du chargement des utilisateurs.", e)
@@ -5677,7 +5732,16 @@ def vouchers_print_view():
     cards = []
 
     try:
-        all_users = api.get_resource("/ip/hotspot/user").get()
+        if getattr(api, "is_relay_snapshot", False):
+            # Relay : lire TOUS les tickets depuis ticket_pricing (pas limité à 100)
+            conn = db_mod.get_conn()
+            rows = conn.execute(
+                "SELECT user, password, profil FROM ticket_pricing WHERE router_id=? ORDER BY user",
+                (router_id,)
+            ).fetchall()
+            all_users = [{"name": str(r[0] or ""), "password": str(r[1] or ""), "profile": str(r[2] or "default")} for r in rows]
+        else:
+            all_users = api.get_resource("/ip/hotspot/user").get()
     except Exception as e:
         _flash_err("Erreur lors du chargement des bons.", e)
         return redirect(url_for("vouchers"))
