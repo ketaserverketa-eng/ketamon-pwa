@@ -60,7 +60,7 @@
       {% if request.args.get('mois') or request.args.get('annee') %}
       — {{ request.args.get('annee','') }}
       {% set _mois_noms = ['','Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc'] %}
-      {% if request.args.get('mois') %}{{ _mois_noms[request.args.get('mois')|int] }}{% endif %}
+      {% if request.args.get('mois') %}{% set _m = request.args.get('mois')|int %}{% if _m >= 1 and _m <= 12 %}{{ _mois_noms[_m] }}{% endif %}{% endif %}
       {% endif %}
     </h3>
     <div class="card-actions no-print" style="gap:6px;flex-wrap:wrap;align-items:center">

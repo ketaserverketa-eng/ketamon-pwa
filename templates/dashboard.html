@@ -475,7 +475,7 @@ setInterval(mettreAJourTrafic, 2000);
 fetch('/api/interfaces')
   .then(r=>r.json())
   .then(d=>{
-    if(!d.ok||!d.interfaces.length) return;
+    if(!d.ok||!d.interfaces||!d.interfaces.length) return;
     const sel=document.getElementById('iface-select');
     sel.innerHTML='';
     d.interfaces.forEach(i=>{
