@@ -2778,7 +2778,6 @@ def _sync_ventes_for_router(router_info, timeout=8):
             # Si le ticket a maintenant un marqueur epoch, on met à jour la clé ancien format
             if username in existing_users:
                 if ticket_key != username:
-                    # Ticket a maintenant un marqueur → migrer l'ancienne clé (format=username)
                     conn.execute(
                         "UPDATE ventes SET ticket_key=? WHERE router_id=? AND user=? AND ticket_key=?",
                         (ticket_key, router_id, username, username)
@@ -2786,6 +2785,19 @@ def _sync_ventes_for_router(router_info, timeout=8):
                     conn.commit()
                     existing_keys.add(ticket_key)
                     existing_keys.discard(username)
+                # Ticket actif EN CE MOMENT et date ≠ aujourd'hui → c'était un backfill,
+                # mettre à jour à la vraie date de vente (aujourd'hui = première utilisation détectée)
+                if username in active_with_traffic:
+                    row = conn.execute(
+                        "SELECT date FROM ventes WHERE router_id=? AND user=? LIMIT 1",
+                        (router_id, username)
+                    ).fetchone()
+                    if row and str(row[0] or "") != date_str:
+                        conn.execute(
+                            "UPDATE ventes SET date=?, heure=? WHERE router_id=? AND user=?",
+                            (date_str, time_str, router_id, username)
+                        )
+                        conn.commit()
                 continue  # déjà compté, jamais créer de doublon
 
             profile = str(u.get("profile", "default") or "default")
@@ -2923,6 +2935,19 @@ def _sync_ventes_from_relay(router):
                     (ticket_key, router_id, username, username)
                 )
                 conn.commit()
+            # Ticket actif EN CE MOMENT et date ≠ aujourd'hui → backfill artifact,
+            # mettre à jour à la vraie date de vente (aujourd'hui = première utilisation détectée)
+            if username in active_with_traffic:
+                row = conn.execute(
+                    "SELECT date FROM ventes WHERE router_id=? AND user=? LIMIT 1",
+                    (router_id, username)
+                ).fetchone()
+                if row and str(row[0] or "") != date_str:
+                    conn.execute(
+                        "UPDATE ventes SET date=?, heure=? WHERE router_id=? AND user=?",
+                        (date_str, time_str, router_id, username)
+                    )
+                    conn.commit()
             continue
 
         profile = str(u.get("profile") or "default").strip() or "default"
@@ -2999,13 +3024,6 @@ def _bg_ventes_loop():
                     }
                     if n:
                         _logger.info("[SYNC] %s : %d nouvelle(s) vente(s)", host, n)
-                    # Rétro-remplissage : tous les tickets de ticket_pricing → ventes
-                    try:
-                        backfilled = db_mod.db_backfill_ventes_from_ticket_pricing(rid)
-                        if backfilled:
-                            _logger.info("[SYNC] %s : %d ticket(s) backfillés dans ventes", host, backfilled)
-                    except Exception:
-                        pass
                     # Partage des stats avec l'agent moniteur
                     agent_mod.set_sync_stats({rid: {
                         "last_ok":    datetime.now().isoformat(timespec="seconds"),
@@ -3082,26 +3100,6 @@ threading.Thread(target=_bg_ventes_loop, daemon=True).start()
 threading.Thread(target=_bg_runtime_support_loop, daemon=True).start()
 
 
-def _startup_backfill_ventes():
-    """Rétro-remplit ventes depuis ticket_pricing au démarrage du serveur."""
-    try:
-        time.sleep(15)
-        for router in db_mod.db_get_routers():
-            rid = str(router.get("id") or router.get("host") or "").strip()
-            if not rid:
-                continue
-            try:
-                n = db_mod.db_backfill_ventes_from_ticket_pricing(rid)
-                if n:
-                    _logger.info("[STARTUP] backfill ventes routeur %s : %d ticket(s)", rid, n)
-            except Exception:
-                pass
-        db_mod.release_thread_conn()
-    except Exception as _e:
-        _logger.warning("[STARTUP] backfill ventes erreur: %s", _e)
-
-
-threading.Thread(target=_startup_backfill_ventes, daemon=True).start()
 if KETAMON_ENV in {"prod", "production"}:
     threading.Thread(target=_bg_keepalive_loop, daemon=True).start()
 agent_mod.start()
@@ -6252,8 +6250,7 @@ def api_sync_ventes():
             new_count = _sync_ventes_from_relay(router)
         else:
             new_count = _sync_ventes_for_router(router, timeout=8)
-        backfilled = db_mod.db_backfill_ventes_from_ticket_pricing(router_id)
-        return jsonify({"ok": True, "new": new_count, "backfilled": backfilled})
+        return jsonify({"ok": True, "new": new_count})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e), "new": 0})
 
