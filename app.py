@@ -1582,8 +1582,13 @@ def normalize_active_sessions(api, active_rows, users_map=None):
         row["debit-up"]   = _fmt_bytes(upload_bytes)
         row["download-bytes"] = str(download_bytes or "0")
         row["upload-bytes"] = str(upload_bytes or "0")
-        row["user_hotspot_id"] = router_item_id(user_row) if user_row else ""
-        row["profile"] = str(user_row.get("profile") or "-")
+        uid = router_item_id(user_row)
+        # En mode relay : si pas d'ID MikroTik, le nom suffit pour les operations relay (find where name=...)
+        if not uid and getattr(api, "is_relay_snapshot", False):
+            uid = str(row.get("user") or "").strip()
+        row["user_hotspot_id"] = uid
+        profile_val = str(user_row.get("profile") or "").strip()
+        row["profile"] = profile_val if profile_val and profile_val != "-" else "-"
         row["limit-uptime"] = str(user_row.get("limit-uptime") or "0")
         row["bytes-in-total"]  = str(user_row.get("bytes-in",  row.get("bytes-in",  0)))
         row["bytes-out-total"] = str(user_row.get("bytes-out", row.get("bytes-out", 0)))
@@ -1953,34 +1958,36 @@ def _enrich_active_users_from_database(router_id, active_rows, users_map):
         if not username:
             continue
         meta = _ticket_db_meta(router_id, username)
-        if not meta:
-            continue
-        limit_source = _ticket_meta_time_limit(meta)
-        limit_uptime = coerce_ticket_time_limit_router(limit_source, empty="0", prefer_legacy_routeros=False) or "0"
+        limit_source = _ticket_meta_time_limit(meta) if meta else ""
+        limit_uptime = coerce_ticket_time_limit_router(limit_source, empty="0", prefer_legacy_routeros=False) or "0" if limit_source else "0"
         existing = users_map.get(username)
         if existing:
-            # Relay/database fallback can restore a ticket before the router sends full user rows.
-            # Never keep "0" as unlimited when KetaMon knows the real profile duration.
             if limit_uptime and limit_uptime not in {"0", "0s", "none"}:
                 current_limit = str(existing.get("limit-uptime") or "").strip().lower()
                 if current_limit in {"", "0", "0s", "none"}:
                     existing["limit-uptime"] = limit_uptime
             if not str(existing.get("profile") or "").strip() or str(existing.get("profile") or "").strip() == "-":
-                existing["profile"] = meta.get("profil") or "default"
-            if not existing.get("comment"):
+                if meta:
+                    existing["profile"] = meta.get("profil") or "default"
+            if not existing.get("comment") and meta:
                 existing["comment"] = "restored-from-database"
+            # Garantir un .id pour les operations relay par nom
+            if not existing.get(".id") and not existing.get("id"):
+                existing[".id"] = username
             users_map[username] = existing
             continue
+        # Creer un user_row meme si absent de ticket_pricing (active session connue, ticket inconnu)
         users_map[username] = {
             "name": username,
-            "profile": meta.get("profil") or "default",
+            ".id": username,  # relay utilise [find where name=...] quand l'ID n'est pas un vrai ID MikroTik
+            "profile": (meta.get("profil") or "default") if meta else "-",
             "limit-uptime": limit_uptime,
-            "uptime": "0",
-            "bytes-in": (active or {}).get("bytes-in", "0"),
-            "bytes-out": (active or {}).get("bytes-out", "0"),
+            "uptime": str((active or {}).get("uptime") or "0"),
+            "bytes-in": str((active or {}).get("bytes-in") or "0"),
+            "bytes-out": str((active or {}).get("bytes-out") or "0"),
             "disabled": "no",
-            "comment": "restored-from-database",
-            "_source": "database",
+            "comment": "restored-from-database" if meta else "",
+            "_source": "database" if meta else "active-only",
         }
     return users_map
 
