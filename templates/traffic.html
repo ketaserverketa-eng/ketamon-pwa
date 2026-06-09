@@ -13,7 +13,24 @@
 .iface-badge{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;}
 .iface-up{background:rgba(34,197,94,.15);color:#22c55e;}
 .iface-down{background:rgba(239,68,68,.12);color:#ef4444;}
+.relay-notice{display:flex;align-items:center;gap:8px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:8px;padding:8px 14px;font-size:12px;color:#f59e0b;margin-bottom:14px;}
 </style>
+
+{% if is_relay %}
+<div class="relay-notice">
+  <i class="fa fa-cloud"></i>
+  <span>
+    <strong>Mode Relais Cloud</strong> — les données de trafic sont mises à jour toutes les ~30 secondes.
+    {% if relay_snap_age is not none %}
+      Dernier snapshot : il y a {{ relay_snap_age }}s.
+    {% endif %}
+    Le graphique affiche la moyenne sur la dernière période.
+  </span>
+  <button class="btn btn-xs btn-secondary" onclick="window.location.reload()" style="margin-left:auto">
+    <i class="fa fa-refresh"></i> Actualiser
+  </button>
+</div>
+{% endif %}
 
 <div class="card" style="margin-bottom:16px">
   <div class="card-header">
@@ -23,8 +40,8 @@
       <select id="iface-select" class="form-control form-control-sm" onchange="changerInterface()">
         {% for i in interfaces %}
         <option value="{{ i.get('name','') }}">
-          {{ i.get('name','') }} ({{ i.get('type','') }})
-          {% if i.get('running','false') != 'true' %} — hors ligne{% endif %}
+          {{ i.get('name','') }}{% if i.get('type','') %} ({{ i.get('type','') }}){% endif %}
+          {% if i.get('running','false') not in ('true','yes') %} — hors ligne{% endif %}
         </option>
         {% endfor %}
       </select>
@@ -34,19 +51,23 @@
     <div class="traffic-stats">
       <div class="traffic-stat">
         <div class="traffic-label">&#8595; Réception (Download)</div>
-        <div class="traffic-value" id="rx-rate">0 Ko/s</div>
+        <div class="traffic-value" id="rx-rate">— Ko/s</div>
         <div class="traffic-sub" id="rx-total">Total : —</div>
       </div>
       <div class="traffic-stat">
         <div class="traffic-label">&#8593; Émission (Upload)</div>
-        <div class="traffic-value" id="tx-rate">0 Ko/s</div>
+        <div class="traffic-value" id="tx-rate">— Ko/s</div>
         <div class="traffic-sub" id="tx-total">Total : —</div>
       </div>
     </div>
     <canvas id="traffic-chart" height="110"></canvas>
-    <div style="display:flex;justify-content:flex-end;gap:16px;margin-top:8px;font-size:11px">
-      <span style="color:#3b82f6">&#9632; Download</span>
-      <span style="color:#f97316">&#9632; Upload</span>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;font-size:11px">
+      <span id="trafic-status" style="color:#64748b"></span>
+      <span>
+        <span style="color:#3b82f6">&#9632; Download</span>
+        &nbsp;
+        <span style="color:#f97316">&#9632; Upload</span>
+      </span>
     </div>
   </div>
 </div>
@@ -62,8 +83,8 @@
           <th>Type</th>
           <th>Adresse MAC</th>
           <th>MTU</th>
-          <th>RX octets</th>
-          <th>TX octets</th>
+          <th>RX total</th>
+          <th>TX total</th>
           <th>État</th>
         </tr>
       </thead>
@@ -77,9 +98,9 @@
           <td>{{ i.get('rx-byte','—') }}</td>
           <td>{{ i.get('tx-byte','—') }}</td>
           <td>
-            {% if i.get('running','false') == 'true' %}
+            {% if i.get('running','false') in ('true','yes') %}
             <span class="badge badge-green">Actif</span>
-            {% elif i.get('disabled','false') == 'true' %}
+            {% elif i.get('disabled','false') in ('true','yes') %}
             <span class="badge badge-red">Désactivé</span>
             {% else %}
             <span class="badge">Inactif</span>
@@ -87,7 +108,7 @@
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="7" class="text-center text-muted">Aucune interface.</td></tr>
+        <tr><td colspan="7" class="text-center text-muted">Aucune interface disponible.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -95,6 +116,8 @@
 </div>
 
 <script>
+const IS_RELAY = {{ 'true' if is_relay else 'false' }};
+
 /* ── Utilitaires ── */
 function fmtRate(bps){
   bps = parseInt(bps) || 0;
@@ -116,6 +139,7 @@ function fmtBytes(n){
 const MAX_PTS = 50;
 let rxHist = new Array(MAX_PTS).fill(0);
 let txHist = new Array(MAX_PTS).fill(0);
+let dataReceived = false;
 
 function dessinerGraphe(canvas){
   const W = canvas.offsetWidth;
@@ -155,7 +179,6 @@ function dessinerGraphe(canvas){
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     ctx.stroke();
-    /* Remplissage */
     ctx.lineTo(pad.left + gW, pad.top + gH);
     ctx.lineTo(pad.left, pad.top + gH);
     ctx.closePath();
@@ -169,33 +192,64 @@ function dessinerGraphe(canvas){
 
 /* ── Polling trafic ── */
 const canvas = document.getElementById('traffic-chart');
+let pollErrors = 0;
 
 function actualiserTrafic(){
-  const iface = document.getElementById('iface-select').value;
+  const sel = document.getElementById('iface-select');
+  const iface = sel ? sel.value : '';
+  if(!iface){ setStatus('Aucune interface sélectionnée.', 'warn'); return; }
+
   fetch(`/api/trafic?interface=${encodeURIComponent(iface)}`)
     .then(r => r.json())
     .then(d => {
-      if(!d.ok) return;
+      pollErrors = 0;
+      if(!d.ok){
+        setStatus('Interface introuvable : ' + (d.msg || ''), 'warn');
+        return;
+      }
+      dataReceived = true;
       rxHist.push(d.rx_rate); if(rxHist.length > MAX_PTS) rxHist.shift();
       txHist.push(d.tx_rate); if(txHist.length > MAX_PTS) txHist.shift();
-      document.getElementById('rx-rate').textContent  = fmtRate(d.rx_rate);
-      document.getElementById('tx-rate').textContent  = fmtRate(d.tx_rate);
+      document.getElementById('rx-rate').textContent = fmtRate(d.rx_rate);
+      document.getElementById('tx-rate').textContent = fmtRate(d.tx_rate);
       document.getElementById('rx-total').textContent = 'Total : ' + fmtBytes(d.rx);
       document.getElementById('tx-total').textContent = 'Total : ' + fmtBytes(d.tx);
+      if(IS_RELAY){
+        if(d.rx_rate === 0 && d.tx_rate === 0){
+          setStatus('En attente du prochain snapshot relais (~30s)...', 'wait');
+        } else {
+          setStatus('Moyenne sur la dernière periode de 30s.', 'ok');
+        }
+      } else {
+        setStatus('', 'ok');
+      }
       dessinerGraphe(canvas);
-    }).catch(()=>{});
+    })
+    .catch(()=>{
+      pollErrors++;
+      if(pollErrors >= 3) setStatus('Erreur de connexion au serveur.', 'error');
+    });
+}
+
+function setStatus(msg, type){
+  const el = document.getElementById('trafic-status');
+  if(!el) return;
+  const colors = {ok:'#22c55e', warn:'#f59e0b', wait:'#64748b', error:'#ef4444'};
+  el.style.color = colors[type] || '#64748b';
+  el.textContent = msg;
 }
 
 function changerInterface(){
   rxHist = new Array(MAX_PTS).fill(0);
   txHist = new Array(MAX_PTS).fill(0);
+  dataReceived = false;
   actualiserTrafic();
 }
 
 actualiserTrafic();
-setInterval(actualiserTrafic, 3000);
+/* En mode relais, poll toutes les 10s (inutile de poller toutes les 3s — snapshot = 30s) */
+setInterval(actualiserTrafic, IS_RELAY ? 10000 : 3000);
 
-/* Redimensionner le canvas quand la fenêtre change */
 window.addEventListener('resize', () => dessinerGraphe(canvas));
 </script>
 {% endblock %}

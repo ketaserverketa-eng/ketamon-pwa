@@ -6003,6 +6003,8 @@ def dhcp_rendre_statique():
 def traffic_monitor():
     api, err = get_api()
     interfaces = []
+    is_relay = getattr(api, "is_relay_snapshot", False) if api else False
+    relay_snap_age = None
     if err:
         flash(err, "danger")
     else:
@@ -6010,7 +6012,20 @@ def traffic_monitor():
             interfaces = api.get_resource("/interface").get()
         except Exception as e:
             _flash_err("Une erreur est survenue.", e)
-    return render_template("traffic.html", interfaces=interfaces)
+    if is_relay:
+        try:
+            router_id = session.get("router_id", "")
+            conn = db_mod.get_conn()
+            row = conn.execute(
+                "SELECT updated_at FROM router_relay_snapshots WHERE router_id=? AND resource=? LIMIT 1",
+                (router_id, "/interface")
+            ).fetchone()
+            if row and row["updated_at"]:
+                dt = datetime.fromisoformat(str(row["updated_at"]).replace("Z", "+00:00")).replace(tzinfo=None)
+                relay_snap_age = max(0, int((datetime.now() - dt).total_seconds()))
+        except Exception:
+            pass
+    return render_template("traffic.html", interfaces=interfaces, is_relay=is_relay, relay_snap_age=relay_snap_age)
 
 @app.route("/api/interfaces")
 @login_required
@@ -6063,9 +6078,14 @@ def api_traffic():
             # et le maintenir entre deux cycles pour éviter les zéros permanents.
             snap_ts = ""
             try:
-                snaps = db_mod.db_get_router_relay_snapshot(router_id)
-                iface_meta = snaps.get("/interface", {}) if isinstance(snaps, dict) else {}
-                snap_ts = str(iface_meta.get("updated_at") or "")
+                # Requête légère : récupère uniquement updated_at, pas les données complètes
+                conn = db_mod.get_conn()
+                row = conn.execute(
+                    "SELECT updated_at FROM router_relay_snapshots WHERE router_id=? AND resource=? LIMIT 1",
+                    (router_id, "/interface")
+                ).fetchone()
+                if row:
+                    snap_ts = str(row["updated_at"] or "")
             except Exception:
                 pass
             cached = _relay_iface_snap.get(key)
