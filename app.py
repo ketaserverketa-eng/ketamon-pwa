@@ -3276,6 +3276,19 @@ def build_ketamon_ticket_expiry_script_source():
 
 
 def upsert_router_script(api, name, source):
+    if getattr(api, "is_relay_snapshot", False):
+        # Relay: pas de snapshot /system/script — upsert inline RouterOS (add ou set)
+        policy = "ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon"
+        escaped = _relay_routeros_quote(source)
+        upsert_src = "\n".join([
+            f':if ([:len [/system script find name="{name}"]] > 0) do={{',
+            f'  /system script set [find name="{name}"] source={escaped} policy="{policy}";',
+            f'}} else={{',
+            f'  /system script add name="{name}" source={escaped} policy="{policy}";',
+            f'}}',
+        ])
+        api.queue_routeros_script(upsert_src)
+        return
     resource = api.get_resource("/system/script")
     params = {
         "name": name,
@@ -3353,7 +3366,12 @@ def _ensure_ticket_runtime_profile_binding(api, profile_resource, profile_row):
         desired_on_login = wrapper_name
 
     if current_on_login != desired_on_login:
-        profile_resource.set(id=router_item_id(profile_row), **{"on-login": desired_on_login})
+        item_id = router_item_id(profile_row)
+        if item_id:
+            profile_resource.set(id=item_id, **{"on-login": desired_on_login})
+        elif profile_name:
+            # Profil synthétique (DB seulement, pas encore dans snapshot) — set par nom
+            profile_resource.set(id=profile_name, **{"on-login": desired_on_login})
 
 
 def ensure_ticket_runtime_support(api, profile_name=None):
@@ -4454,7 +4472,23 @@ def reseau_ajouter_client():
             if server:
                 params["server"] = server
             api.get_resource("/ip/hotspot/user").add(**params)
-            flash(f'Client "{name}" cree. 1 ticket = 1 appareil, compteur absolu a la premiere connexion.', "success")
+            # Enregistrer immédiatement dans ticket_pricing (relay ou direct)
+            try:
+                profiles_meta = get_hotspot_profile_metadata_map(router_id)
+                meta = profiles_meta.get(profile, {})
+                db_mod.db_batch_upsert_ticket_pricing([{
+                    "router_id": router_id,
+                    "user": name,
+                    "password": passwd,
+                    "prix": float(meta.get("price") or 0),
+                    "devise": meta.get("currency") or "FCFA",
+                    "profil": profile,
+                    "reseau": server or "",
+                }])
+            except Exception:
+                pass
+            relay_note = " Les tickets seront actifs sur le routeur dans ~30 secondes (mode relais)." if getattr(api, "is_relay_snapshot", False) else ""
+            flash(f'Client "{name}" cree.{relay_note}', "success")
             return redirect(url_for("reseau_clients"))
         except ValueError as e:
             flash(str(e), "warning")
@@ -4893,11 +4927,12 @@ def hotspot_generate_safe():
                     source="web",
                 )
 
+            relay_note = " Ils seront actifs sur le routeur dans ~30 secondes (mode relais)." if getattr(api, "is_relay_snapshot", False) else ""
             if len(generated) == qty:
-                flash(f"{len(generated)} ticket(s) crees.", "success")
+                flash(f"{len(generated)} ticket(s) crees.{relay_note}", "success")
             else:
                 detail = gen_errors[-1] if gen_errors else "quantite partielle"
-                flash(f"{len(generated)}/{qty} ticket(s) crees. {detail}", "warning")
+                flash(f"{len(generated)}/{qty} ticket(s) crees. {detail}{relay_note}", "warning")
         except TicketGenerationBusyError as e:
             skip_profile_load = True
             flash(str(e), "warning")
