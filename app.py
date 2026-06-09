@@ -2238,11 +2238,19 @@ def _maybe_queue_relay_auto_upgrade(router, token, counts):
         active_count = _fresh_relay_snapshot_count(snapshots, "/ip/hotspot/active", active_count)
     except Exception:
         pass
-    # On met a jour seulement quand le snapshot prouve que le relais est incomplet:
-    # sessions actives presentes mais aucun ticket/profil remonte.
+    # Vérifier si la version du script est obsolète (< safe-snapshot-v4)
+    needs_version_upgrade = False
+    try:
+        relay_status_meta = snapshots.get("/ketamon/relay-status", {}) if isinstance(snapshots, dict) else {}
+        relay_status_data = relay_status_meta.get("data", []) if isinstance(relay_status_meta, dict) else []
+        current_source = str((relay_status_data[0] if relay_status_data else {}).get("source") or "")
+        needs_version_upgrade = current_source not in ("safe-snapshot-v4",)
+    except Exception:
+        pass
+    # Déclencher si : snapshot incomplet OU version obsolète
     incomplete_user_snapshot = active_count > 0 and user_count == 0
     incomplete_profile_snapshot = active_count > 0 and profile_count == 0
-    if not (incomplete_user_snapshot or incomplete_profile_snapshot):
+    if not (incomplete_user_snapshot or incomplete_profile_snapshot or needs_version_upgrade):
         return False
     now = time.time()
     last = float(_RELAY_AUTO_UPGRADE_LAST.get(router_id) or 0)
@@ -7045,7 +7053,7 @@ def _build_routeros_relay_script(base_url, token):
         f"    :do {{ /tool fetch url=\"{next_url}\" dst-path=\"ketamon-relay-next.rsc\" keep-result=yes; :delay 1s; /import file-name=\"ketamon-relay-next.rsc\"; /file remove [find name=\"ketamon-relay-next.rsc\"]; }} on-error={{}}",
         "  }",
         "  :local p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
-        "  :do { :set p ($p . \"R=/ketamon/relay-status|source=safe-snapshot-v3|hotspot-users-found=\" . [$ktmEsc [:len [/ip hotspot user find]]] . $NL); } on-error={};",
+        "  :do { :set p ($p . \"R=/ketamon/relay-status|source=safe-snapshot-v4|hotspot-users-found=\" . [$ktmEsc [:len [/ip hotspot user find]]] . $NL); } on-error={};",
         "  :do { :set p ($p . \"R=/system/identity|name=\" . [$ktmEsc [/system identity get name]] . $NL); } on-error={};",
         "  :do { :set p ($p . \"R=/system/resource|version=\" . [$ktmEsc [/system resource get version]] . \"|uptime=\" . [$ktmEsc [/system resource get uptime]] . \"|cpu-load=\" . [$ktmEsc [/system resource get cpu-load]] . \"|total-memory=\" . [$ktmEsc [/system resource get total-memory]] . \"|free-memory=\" . [$ktmEsc [/system resource get free-memory]] . \"|total-hdd-space=\" . [$ktmEsc [/system resource get total-hdd-space]] . \"|free-hdd-space=\" . [$ktmEsc [/system resource get free-hdd-space]] . \"|board-name=\" . [$ktmEsc [/system resource get board-name]] . $NL); } on-error={};",
         "  :do { :set p ($p . \"R=/system/clock|time=\" . [$ktmEsc [/system clock get time]] . \"|date=\" . [$ktmEsc [/system clock get date]] . $NL); } on-error={};",
@@ -7091,6 +7099,9 @@ def _build_routeros_relay_script(base_url, token):
         send_line(),
         "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
         "  :do { :foreach i in=[/interface print as-value] do={ :set p ($p . \"R=/interface|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|type=\" . [$ktmEsc ($i->\"type\")] . \"|running=\" . [$ktmEsc ($i->\"running\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|actual-mtu=\" . [$ktmEsc ($i->\"actual-mtu\")] . \"|mtu=\" . [$ktmEsc ($i->\"mtu\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|rx-byte=\" . [$ktmEsc ($i->\"rx-byte\")] . \"|tx-byte=\" . [$ktmEsc ($i->\"tx-byte\")] . \"|rx-packet=\" . [$ktmEsc ($i->\"rx-packet\")] . \"|tx-packet=\" . [$ktmEsc ($i->\"tx-packet\")] . $NL); } } on-error={};",
+        send_line(),
+        "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
+        "  :do { :local c 0; :foreach i in=[/ip dhcp-server lease print as-value] do={ :if ($c < 500) do={ :set p ($p . \"R=/ip/dhcp-server/lease|.id=\" . [$ktmEsc ($i->\".id\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|host-name=\" . [$ktmEsc ($i->\"host-name\")] . \"|status=\" . [$ktmEsc ($i->\"status\")] . \"|dynamic=\" . [$ktmEsc ($i->\"dynamic\")] . \"|comment=\" . [$ktmEsc ($i->\"comment\")] . $NL); :set c ($c + 1); } } } on-error={};",
         send_line(),
         "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
         "  :do { :local c 0; :foreach i in=[/log print as-value] do={ :if ($c < 120) do={ :set p ($p . \"R=/log|.id=\" . [$ktmEsc ($i->\".id\")] . \"|time=\" . [$ktmEsc ($i->\"time\")] . \"|topics=\" . [$ktmEsc ($i->\"topics\")] . \"|message=\" . [$ktmEsc ($i->\"message\")] . $NL); :set c ($c + 1); } } } on-error={};",
