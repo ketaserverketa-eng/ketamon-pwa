@@ -2385,7 +2385,65 @@ def _enforce_relay_snapshot_expirations(router):
             except Exception:
                 pass
 
-    return {"expired": len(expired), "patched": patched, "cleaned": cleaned, "recorded": recorded}
+    # Fix 3 : vérifier TOUS les tickets via ticket_pricing+ventes, pas uniquement le snapshot 100-users
+    snapshot_usernames = {str(u.get("name") or "").strip() for u in users if str(u.get("name") or "").strip()}
+    db_extra_expired = []
+    try:
+        conn = db_mod.get_conn()
+        all_tp = conn.execute(
+            "SELECT tp.user, tp.profil, hp.time_limit"
+            " FROM ticket_pricing tp"
+            " LEFT JOIN hotspot_profile_metadata hp"
+            "   ON hp.router_id=tp.router_id AND hp.profile_name=tp.profil"
+            " WHERE tp.router_id=?",
+            (router_id,)
+        ).fetchall()
+        for tp in all_tp:
+            username = str(tp[0] or "").strip()
+            if not username or username in snapshot_usernames:
+                continue
+            first_use_str = first_used_map.get(username)
+            if not first_use_str:
+                continue  # jamais utilisé → ne pas toucher
+            profil = str(tp[1] or "").strip()
+            tl_raw = str(tp[2] or "").strip() or _infer_time_limit_from_profile_name(profil)
+            if not tl_raw or tl_raw.lower() in {"0", "0s", "none"}:
+                continue
+            limit_seconds = parse_routeros_duration(
+                coerce_ticket_time_limit_router(tl_raw, empty="0", prefer_legacy_routeros=False) or "0"
+            )
+            if not limit_seconds or limit_seconds <= 0:
+                continue
+            first_dt = _effective_first_used_datetime(first_use_str, None, now=now)
+            if not first_dt:
+                continue
+            if now < first_dt + timedelta(seconds=limit_seconds):
+                continue
+            merged = {"username": username, "name": username}
+            active_row = active_by_user.get(username) or {}
+            if active_row:
+                merged["address"] = active_row.get("address")
+                merged["mac-address"] = active_row.get("mac-address")
+            db_extra_expired.append(merged)
+    except Exception:
+        pass
+    if db_extra_expired:
+        for i in range(0, len(db_extra_expired), 200):
+            batch = db_extra_expired[i:i + 200]
+            source = _relay_expired_cleanup_source(batch)
+            if source:
+                db_mod.db_enqueue_router_relay_command(
+                    router_id,
+                    router.get("owner_id", ""),
+                    "routeros-script",
+                    {"source": source},
+                )
+        try:
+            db_mod.db_delete_ticket_pricing(router_id, [row["username"] for row in db_extra_expired])
+        except Exception:
+            pass
+
+    return {"expired": len(expired) + len(db_extra_expired), "patched": patched, "cleaned": cleaned, "recorded": recorded}
 
 
 def _record_active_revenues_from_database(router_id, active_rows):
@@ -2412,21 +2470,21 @@ def _record_active_revenues_from_database(router_id, active_rows):
         if not pricing:
             continue
         price = float(pricing["prix"] or 0)
-        if price <= 0:
-            continue
+        # Utilise le debut de session comme date de premiere utilisation (plus precis que now)
+        session_start = _active_started_datetime(active, now=now) or now
         try:
             db_mod.db_insert_vente({
                 "id": uuid.uuid4().hex,
                 "router_id": router_id,
-                "date": now.strftime("%Y-%m-%d"),
-                "heure": now.strftime("%H:%M:%S"),
+                "date": session_start.strftime("%Y-%m-%d"),
+                "heure": session_start.strftime("%H:%M:%S"),
                 "user": username,
                 "profil": pricing["profil"] or "",
                 "prix": price,
                 "devise": pricing["devise"] or "FCFA",
                 "reseau": pricing["reseau"] or "",
                 "data_limit": "0",
-                "ticket_key": f"{username}:{int(now.timestamp())}",
+                "ticket_key": f"{username}:{int(session_start.timestamp())}",
             })
             inserted += 1
         except Exception:
@@ -2538,10 +2596,11 @@ def _repair_active_ticket_epochs(api, router_id, active_rows=None, users_map=Non
         else:
             if not active_row:
                 continue
-            used_seconds = parse_routeros_duration(user_row.get("uptime-used"))
-            if used_seconds is None:
-                used_seconds = parse_routeros_duration(active_row.get("uptime")) or 0
-            expire_dt = server_now + timedelta(seconds=max(limit_seconds - used_seconds, 0))
+            # Utilise le debut de session comme proxy de premiere utilisation
+            session_start = _active_started_datetime(active_row, now=server_now)
+            if not session_start:
+                continue
+            expire_dt = session_start + timedelta(seconds=limit_seconds)
 
         if current_expire_dt:
             drift = abs(int((current_expire_dt - expire_dt).total_seconds()))
