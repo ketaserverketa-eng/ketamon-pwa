@@ -6108,9 +6108,42 @@ def traffic_monitor():
         flash(err, "danger")
     else:
         try:
-            interfaces = api.get_resource("/interface").get()
+            raw_ifaces = api.get_resource("/interface").get()
+            # Normalisation : interface "running" = true si non désactivée OU a des compteurs > 0
+            for iface in (raw_ifaces or []):
+                run = str(iface.get("running") or "").strip().lower()
+                dis = str(iface.get("disabled") or "").strip().lower()
+                rx  = int(iface.get("rx-byte") or 0)
+                tx  = int(iface.get("tx-byte") or 0)
+                if run not in ("true", "yes") and (dis not in ("true", "yes") or rx > 0 or tx > 0):
+                    iface["running"] = "true"
+            interfaces = raw_ifaces or []
         except Exception as e:
             _flash_err("Une erreur est survenue.", e)
+
+    # Mettre l'interface hotspot en tête de liste (c'est là où passe le trafic clients)
+    if interfaces:
+        try:
+            hotspot_iface = ""
+            router_id = session.get("router_id", "")
+            hs_rows = db_mod.db_get_router_relay_snapshot(router_id, "/ip/hotspot") if is_relay else []
+            if hs_rows:
+                hotspot_iface = str((hs_rows[0] if hs_rows else {}).get("interface") or "").strip()
+            if not hotspot_iface:
+                # Essai via API directe
+                try:
+                    hs = api.get_resource("/ip/hotspot").get()
+                    hotspot_iface = str((hs[0] if hs else {}).get("interface") or "").strip()
+                except Exception:
+                    pass
+            if hotspot_iface:
+                interfaces = sorted(
+                    interfaces,
+                    key=lambda i: (0 if str(i.get("name") or "") == hotspot_iface else 1)
+                )
+        except Exception:
+            pass
+
     if is_relay:
         try:
             router_id = session.get("router_id", "")
