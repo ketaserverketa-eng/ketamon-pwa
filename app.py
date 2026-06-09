@@ -3513,12 +3513,33 @@ def _relay_database_dashboard_data(router):
         ORDER BY COUNT(*) DESC
         LIMIT 1
     """, (router_id,)).fetchone()
-    # Lire les ressources systeme depuis le snapshot relay
+    # Lire les ressources systeme depuis les snapshots relay
     res = {}
+    ident = {}
+    clock = {}
+    rb = {}
     try:
-        res_rows = db_mod.db_get_router_relay_snapshot(router_id, "/system/resource")
-        if res_rows and isinstance(res_rows, list) and res_rows:
-            res = dict(res_rows[0])
+        rows = db_mod.db_get_router_relay_snapshot(router_id, "/system/resource")
+        if rows and isinstance(rows, list):
+            res = dict(rows[0])
+    except Exception:
+        pass
+    try:
+        rows = db_mod.db_get_router_relay_snapshot(router_id, "/system/identity")
+        if rows and isinstance(rows, list):
+            ident = dict(rows[0])
+    except Exception:
+        pass
+    try:
+        rows = db_mod.db_get_router_relay_snapshot(router_id, "/system/clock")
+        if rows and isinstance(rows, list):
+            clock = dict(rows[0])
+    except Exception:
+        pass
+    try:
+        rows = db_mod.db_get_router_relay_snapshot(router_id, "/system/routerboard")
+        if rows and isinstance(rows, list):
+            rb = dict(rows[0])
     except Exception:
         pass
     total_mem = int(res.get("total-memory", 0) or 0)
@@ -3526,10 +3547,14 @@ def _relay_database_dashboard_data(router):
     total_hdd = int(res.get("total-hdd-space", 0) or 0)
     free_hdd  = int(res.get("free-hdd-space",  0) or 0)
     mem_pct   = round((total_mem - free_mem) / total_mem * 100) if total_mem else 0
+    identity  = ident.get("name") or res.get("board-name") or router.get("name") or "MikroTik"
+    board     = rb.get("model") or res.get("board-name") or "Relais KetaMon"
+    clk_time  = clock.get("time") or ""
+    clk_date  = clock.get("date") or router.get("relay_last_seen") or ""
     return {
-        "identity": res.get("board-name") or router.get("name") or "MikroTik",
-        "board": "Donnees restaurees",
-        "version": res.get("version") or "Base KetaMon",
+        "identity": identity,
+        "board": board,
+        "version": res.get("version") or "RouterOS",
         "uptime": res.get("uptime") or "",
         "cpu_load": str(res.get("cpu-load") or "0"),
         "total_mem": mk.format_bytes(total_mem) if total_mem else "",
@@ -3537,8 +3562,8 @@ def _relay_database_dashboard_data(router):
         "mem_pct": mem_pct,
         "total_hdd": mk.format_bytes(total_hdd) if total_hdd else "",
         "free_hdd": mk.format_bytes(free_hdd) if free_hdd else "",
-        "time": "",
-        "date": router.get("relay_last_seen") or "",
+        "time": clk_time,
+        "date": clk_date,
         "hs_users": tickets,
         "hs_active": active,
         "hs_profiles": profiles,
@@ -4221,61 +4246,64 @@ def dashboard():
     active_router_info = get_active_router() or {}
     relay_mode = bool(int(active_router_info.get("relay_enabled") or 0))
     relay_commands = db_mod.db_get_router_relay_commands(active_router_info.get("id", ""), limit=8) if relay_mode else []
-    api, err = get_api()
     data = {}
     router_error = ""
-    if err:
-        router_error = str(err)
-        flash(err, "danger")
-    else:
+    if relay_mode:
         try:
-            res_rows = api.get_resource("/system/resource").get()
-            ident_rows = api.get_resource("/system/identity").get()
-            clock_rows = api.get_resource("/system/clock").get()
-            rb_rows = api.get_resource("/system/routerboard").get()
-            if relay_mode:
-                data = _relay_database_dashboard_data(active_router_info)
-                return render_template("dashboard.html", data=data, router_error=router_error, relay_mode=relay_mode, relay_commands=relay_commands)
-            res   = res_rows[0] if res_rows else {}
-            ident = ident_rows[0] if ident_rows else {}
-            clock = clock_rows[0] if clock_rows else {}
-            rb    = rb_rows[0] if rb_rows else {}
-            hs_users    = resource_count(api, "/ip/hotspot/user")
-            hs_active   = resource_count(api, "/ip/hotspot/active")
-            hs_profiles = resource_count(api, "/ip/hotspot/user/profile")
-            hs_list     = api.get_resource("/ip/hotspot").get()
-
-            total_mem  = int(res.get("total-memory", 0))
-            free_mem   = int(res.get("free-memory", 0))
-            total_hdd  = int(res.get("total-hdd-space", 0))
-            free_hdd   = int(res.get("free-hdd-space", 0))
-            mem_used   = total_mem - free_mem
-            mem_pct    = round(mem_used / total_mem * 100) if total_mem else 0
-
-            router = get_active_router() or {}
-            data = {
-                "identity":     ident.get("name", "MikroTik"),
-                "board":        rb.get("model", res.get("board-name", "?")),
-                "version":      res.get("version", "?"),
-                "uptime":       res.get("uptime", "?"),
-                "cpu_load":     res.get("cpu-load", "0"),
-                "total_mem":    mk.format_bytes(total_mem),
-                "free_mem":     mk.format_bytes(free_mem),
-                "mem_pct":      mem_pct,
-                "total_hdd":    mk.format_bytes(total_hdd),
-                "free_hdd":     mk.format_bytes(free_hdd),
-                "time":         clock.get("time", ""),
-                "date":         clock.get("date", ""),
-                "hs_users":     hs_users,
-                "hs_active":    hs_active,
-                "hs_profiles":  hs_profiles,
-                "hs_servers":   [h.get("name", "") for h in hs_list],
-                "router_host":  router.get("host", ""),
-                "router_port":  str(router.get("port", "8728")),
-            }
+            data = _relay_database_dashboard_data(active_router_info)
         except Exception as e:
             router_error = str(e)
-            _flash_err("Erreur de communication MikroTik.", e)
+    else:
+        api, err = get_api()
+        if err:
+            router_error = str(err)
+            flash(err, "danger")
+        else:
+            try:
+                res_rows = api.get_resource("/system/resource").get()
+                ident_rows = api.get_resource("/system/identity").get()
+                clock_rows = api.get_resource("/system/clock").get()
+                rb_rows = api.get_resource("/system/routerboard").get()
+                res   = res_rows[0] if res_rows else {}
+                ident = ident_rows[0] if ident_rows else {}
+                clock = clock_rows[0] if clock_rows else {}
+                rb    = rb_rows[0] if rb_rows else {}
+                hs_users    = resource_count(api, "/ip/hotspot/user")
+                hs_active   = resource_count(api, "/ip/hotspot/active")
+                hs_profiles = resource_count(api, "/ip/hotspot/user/profile")
+                hs_list     = api.get_resource("/ip/hotspot").get()
+
+                total_mem  = int(res.get("total-memory", 0))
+                free_mem   = int(res.get("free-memory", 0))
+                total_hdd  = int(res.get("total-hdd-space", 0))
+                free_hdd   = int(res.get("free-hdd-space", 0))
+                mem_used   = total_mem - free_mem
+                mem_pct    = round(mem_used / total_mem * 100) if total_mem else 0
+
+                router = get_active_router() or {}
+                data = {
+                    "identity":     ident.get("name", "MikroTik"),
+                    "board":        rb.get("model", res.get("board-name", "?")),
+                    "version":      res.get("version", "?"),
+                    "uptime":       res.get("uptime", "?"),
+                    "cpu_load":     res.get("cpu-load", "0"),
+                    "total_mem":    mk.format_bytes(total_mem),
+                    "free_mem":     mk.format_bytes(free_mem),
+                    "mem_pct":      mem_pct,
+                    "total_hdd":    mk.format_bytes(total_hdd),
+                    "free_hdd":     mk.format_bytes(free_hdd),
+                    "time":         clock.get("time", ""),
+                    "date":         clock.get("date", ""),
+                    "hs_users":     hs_users,
+                    "hs_active":    hs_active,
+                    "hs_profiles":  hs_profiles,
+                    "hs_servers":   [h.get("name", "") for h in hs_list],
+                    "router_host":  router.get("host", ""),
+                    "router_port":  str(router.get("port", "8728")),
+                }
+            except Exception as e:
+                router_error = str(e)
+                _flash_err("Erreur de communication MikroTik.", e)
     return render_template("dashboard.html", data=data, router_error=router_error, relay_mode=relay_mode, relay_commands=relay_commands)
 
 # ─── Hotspot : Utilisateurs ──────────────────────────────────────────────────
