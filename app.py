@@ -3510,6 +3510,29 @@ def _relay_fallback_rows(router_id, path):
         """, (router_id,)).fetchone()
         if row and row["reseau"]:
             return [{".id": "*db-hotspot-1", "name": row["reseau"], "_source": "database"}]
+    if path == "/interface":
+        iface_name = "ether1"
+        try:
+            hs_rows = db_mod.db_get_router_relay_snapshot(router_id, "/ip/hotspot")
+            if hs_rows:
+                iface_name = str(hs_rows[0].get("interface") or "ether1")
+        except Exception:
+            pass
+        return [{
+            ".id": "*1",
+            "name": iface_name,
+            "type": "ether",
+            "running": "true",
+            "disabled": "false",
+            "mtu": "1500",
+            "actual-mtu": "1500",
+            "mac-address": "",
+            "rx-byte": "0",
+            "tx-byte": "0",
+            "rx-packet": "0",
+            "tx-packet": "0",
+            "_source": "fallback",
+        }]
     return []
 
 
@@ -6013,6 +6036,7 @@ def api_interfaces():
 
 # Stockage du dernier état d'interface pour calcul différentiel du débit
 _last_iface_bytes = {}  # clé: "router_id:iface" → (rx_bytes, tx_bytes, timestamp)
+_relay_iface_snap = {}  # mode relais : clé → (prev_rx, prev_tx, snap_ts_str, rx_rate, tx_rate)
 
 
 @app.route("/api/trafic")
@@ -6033,15 +6057,47 @@ def api_traffic():
         tx_bytes = int(d.get("tx-byte", 0) or 0)
         now      = time.time()
         key      = f"{router_id}:{iface}"
-        last     = _last_iface_bytes.get(key)
-        if last:
-            prev_rx, prev_tx, prev_t = last
-            elapsed = now - prev_t
-            rx_rate = int(max(0, (rx_bytes - prev_rx) / elapsed)) if elapsed > 0 else 0
-            tx_rate = int(max(0, (tx_bytes - prev_tx) / elapsed)) if elapsed > 0 else 0
+
+        if getattr(api, "is_relay_snapshot", False):
+            # Mode relais : snapshot toutes les ~30s — calculer le taux sur l'intervalle snapshot
+            # et le maintenir entre deux cycles pour éviter les zéros permanents.
+            snap_ts = ""
+            try:
+                snaps = db_mod.db_get_router_relay_snapshot(router_id)
+                iface_meta = snaps.get("/interface", {}) if isinstance(snaps, dict) else {}
+                snap_ts = str(iface_meta.get("updated_at") or "")
+            except Exception:
+                pass
+            cached = _relay_iface_snap.get(key)
+            if cached and snap_ts and cached[2] == snap_ts:
+                # Même snapshot qu'avant — retourner le taux mis en cache
+                rx_rate, tx_rate = cached[3], cached[4]
+            elif cached and snap_ts and cached[2] != snap_ts and cached[2]:
+                # Nouveau snapshot — recalculer le taux sur l'intervalle réel
+                prev_rx, prev_tx, prev_snap_ts = cached[0], cached[1], cached[2]
+                try:
+                    t1 = datetime.fromisoformat(prev_snap_ts.replace("Z", "+00:00")).replace(tzinfo=None)
+                    t2 = datetime.fromisoformat(snap_ts.replace("Z", "+00:00")).replace(tzinfo=None)
+                    elapsed = max(1.0, (t2 - t1).total_seconds())
+                except Exception:
+                    elapsed = 30.0
+                rx_rate = int(max(0, (rx_bytes - prev_rx) / elapsed))
+                tx_rate = int(max(0, (tx_bytes - prev_tx) / elapsed))
+                _relay_iface_snap[key] = (rx_bytes, tx_bytes, snap_ts, rx_rate, tx_rate)
+            else:
+                rx_rate = tx_rate = 0
+                _relay_iface_snap[key] = (rx_bytes, tx_bytes, snap_ts, 0, 0)
         else:
-            rx_rate = tx_rate = 0
-        _last_iface_bytes[key] = (rx_bytes, tx_bytes, now)
+            last = _last_iface_bytes.get(key)
+            if last:
+                prev_rx, prev_tx, prev_t = last
+                elapsed = now - prev_t
+                rx_rate = int(max(0, (rx_bytes - prev_rx) / elapsed)) if elapsed > 0 else 0
+                tx_rate = int(max(0, (tx_bytes - prev_tx) / elapsed)) if elapsed > 0 else 0
+            else:
+                rx_rate = tx_rate = 0
+            _last_iface_bytes[key] = (rx_bytes, tx_bytes, now)
+
         return jsonify({
             "ok": True,
             "rx": rx_bytes, "tx": tx_bytes,
