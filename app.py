@@ -2457,12 +2457,10 @@ def _record_active_revenues_from_database(router_id, active_rows):
         username = str((active or {}).get("user") or "").strip()
         if not username:
             continue
-        exists = conn.execute(
-            "SELECT 1 FROM ventes WHERE router_id=? AND user=? LIMIT 1",
+        existing_vente = conn.execute(
+            "SELECT id, prix FROM ventes WHERE router_id=? AND user=? LIMIT 1",
             (router_id, username),
         ).fetchone()
-        if exists:
-            continue
         pricing = conn.execute(
             "SELECT prix, devise, profil, reseau FROM ticket_pricing WHERE router_id=? AND user=? LIMIT 1",
             (router_id, username),
@@ -2471,7 +2469,7 @@ def _record_active_revenues_from_database(router_id, active_rows):
             continue
         price = float(pricing["prix"] or 0)
         profil = str(pricing["profil"] or "").strip()
-        # Si prix=0 dans ticket_pricing, chercher le prix reel depuis hotspot_profile_metadata
+        # Si prix=0, chercher le vrai prix depuis hotspot_profile_metadata (source de verite)
         if price <= 0 and profil:
             try:
                 meta_row = conn.execute(
@@ -2491,6 +2489,18 @@ def _record_active_revenues_from_database(router_id, active_rows):
                 pass
         if price <= 0:
             continue  # ticket genuinement gratuit ou profil sans prix configure
+        if existing_vente:
+            # Vente deja enregistree : corriger le prix si elle etait a 0
+            if float(existing_vente[1] or 0) <= 0:
+                try:
+                    conn.execute(
+                        "UPDATE ventes SET prix=?, devise=? WHERE id=?",
+                        (price, pricing["devise"] or "FCFA", existing_vente[0]),
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
+            continue  # Toujours une seule vente par ticket
         # Utilise le debut de session comme date de premiere utilisation (plus precis que now)
         session_start = _active_started_datetime(active, now=now) or now
         try:
