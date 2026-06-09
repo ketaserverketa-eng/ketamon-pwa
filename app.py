@@ -3215,67 +3215,96 @@ def _build_routeros_local_epoch_lines(indent=""):
 
 
 def build_ketamon_ticket_login_script_source():
-    # Epoch computation — uses /system clock (NTP-synced) so expiry survives reboots.
-    # RouterOS 7 date format: "2026-05-12" (ISO yyyy-mm-dd), positions 0-3=year, 5-6=month, 8-9=day.
-    _epoch_lines = _build_routeros_local_epoch_lines(indent="    ")
+    # Expiration absolue horloge murale (wall-clock) :
+    # - 1ère connexion  : epoch stocké = now + limit-uptime ; limit-uptime effacé
+    # - Reconnexion valide : laisse passer (le scheduler 30s gère l'expiry active)
+    # - Reconnexion expirée : session/cookie/user supprimés immédiatement → internet coupé
+    # - 1 ticket = 1 appareil : MAC verrouillée à la 1ère connexion
+    _epoch_lines = _build_routeros_local_epoch_lines(indent="")
     return "\n".join([
         ':local uname $user;',
         ':local loginMac $"mac-address";',
         ':if ([:len $uname] = 0) do={ :return; }',
         ':local userId [/ip hotspot user find where name=$uname];',
         ':if ([:len $userId] = 0) do={ :return; }',
-        ':local storedMac [:tostr [/ip hotspot user get $userId mac-address]];',
-        ':if (([:len $loginMac] > 0) && (($storedMac = "") || ($storedMac = "00:00:00:00:00:00"))) do={ /ip hotspot user set $userId mac-address=$loginMac; }',
-        ':local limitVal [:tostr [/ip hotspot user get $userId limit-uptime]];',
-        ':if (([:len $limitVal] = 0) || ($limitVal = "0") || ($limitVal = "0s") || ($limitVal = "none")) do={ :return; }',
+        # Calcul epoch (NTP) — si horloge non synchro (année < 2020) le :return est dans _epoch_lines
+        *_epoch_lines,
+        # Lecture commentaire et détection du marqueur d'expiry
         ':local currentComment [:tostr [/ip hotspot user get $userId comment]];',
         f':local marker "{KETAMON_TICKET_COMMENT_MARKER}";',
         f':local markerAlt "{KETAMON_TICKET_COMMENT_MARKER.strip()}";',
+        ':local markerLen [:len $marker];',
         ':local markerPos [:find $currentComment $marker];',
-        ':if ($markerPos = nil) do={ :set markerPos [:find $currentComment $markerAlt]; }',
         ':if ($markerPos = nil) do={',
-        *_epoch_lines,
-        '    :if ($nowEpoch < 1000000000) do={ :return; }',
-        '    :local durSec 0;',
-        '    :local workVal $limitVal;',
-        '    :local wPos [:find $workVal "w"];',
-        '    :if ($wPos != nil) do={',
-        '        :set durSec ($durSec + ([:tonum [:pick $workVal 0 $wPos]] * 604800));',
-        '        :set workVal [:pick $workVal ($wPos + 1) [:len $workVal]];',
-        '    }',
-        '    :local dPos [:find $workVal "d"];',
-        '    :if ($dPos != nil) do={',
-        '        :set durSec ($durSec + ([:tonum [:pick $workVal 0 $dPos]] * 86400));',
-        '        :set workVal [:pick $workVal ($dPos + 1) [:len $workVal]];',
-        '    }',
-        '    :local colonPos [:find $workVal ":"];',
-        '    :if ($colonPos != nil) do={',
-        '        :local dHH [:tonum [:pick $workVal 0 2]];',
-        '        :local dMM [:tonum [:pick $workVal 3 5]];',
-        '        :local dSS [:tonum [:pick $workVal 6 8]];',
-        '        :set durSec ($durSec + ($dHH * 3600) + ($dMM * 60) + $dSS);',
-        '    } else={',
-        '        :local hPos [:find $workVal "h"];',
-        '        :if ($hPos != nil) do={',
-        '            :set durSec ($durSec + ([:tonum [:pick $workVal 0 $hPos]] * 3600));',
-        '            :set workVal [:pick $workVal ($hPos + 1) [:len $workVal]];',
+        '    :set markerPos [:find $currentComment $markerAlt];',
+        '    :if ($markerPos != nil) do={ :set markerLen [:len $markerAlt]; }',
+        '}',
+        # --- Ticket déjà utilisé (marqueur présent) ---
+        ':if ($markerPos != nil) do={',
+        '    :local startPos ($markerPos + $markerLen);',
+        '    :local expireRaw [:pick $currentComment $startPos [:len $currentComment]];',
+        '    :local expireEpoch [:tonum $expireRaw];',
+        '    :if ($expireEpoch >= 1000000000) do={',
+        '        :if ($nowEpoch >= $expireEpoch) do={',
+        '            :foreach activeId in=[/ip hotspot active find where user=$uname] do={',
+        '                /ip hotspot active remove $activeId;',
+        '            }',
+        '            :foreach cookieId in=[/ip hotspot cookie find where user=$uname] do={',
+        '                /ip hotspot cookie remove $cookieId;',
+        '            }',
+        '            /ip hotspot user remove $userId;',
+        '            :return;',
         '        }',
-        '        :local mPos [:find $workVal "m"];',
-        '        :if ($mPos != nil) do={',
-        '            :set durSec ($durSec + ([:tonum [:pick $workVal 0 $mPos]] * 60));',
-        '            :set workVal [:pick $workVal ($mPos + 1) [:len $workVal]];',
-        '        }',
-        '        :local sPos [:find $workVal "s"];',
-        '        :if ($sPos != nil) do={ :set durSec ($durSec + [:tonum [:pick $workVal 0 $sPos]]); }',
         '    }',
-        '    :if ($durSec <= 0) do={ :return; }',
-        '    :local expireEpoch ($nowEpoch + $durSec);',
-        '    :local baseComment $currentComment;',
-        '    :if ([:len $baseComment] > 0) do={',
-        '        /ip hotspot user set $userId comment=($baseComment . $marker . [:tostr $expireEpoch]) limit-uptime=0;',
-        '    } else={',
-        '        /ip hotspot user set $userId comment=($markerAlt . [:tostr $expireEpoch]) limit-uptime=0;',
+        '    :return;',
+        '}',
+        # --- Première connexion ---
+        # Verrouillage MAC sur cet appareil
+        ':local storedMac [:tostr [/ip hotspot user get $userId mac-address]];',
+        ':if (([:len $loginMac] > 0) && (($storedMac = "") || ($storedMac = "00:00:00:00:00:00"))) do={ /ip hotspot user set $userId mac-address=$loginMac; }',
+        # Lecture limit-uptime (durée du ticket)
+        ':local limitVal [:tostr [/ip hotspot user get $userId limit-uptime]];',
+        ':if (([:len $limitVal] = 0) || ($limitVal = "0") || ($limitVal = "0s") || ($limitVal = "none")) do={ :return; }',
+        # Conversion durée → secondes
+        ':local durSec 0;',
+        ':local workVal $limitVal;',
+        ':local wPos [:find $workVal "w"];',
+        ':if ($wPos != nil) do={',
+        '    :set durSec ($durSec + ([:tonum [:pick $workVal 0 $wPos]] * 604800));',
+        '    :set workVal [:pick $workVal ($wPos + 1) [:len $workVal]];',
+        '}',
+        ':local dPos [:find $workVal "d"];',
+        ':if ($dPos != nil) do={',
+        '    :set durSec ($durSec + ([:tonum [:pick $workVal 0 $dPos]] * 86400));',
+        '    :set workVal [:pick $workVal ($dPos + 1) [:len $workVal]];',
+        '}',
+        ':local colonPos [:find $workVal ":"];',
+        ':if ($colonPos != nil) do={',
+        '    :local dHH [:tonum [:pick $workVal 0 2]];',
+        '    :local dMM [:tonum [:pick $workVal 3 5]];',
+        '    :local dSS [:tonum [:pick $workVal 6 8]];',
+        '    :set durSec ($durSec + ($dHH * 3600) + ($dMM * 60) + $dSS);',
+        '} else={',
+        '    :local hPos [:find $workVal "h"];',
+        '    :if ($hPos != nil) do={',
+        '        :set durSec ($durSec + ([:tonum [:pick $workVal 0 $hPos]] * 3600));',
+        '        :set workVal [:pick $workVal ($hPos + 1) [:len $workVal]];',
         '    }',
+        '    :local mPos [:find $workVal "m"];',
+        '    :if ($mPos != nil) do={',
+        '        :set durSec ($durSec + ([:tonum [:pick $workVal 0 $mPos]] * 60));',
+        '        :set workVal [:pick $workVal ($mPos + 1) [:len $workVal]];',
+        '    }',
+        '    :local sPos [:find $workVal "s"];',
+        '    :if ($sPos != nil) do={ :set durSec ($durSec + [:tonum [:pick $workVal 0 $sPos]]); }',
+        '}',
+        ':if ($durSec <= 0) do={ :return; }',
+        # Calcul et stockage de l'epoch d'expiration absolue ; limit-uptime effacé
+        ':local expireEpoch ($nowEpoch + $durSec);',
+        ':if ([:len $currentComment] > 0) do={',
+        '    /ip hotspot user set $userId comment=($currentComment . $marker . [:tostr $expireEpoch]) limit-uptime=0;',
+        '} else={',
+        '    /ip hotspot user set $userId comment=($markerAlt . [:tostr $expireEpoch]) limit-uptime=0;',
         '}',
     ])
 
@@ -3450,23 +3479,33 @@ def ensure_ticket_runtime_support(api, profile_name=None):
 def _relay_queue_expiry_install(router):
     """
     Routeur relais : met en file un script RouterOS qui installe ou met à jour
-    le script d'expiry et son scheduler, directement sur le routeur.
+    le script d'expiry, le script de login, et leur scheduler.
     Idempotent — s'exécute sans connexion directe, indépendamment de l'état du serveur.
     """
     router_id = str(router.get("id") or router.get("host") or "").strip()
     owner_id  = str(router.get("owner_id") or "").strip()
     if not router_id:
         return
-    policy   = "ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon"
-    exp_name = KETAMON_TICKET_EXPIRY_SCRIPT
-    sch_name = KETAMON_TICKET_EXPIRY_SCHEDULER
-    escaped  = _relay_routeros_quote(build_ketamon_ticket_expiry_script_source())
+    policy     = "ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon"
+    exp_name   = KETAMON_TICKET_EXPIRY_SCRIPT
+    login_name = KETAMON_TICKET_LOGIN_SCRIPT
+    sch_name   = KETAMON_TICKET_EXPIRY_SCHEDULER
+    esc_exp    = _relay_routeros_quote(build_ketamon_ticket_expiry_script_source())
+    esc_login  = _relay_routeros_quote(build_ketamon_ticket_login_script_source())
     source = "\n".join([
+        # Script d'expiry (scheduler 30s)
         f':if ([:len [/system script find name="{exp_name}"]] > 0) do={{',
-        f'  /system script set [find name="{exp_name}"] source={escaped} policy="{policy}";',
+        f'  /system script set [find name="{exp_name}"] source={esc_exp} policy="{policy}";',
         f'}} else={{',
-        f'  /system script add name="{exp_name}" source={escaped} policy="{policy}";',
+        f'  /system script add name="{exp_name}" source={esc_exp} policy="{policy}";',
         f'}};',
+        # Script de login (on-login du profil hotspot) — expiration absolue horloge murale
+        f':if ([:len [/system script find name="{login_name}"]] > 0) do={{',
+        f'  /system script set [find name="{login_name}"] source={esc_login} policy="{policy}";',
+        f'}} else={{',
+        f'  /system script add name="{login_name}" source={esc_login} policy="{policy}";',
+        f'}};',
+        # Scheduler
         f':if ([:len [/system scheduler find name="{sch_name}"]] > 0) do={{',
         f'  /system scheduler set [find name="{sch_name}"] interval=30s on-event="{exp_name}" disabled=no;',
         f'}} else={{',
