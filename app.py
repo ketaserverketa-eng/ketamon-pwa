@@ -7192,6 +7192,11 @@ def _build_routeros_relay_script(base_url, token):
         "}",
         "/system scheduler add name=\"ketamon-relay-poll\" interval=30s on-event=\"/system script run ketamon-relay-poll\" disabled=no",
         "/system scheduler add name=\"ketamon-relay-watchdog\" interval=2m on-event=\":do { /system script run ketamon-relay-poll; } on-error={}\" disabled=no",
+        # Script de boot : réinstalle le relay automatiquement si les schedulers disparaissent (reset config, firmware update, etc.)
+        ":do { /system script remove [find name=\"ketamon-relay-boot\"]; } on-error={}",
+        ":do { /system scheduler remove [find name=\"ketamon-relay-boot\"]; } on-error={}",
+        f"/system script add name=\"ketamon-relay-boot\" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon source={{:local exists [/system scheduler find where name=\"ketamon-relay-poll\"]; :if ([:len $exists] = 0) do={{:do {{/tool fetch url=\"{base_url}/api/relay/routeros/install.rsc?token={token}\" dst-path=\"ketamon-relay-install.rsc\"; :delay 2s; /import file-name=\"ketamon-relay-install.rsc\"; /file remove [find name=\"ketamon-relay-install.rsc\"]; }} on-error={{}}; }} }}",
+        "/system scheduler add name=\"ketamon-relay-boot\" start-time=startup interval=0 on-event=\"/system script run ketamon-relay-boot\" disabled=no",
         ":delay 2s",
         ":do { /system script run ketamon-relay-poll; } on-error={}",
     ])
