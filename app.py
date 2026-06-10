@@ -3510,6 +3510,13 @@ def _relay_queue_expiry_install(router):
         f'  /system scheduler add name="{sch_name}" interval=30s on-event="{exp_name}"'
         f' start-time=00:00:00 disabled=no;',
         f'}};',
+        # Attacher on-login=ketamon-ticket-login sur tous les profils hotspot qui n'ont pas déjà un on-login
+        f':foreach pId in=[/ip hotspot user profile find] do={{',
+        f'  :local cur [:tostr [/ip hotspot user profile get $pId on-login]];',
+        f'  :if (($cur = "") || ($cur = "none") || ($cur = "{login_name}")) do={{',
+        f'    /ip hotspot user profile set $pId on-login="{login_name}";',
+        f'  }};',
+        f'}};',
     ])
     db_mod.db_enqueue_router_relay_command(router_id, owner_id, "routeros-script", {"source": source})
 
