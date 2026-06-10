@@ -2268,6 +2268,42 @@ def _maybe_queue_relay_auto_upgrade(router, token, counts):
     return bool(command)
 
 
+_RELAY_BOOT_SCRIPT_LAST = {}
+
+
+def _maybe_queue_relay_boot_script(router, token, resources):
+    router = dict(router or {})
+    router_id = str(router.get("id") or "").strip()
+    if not router_id or not token:
+        return False
+    # Vérifier si ketamon-relay-boot existe dans le snapshot des schedulers
+    try:
+        scheduler_rows = (resources or {}).get("/system/scheduler") or []
+        names = {str(r.get("name") or "").strip() for r in scheduler_rows if isinstance(r, dict)}
+        if "ketamon-relay-boot" in names:
+            return False
+    except Exception:
+        return False
+    # Limiter à 1 tentative par heure par routeur
+    now = time.time()
+    if now - float(_RELAY_BOOT_SCRIPT_LAST.get(router_id) or 0) < 3600:
+        return False
+    base_url = _relay_public_base_url()
+    install_url = f"{base_url}/api/relay/routeros/install.rsc?token={quote(str(token or ''))}"
+    source = "\n".join([
+        ":do { /system script remove [find name=\"ketamon-relay-boot\"]; } on-error={}",
+        ":do { /system scheduler remove [find name=\"ketamon-relay-boot\"]; } on-error={}",
+        f":do {{ /system script add name=\"ketamon-relay-boot\" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon source={{:local exists [/system scheduler find where name=\"ketamon-relay-poll\"]; :if ([:len $exists] = 0) do={{:do {{/tool fetch url=\"{install_url}\" dst-path=\"ketamon-relay-install.rsc\"; :delay 2s; /import file-name=\"ketamon-relay-install.rsc\"; /file remove [find name=\"ketamon-relay-install.rsc\"]; }} on-error={{}}; }} }}; }} on-error={{}}",
+        ":do { /system scheduler add name=\"ketamon-relay-boot\" start-time=startup interval=0 on-event=\"/system script run ketamon-relay-boot\" disabled=no; } on-error={}",
+    ])
+    command = db_mod.db_enqueue_router_relay_command(
+        router_id, router.get("owner_id", ""), "routeros-script", {"source": source},
+    )
+    if command:
+        _RELAY_BOOT_SCRIPT_LAST[router_id] = now
+    return bool(command)
+
+
 def _profile_metadata_map_for_display(router_id, profiles):
     metadata_map = get_hotspot_profile_metadata_map(router_id)
     for profile in profiles or []:
@@ -6815,6 +6851,7 @@ def api_relay_snapshot():
     synced = _sync_relay_snapshot_database(router["id"], resources)
     expiry = _enforce_relay_snapshot_expirations(router)
     upgrade_queued = _maybe_queue_relay_auto_upgrade(router, token, counts)
+    boot_queued = _maybe_queue_relay_boot_script(router, token, resources)
     print(
         "[RELAY][SNAPSHOT] "
         f"router={router.get('name') or router.get('id')} "
@@ -6822,7 +6859,7 @@ def api_relay_snapshot():
         f"users={counts.get('/ip/hotspot/user', 0)} "
         f"active={counts.get('/ip/hotspot/active', 0)} "
         f"status={relay_status} "
-        f"synced={synced} expiry={expiry} upgrade={upgrade_queued}",
+        f"synced={synced} expiry={expiry} upgrade={upgrade_queued} boot={boot_queued}",
         flush=True,
     )
     return jsonify({
