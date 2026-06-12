@@ -2938,6 +2938,13 @@ def _backfill_ventes_prix_zero(router_id, conn):
                 "SELECT prix, devise FROM ventes WHERE router_id=? AND profil=? AND prix>0 LIMIT 1",
                 (router_id, profil)
             ).fetchone()
+        if not ref:
+            meta_row = conn.execute(
+                "SELECT price, currency FROM hotspot_profile_metadata WHERE router_id=? AND profile_name=? AND CAST(price AS REAL)>0 LIMIT 1",
+                (router_id, profil)
+            ).fetchone()
+            if meta_row and float(meta_row[0] or 0) > 0:
+                ref = (float(meta_row[0]), str(meta_row[1] or "FCFA"))
         if ref and float(ref[0] or 0) > 0:
             conn.execute(
                 "UPDATE ventes SET prix=?, devise=? WHERE id=?",
@@ -5079,9 +5086,29 @@ def hotspot_generate():
                 except Exception:
                     pass
 
-            meta     = profiles_meta.get(profile, {})
-            price    = meta.get("price", "0") or "0"
-            currency = meta.get("currency", "FCFA") or "FCFA"
+            meta               = profiles_meta.get(profile, {})
+            price_from_form    = (request.form.get("price_input", "0") or "0").strip()
+            currency_from_form = (request.form.get("currency_input", "") or "").strip()
+            try:
+                price_from_form_f = float(price_from_form) if price_from_form else 0.0
+            except (ValueError, TypeError):
+                price_from_form_f = 0.0
+            if price_from_form_f > 0:
+                price    = price_from_form
+                currency = currency_from_form or meta.get("currency", "FCFA") or "FCFA"
+                try:
+                    db_mod.db_upsert_hotspot_profile_metadata(
+                        router_id, profile,
+                        price=price, currency=currency,
+                        expire_mode=meta.get("expire_mode", "none"),
+                        lock_user=meta.get("lock_user", "no"),
+                        time_limit=meta.get("time_limit", "0"),
+                    )
+                except Exception:
+                    pass
+            else:
+                price    = meta.get("price", "0") or "0"
+                currency = currency_from_form or meta.get("currency", "FCFA") or "FCFA"
 
             if mode == "chiffres":
                 charset = string.digits
@@ -5148,6 +5175,21 @@ def hotspot_generate():
                     break
             if pricing_batch:
                 db_mod.db_batch_upsert_ticket_pricing(pricing_batch)
+                try:
+                    _pf = float(price) if price else 0.0
+                except (ValueError, TypeError):
+                    _pf = 0.0
+                if _pf > 0:
+                    try:
+                        _conn = db_mod.get_conn()
+                        _conn.execute(
+                            "UPDATE ticket_pricing SET prix=?, devise=? WHERE router_id=? AND profil=? AND (prix IS NULL OR prix<=0)",
+                            (_pf, currency, router_id, profile)
+                        )
+                        _conn.commit()
+                        _backfill_ventes_prix_zero(router_id, _conn)
+                    except Exception:
+                        pass
                 try:
                     db_mod.db_backfill_ventes_from_ticket_pricing(router_id)
                 except Exception:

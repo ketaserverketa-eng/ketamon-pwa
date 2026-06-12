@@ -131,6 +131,23 @@
         </div>
       </div>
 
+      <div class="form-row">
+        <div class="form-group col-8">
+          <label><i class="fa fa-tag"></i> Prix du ticket <small class="text-muted">(0 = gratuit)</small></label>
+          <input type="number" name="price_input" id="price-input" class="form-control"
+                 placeholder="ex: 500" min="0" step="1" value="0">
+        </div>
+        <div class="form-group col-4">
+          <label>Devise</label>
+          <select name="currency_input" id="currency-input" class="form-control">
+            <option value="FCFA">FCFA</option>
+            <option value="XOF">XOF</option>
+            <option value="EUR">EUR</option>
+            <option value="USD">USD</option>
+          </select>
+        </div>
+      </div>
+
       <div class="form-group">
         <label><i class="fa fa-key"></i> Mode du mot de passe</label>
         <div style="display:flex;gap:10px;margin-top:6px;flex-wrap:wrap">
@@ -313,7 +330,11 @@ function afficherPrix(sel){
   var price=opt.getAttribute('data-price')||'0';
   var cur=opt.getAttribute('data-currency')||'FCFA';
   var div=document.getElementById('prix-profil');
-  if(div) div.textContent=(price&&price!=='0')?'Prix: '+price+' '+cur:'';
+  if(div) div.textContent=(price&&price!=='0')?'Prix profil: '+price+' '+cur:'';
+  var priceInp=document.getElementById('price-input');
+  var curInp=document.getElementById('currency-input');
+  if(priceInp) priceInp.value=(price&&price!=='0')?price:'0';
+  if(curInp&&cur){for(var i=0;i<curInp.options.length;i++){if(curInp.options[i].value===cur){curInp.selectedIndex=i;break;}}}
 }
 function showGenerateMessage(msg, type){
   if(typeof afficherNotif==='function'){
