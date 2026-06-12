@@ -2799,20 +2799,16 @@ def _sync_ventes_for_router(router_info, timeout=8):
             except (ValueError, TypeError):
                 bytes_in = 0
 
-            # Un ticket est "utilisé" si :
-            # - bytes-in > 0 sur le compte (sessions passées, mis à jour à la déconnexion)
-            # - OU bytes-in > 0 dans une session active (trafic en cours, non encore flush sur le compte)
-            if bytes_in == 0 and username not in active_with_traffic:
+            # Ticket "utilisé" : bytes-in>0, session active, OU marqueur ##KETAMON## (preuve d'utilisation)
+            has_ketamon = any(m in comment for m in KETAMON_TICKET_COMMENT_MARKERS)
+            if bytes_in == 0 and username not in active_with_traffic and not has_ketamon:
                 continue
 
             ticket_key = _extract_ticket_key(username, comment)
 
-            # Ticket déjà enregistré avec cette clé exacte → skip
             if ticket_key in existing_keys:
                 continue
 
-            # Username déjà comptabilisé (quelle que soit la clé) → pas de doublon
-            # Si le ticket a maintenant un marqueur epoch, on met à jour la clé ancien format
             if username in existing_users:
                 if ticket_key != username:
                     conn.execute(
@@ -2822,8 +2818,6 @@ def _sync_ventes_for_router(router_info, timeout=8):
                     conn.commit()
                     existing_keys.add(ticket_key)
                     existing_keys.discard(username)
-                # Ticket actif EN CE MOMENT et date ≠ aujourd'hui → c'était un backfill,
-                # mettre à jour à la vraie date de vente (aujourd'hui = première utilisation détectée)
                 if username in active_with_traffic:
                     row = conn.execute(
                         "SELECT date FROM ventes WHERE router_id=? AND user=? LIMIT 1",
@@ -2835,11 +2829,10 @@ def _sync_ventes_for_router(router_info, timeout=8):
                             (date_str, time_str, router_id, username)
                         )
                         conn.commit()
-                continue  # déjà compté, jamais créer de doublon
+                continue
 
             profile = str(u.get("profile", "default") or "default")
 
-            # Priorité 1 : prix enregistré à la création dans KetaMon
             pricing = conn.execute(
                 "SELECT prix, devise, profil, reseau FROM ticket_pricing WHERE router_id=? AND user=?",
                 (router_id, username)
@@ -2850,12 +2843,10 @@ def _sync_ventes_for_router(router_info, timeout=8):
                 profile  = pricing[2] or profile
                 reseau   = pricing[3] or ""
             elif profile in profiles_meta:
-                # Priorité 2 : métadonnées du profil KetaMon
                 meta     = profiles_meta[profile]
                 price    = float(meta.get("price", "0") or "0")
                 currency = meta.get("currency", "FCFA") or "FCFA"
                 reseau   = str(u.get("server") or "")
-                # Backfill ticket_pricing pour les anciens tickets hors KetaMon
                 if price > 0:
                     try:
                         db_mod.db_batch_upsert_ticket_pricing([{
@@ -2866,12 +2857,10 @@ def _sync_ventes_for_router(router_info, timeout=8):
                     except Exception:
                         pass
             else:
-                # Ticket inconnu de KetaMon → ignorer
-                continue
-
-            # Profil sans prix (default, gratuit) → pas de revenu à comptabiliser
-            if price <= 0:
-                continue
+                # Ticket utilisé mais profil non configuré dans KetaMon → enregistrer sans prix
+                price    = 0.0
+                currency = "FCFA"
+                reseau   = str(u.get("server") or "")
 
             db_mod.db_insert_vente({
                 "id":         _uuid.uuid4().hex,
@@ -2953,14 +2942,17 @@ def _sync_ventes_from_relay(router):
         username = str(u.get("name") or "").strip()
         if not username:
             continue
+        comment  = str(u.get("comment") or "")
         try:
             bytes_in = int(u.get("bytes-in", 0) or 0)
         except (ValueError, TypeError):
             bytes_in = 0
-        if bytes_in == 0 and username not in active_with_traffic:
+
+        # Ticket "utilisé" : bytes-in>0, session active, OU marqueur ##KETAMON## (preuve d'utilisation)
+        has_ketamon = any(m in comment for m in KETAMON_TICKET_COMMENT_MARKERS)
+        if bytes_in == 0 and username not in active_with_traffic and not has_ketamon:
             continue
 
-        comment    = str(u.get("comment") or "")
         ticket_key = _extract_ticket_key(username, comment)
 
         if ticket_key in existing_keys:
@@ -2972,8 +2964,6 @@ def _sync_ventes_from_relay(router):
                     (ticket_key, router_id, username, username)
                 )
                 conn.commit()
-            # Ticket actif EN CE MOMENT et date ≠ aujourd'hui → backfill artifact,
-            # mettre à jour à la vraie date de vente (aujourd'hui = première utilisation détectée)
             if username in active_with_traffic:
                 row = conn.execute(
                     "SELECT date FROM ventes WHERE router_id=? AND user=? LIMIT 1",
@@ -3002,7 +2992,6 @@ def _sync_ventes_from_relay(router):
             price    = float(meta.get("price", "0") or "0")
             currency = meta.get("currency", "FCFA") or "FCFA"
             reseau   = str(u.get("server") or "")
-            # Backfill ticket_pricing pour les anciens tickets hors KetaMon
             if price > 0:
                 try:
                     db_mod.db_batch_upsert_ticket_pricing([{
@@ -3013,10 +3002,10 @@ def _sync_ventes_from_relay(router):
                 except Exception:
                     pass
         else:
-            continue
-
-        if price <= 0:
-            continue
+            # Ticket utilisé mais profil non configuré dans KetaMon → enregistrer sans prix
+            price    = 0.0
+            currency = "FCFA"
+            reseau   = str(u.get("server") or "")
 
         db_mod.db_insert_vente({
             "id":         _uuid.uuid4().hex,
