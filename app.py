@@ -3970,7 +3970,7 @@ def _relay_routeros_path(path):
 def _relay_routeros_quote(value):
     text = str(value if value is not None else "")
     text = text.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
-    text = text.replace("\r", " ").replace("\n", " ")
+    text = text.replace("\r", "").replace("\n", "\\n")
     return f'"{text}"'
 
 
