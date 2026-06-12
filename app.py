@@ -7106,7 +7106,7 @@ def api_relay_routeros_next():
         source = (
             ':put "KetaMon relay: ping";\n'
             f'{clock_sync_source}\n'
-            f'/tool fetch url="{result_url}&ok=1&msg=pong" keep-result=no;\n'
+            f':do {{ /tool fetch url="{result_url}&ok=1&msg=pong" keep-result=no duration=15s; }} on-error={{}}\n'
         )
     elif command["command"] == "routeros-script":
         try:
@@ -7117,22 +7117,22 @@ def api_relay_routeros_next():
         if not script_source:
             source = (
                 ':put "KetaMon relay: script vide";\n'
-                f'/tool fetch url="{result_url}&ok=0&msg=script_vide" keep-result=no;\n'
+                f':do {{ /tool fetch url="{result_url}&ok=0&msg=script_vide" keep-result=no duration=15s; }} on-error={{}}\n'
             )
         else:
             source = (
                 ':do {\n'
                 f'{clock_sync_source}\n'
                 f'{script_source}\n'
-                f'/tool fetch url="{result_url}&ok=1&msg=done" keep-result=no;\n'
+                f':do {{ /tool fetch url="{result_url}&ok=1&msg=done" keep-result=no duration=15s; }} on-error={{}}\n'
                 '} on-error={\n'
-                f'/tool fetch url="{result_url}&ok=0&msg=error" keep-result=no;\n'
+                f':do {{ /tool fetch url="{result_url}&ok=0&msg=error" keep-result=no duration=15s; }} on-error={{}}\n'
                 '}\n'
             )
     else:
         source = (
             f':put "KetaMon relay: commande non supportee {command["command"]}";\n'
-            f'/tool fetch url="{result_url}&ok=0&msg=commande_non_supportee" keep-result=no;\n'
+            f':do {{ /tool fetch url="{result_url}&ok=0&msg=commande_non_supportee" keep-result=no duration=15s; }} on-error={{}}\n'
         )
     return source, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
