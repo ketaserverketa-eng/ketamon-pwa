@@ -92,6 +92,7 @@ BG_REVENUE_SYNC_INTERVAL = int(os.environ.get("KETAMON_REVENUE_SYNC_INTERVAL", "
 _TICKET_GENERATION_LOCKS = {}
 _TICKET_GENERATION_STATUS = {}
 _TICKET_GENERATION_GUARD = threading.Lock()
+_relay_public_url_cache = ""  # mis à jour à chaque requête relay ; lu par les threads de fond
 
 def _ks_ping_once(timeout=1):
     try:
@@ -3549,50 +3550,102 @@ def ensure_ticket_runtime_support(api, profile_name=None):
         _ensure_ticket_runtime_profile_binding(api, profile_resource, profile_row)
 
 
-def _relay_queue_expiry_install(router):
+def _build_ketamon_installer_rsc():
     """
-    Routeur relais : met en file un script RouterOS qui installe ou met à jour
-    le script d'expiry, le script de login, et leur scheduler.
-    Idempotent — s'exécute sans connexion directe, indépendamment de l'état du serveur.
+    Génère un fichier .rsc RouterOS qui installe ketamon-ticket-login, ketamon-ticket-expiry
+    et leur scheduler via la syntaxe source={...} — aucun quoting, aucun échappement.
+    Stratégie remove+add (idempotent, pas de if/else imbriqué).
+    Compatible RouterOS v6 et v7.
     """
-    router_id = str(router.get("id") or router.get("host") or "").strip()
-    owner_id  = str(router.get("owner_id") or "").strip()
-    if not router_id:
-        return
     policy     = "ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon"
     exp_name   = KETAMON_TICKET_EXPIRY_SCRIPT
     login_name = KETAMON_TICKET_LOGIN_SCRIPT
     sch_name   = KETAMON_TICKET_EXPIRY_SCHEDULER
-    esc_exp    = _relay_routeros_quote(build_ketamon_ticket_expiry_script_source())
-    esc_login  = _relay_routeros_quote(build_ketamon_ticket_login_script_source())
-    source = "\n".join([
-        # Script d'expiry (scheduler 30s)
-        f':if ([:len [/system script find name="{exp_name}"]] > 0) do={{',
-        f'  /system script set [find name="{exp_name}"] source={esc_exp} policy="{policy}";',
-        f'}} else={{',
-        f'  /system script add name="{exp_name}" source={esc_exp} policy="{policy}";',
-        f'}};',
-        # Script de login (on-login du profil hotspot) — expiration absolue horloge murale
-        f':if ([:len [/system script find name="{login_name}"]] > 0) do={{',
-        f'  /system script set [find name="{login_name}"] source={esc_login} policy="{policy}";',
-        f'}} else={{',
-        f'  /system script add name="{login_name}" source={esc_login} policy="{policy}";',
-        f'}};',
-        # Scheduler
-        f':if ([:len [/system scheduler find name="{sch_name}"]] > 0) do={{',
-        f'  /system scheduler set [find name="{sch_name}"] interval=30s on-event="{exp_name}" disabled=no;',
-        f'}} else={{',
-        f'  /system scheduler add name="{sch_name}" interval=30s on-event="{exp_name}"'
-        f' start-time=00:00:00 disabled=no;',
-        f'}};',
-        # Attacher on-login=ketamon-ticket-login sur tous les profils hotspot qui n'ont pas déjà un on-login
+    login_src  = build_ketamon_ticket_login_script_source()
+    expiry_src = build_ketamon_ticket_expiry_script_source()
+    lines = [
+        "# KetaMon ticket scripts installer v2 — file-based, no quoting",
+        # Script login : remove puis add (idempotent)
+        f':do {{ /system script remove [find name="{login_name}"]; }} on-error={{}}',
+        f'/system script add name="{login_name}" policy="{policy}" source={{',
+        login_src,
+        '}',
+        # Script expiry : remove puis add (idempotent)
+        f':do {{ /system script remove [find name="{exp_name}"]; }} on-error={{}}',
+        f'/system script add name="{exp_name}" policy="{policy}" source={{',
+        expiry_src,
+        '}',
+        # Scheduler : remove puis add
+        f':do {{ /system scheduler remove [find name="{sch_name}"]; }} on-error={{}}',
+        f'/system scheduler add name="{sch_name}" interval=30s on-event="{exp_name}" start-time=00:00:00 disabled=no',
+        # Attacher on-login sur tous les profils hotspot sans on-login personnalisé
         f':foreach pId in=[/ip hotspot user profile find] do={{',
         f'  :local cur [:tostr [/ip hotspot user profile get $pId on-login]];',
         f'  :if (($cur = "") || ($cur = "none") || ($cur = "{login_name}")) do={{',
         f'    /ip hotspot user profile set $pId on-login="{login_name}";',
         f'  }};',
-        f'}};',
-    ])
+        f'}}',
+    ]
+    return "\n".join(lines)
+
+
+def _relay_queue_expiry_install(router):
+    """
+    Routeur relais : met en file un script RouterOS qui installe ou met à jour
+    le script d'expiry, le script de login, et leur scheduler.
+    Idempotent — s'exécute sans connexion directe, indépendamment de l'état du serveur.
+    Si l'URL publique est connue, utilise l'approche fichier (download + import) — aucun quoting.
+    Sinon, fallback sur source embeddée échappée.
+    """
+    router_id = str(router.get("id") or router.get("host") or "").strip()
+    owner_id  = str(router.get("owner_id") or "").strip()
+    if not router_id:
+        return
+    token    = str(router.get("relay_token") or "").strip()
+    base_url = (
+        os.environ.get("KETAMON_PUBLIC_URL", "").strip().rstrip("/")
+        or _relay_public_url_cache
+    )
+    if base_url and token:
+        # Approche fiable : MikroTik télécharge un .rsc et l'importe — zéro quoting/échappement
+        installer_url = f"{base_url}/api/relay/scripts/installer.rsc?token={quote(token)}"
+        source = (
+            f':do {{ /tool fetch url="{installer_url}" dst-path="ktm-install.rsc" duration=20s; '
+            f':delay 1s; /import file-name="ktm-install.rsc"; '
+            f':do {{ /file remove [find name="ktm-install.rsc"]; }} on-error={{}}; }} on-error={{}}'
+        )
+    else:
+        # Fallback local : source embeddée avec échappement (pas d'URL publique disponible)
+        policy     = "ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon"
+        exp_name   = KETAMON_TICKET_EXPIRY_SCRIPT
+        login_name = KETAMON_TICKET_LOGIN_SCRIPT
+        sch_name   = KETAMON_TICKET_EXPIRY_SCHEDULER
+        esc_exp    = _relay_routeros_quote(build_ketamon_ticket_expiry_script_source())
+        esc_login  = _relay_routeros_quote(build_ketamon_ticket_login_script_source())
+        source = "\n".join([
+            f':if ([:len [/system script find name="{exp_name}"]] > 0) do={{',
+            f'  /system script set [find name="{exp_name}"] source={esc_exp} policy="{policy}";',
+            f'}} else={{',
+            f'  /system script add name="{exp_name}" source={esc_exp} policy="{policy}";',
+            f'}};',
+            f':if ([:len [/system script find name="{login_name}"]] > 0) do={{',
+            f'  /system script set [find name="{login_name}"] source={esc_login} policy="{policy}";',
+            f'}} else={{',
+            f'  /system script add name="{login_name}" source={esc_login} policy="{policy}";',
+            f'}};',
+            f':if ([:len [/system scheduler find name="{sch_name}"]] > 0) do={{',
+            f'  /system scheduler set [find name="{sch_name}"] interval=30s on-event="{exp_name}" disabled=no;',
+            f'}} else={{',
+            f'  /system scheduler add name="{sch_name}" interval=30s on-event="{exp_name}"'
+            f' start-time=00:00:00 disabled=no;',
+            f'}};',
+            f':foreach pId in=[/ip hotspot user profile find] do={{',
+            f'  :local cur [:tostr [/ip hotspot user profile get $pId on-login]];',
+            f'  :if (($cur = "") || ($cur = "none") || ($cur = "{login_name}")) do={{',
+            f'    /ip hotspot user profile set $pId on-login="{login_name}";',
+            f'  }};',
+            f'}};',
+        ])
     db_mod.db_enqueue_router_relay_command(router_id, owner_id, "routeros-script", {"source": source})
 
 
@@ -6781,22 +6834,28 @@ def _detect_lan_ip_for_relay():
 
 
 def _relay_public_base_url():
+    global _relay_public_url_cache
     configured = os.environ.get("KETAMON_PUBLIC_URL", "").strip().rstrip("/")
     if configured:
+        _relay_public_url_cache = configured
         return configured
     root = request.url_root.rstrip("/")
     try:
         parsed = urlsplit(root)
         host = parsed.hostname or ""
         if not _is_local_relay_host(host):
+            _relay_public_url_cache = root
             return root
         lan_ip = _detect_lan_ip_for_relay()
         if lan_ip:
             port = f":{parsed.port}" if parsed.port else ""
             scheme = parsed.scheme or "http"
-            return f"{scheme}://{lan_ip}{port}"
+            result = f"{scheme}://{lan_ip}{port}"
+            _relay_public_url_cache = result
+            return result
     except Exception:
         pass
+    _relay_public_url_cache = root
     return root
 
 
@@ -7286,6 +7345,27 @@ def api_relay_routeros_install_script():
         flush=True,
     )
     return _build_routeros_relay_script(_relay_public_base_url(), token) + "\n", 200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store",
+    }
+
+
+@app.route("/api/relay/scripts/installer.rsc", methods=["GET"])
+def api_relay_scripts_installer():
+    """
+    Sert le fichier .rsc qui installe ketamon-ticket-login et ketamon-ticket-expiry
+    en utilisant la syntaxe source={...} — aucun quoting, aucun problème d'échappement.
+    Authentifié par token relay.
+    """
+    router, _token = _relay_router_from_request()
+    if not router:
+        return "# KetaMon: token invalide\n", 401, {"Content-Type": "text/plain; charset=utf-8"}
+    print(
+        "[RELAY][INSTALLER] "
+        f"router={router.get('name') or router.get('id')}",
+        flush=True,
+    )
+    return _build_ketamon_installer_rsc() + "\n", 200, {
         "Content-Type": "text/plain; charset=utf-8",
         "Cache-Control": "no-store",
     }
