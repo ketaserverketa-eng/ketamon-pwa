@@ -3251,7 +3251,7 @@ def _build_routeros_local_epoch_lines(indent=""):
 def build_ketamon_ticket_login_script_source():
     # Expiration absolue horloge murale (wall-clock) :
     # - 1ère connexion  : epoch stocké = now + limit-uptime ; limit-uptime effacé
-    # - Reconnexion valide : laisse passer (le scheduler 30s gère l'expiry active)
+    # - Reconnexion valide : limit-uptime = (expireEpoch - now), uptime reset → MikroTik coupe exactement à l'expiry
     # - Reconnexion expirée : session/cookie/user supprimés immédiatement → internet coupé
     # - 1 ticket = 1 appareil : MAC verrouillée à la 1ère connexion
     _epoch_lines = _build_routeros_local_epoch_lines(indent="")
@@ -3288,6 +3288,12 @@ def build_ketamon_ticket_login_script_source():
         '            }',
         '            /ip hotspot user remove $userId;',
         '            :return;',
+        '        }',
+        # Reconnexion valide : appliquer le temps restant exact comme limit-uptime
+        # Cela remplace le session-time du profil par le vrai temps restant du ticket
+        '        :local remainSec ($expireEpoch - $nowEpoch);',
+        '        :if ($remainSec > 0) do={',
+        '            :do { /ip hotspot user set $userId limit-uptime=([:tostr $remainSec] . "s") uptime=0s; } on-error={};',
         '        }',
         '    }',
         '    :return;',
