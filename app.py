@@ -2857,10 +2857,25 @@ def _sync_ventes_for_router(router_info, timeout=8):
                     except Exception:
                         pass
             else:
-                # Ticket utilisé mais profil non configuré dans KetaMon → enregistrer sans prix
+                # Profil non configuré → chercher le prix depuis d'autres tickets du même profil
                 price    = 0.0
                 currency = "FCFA"
                 reseau   = str(u.get("server") or "")
+
+            # Si toujours prix=0, inférer depuis ticket_pricing ou ventes existantes (même profil)
+            if price <= 0:
+                row = conn.execute(
+                    "SELECT prix, devise FROM ticket_pricing WHERE router_id=? AND profil=? AND prix>0 LIMIT 1",
+                    (router_id, profile)
+                ).fetchone()
+                if not row:
+                    row = conn.execute(
+                        "SELECT prix, devise FROM ventes WHERE router_id=? AND profil=? AND prix>0 LIMIT 1",
+                        (router_id, profile)
+                    ).fetchone()
+                if row:
+                    price    = float(row[0] or 0)
+                    currency = str(row[1] or "FCFA")
 
             db_mod.db_insert_vente({
                 "id":         _uuid.uuid4().hex,
@@ -2903,6 +2918,37 @@ def _expire_tickets_for_router(api, host="?"):
     return 0
 
 
+def _backfill_ventes_prix_zero(router_id, conn):
+    """Corrige les ventes enregistrées avec prix=0 en cherchant le prix depuis ticket_pricing ou d'autres ventes du même profil."""
+    rows = conn.execute(
+        "SELECT id, profil FROM ventes WHERE router_id=? AND (prix IS NULL OR prix<=0)",
+        (router_id,)
+    ).fetchall()
+    fixed = 0
+    for row in rows:
+        vid, profil = row[0], str(row[1] or "")
+        if not profil:
+            continue
+        ref = conn.execute(
+            "SELECT prix, devise FROM ticket_pricing WHERE router_id=? AND profil=? AND prix>0 LIMIT 1",
+            (router_id, profil)
+        ).fetchone()
+        if not ref:
+            ref = conn.execute(
+                "SELECT prix, devise FROM ventes WHERE router_id=? AND profil=? AND prix>0 LIMIT 1",
+                (router_id, profil)
+            ).fetchone()
+        if ref and float(ref[0] or 0) > 0:
+            conn.execute(
+                "UPDATE ventes SET prix=?, devise=? WHERE id=?",
+                (float(ref[0]), str(ref[1] or "FCFA"), vid)
+            )
+            fixed += 1
+    if fixed:
+        conn.commit()
+    return fixed
+
+
 def _sync_ventes_from_relay(router):
     """Sync revenus depuis le snapshot relais (pas de connexion directe MikroTik)."""
     router_id = str(router.get("id") or router.get("host") or "").strip()
@@ -2913,6 +2959,7 @@ def _sync_ventes_from_relay(router):
 
     import uuid as _uuid
     conn = db_mod.get_conn()
+    _backfill_ventes_prix_zero(router_id, conn)
     # SELECT ticket_key en premier pour que r[0]=ticket_key, r[1]=user
     existing_rows = conn.execute(
         "SELECT ticket_key, user FROM ventes WHERE router_id=?", (router_id,)
@@ -3002,10 +3049,25 @@ def _sync_ventes_from_relay(router):
                 except Exception:
                     pass
         else:
-            # Ticket utilisé mais profil non configuré dans KetaMon → enregistrer sans prix
+            # Profil non configuré → chercher le prix depuis d'autres tickets du même profil
             price    = 0.0
             currency = "FCFA"
             reseau   = str(u.get("server") or "")
+
+        # Si toujours prix=0, inférer depuis ticket_pricing ou ventes existantes (même profil)
+        if price <= 0:
+            row = conn.execute(
+                "SELECT prix, devise FROM ticket_pricing WHERE router_id=? AND profil=? AND prix>0 LIMIT 1",
+                (router_id, profile)
+            ).fetchone()
+            if not row:
+                row = conn.execute(
+                    "SELECT prix, devise FROM ventes WHERE router_id=? AND profil=? AND prix>0 LIMIT 1",
+                    (router_id, profile)
+                ).fetchone()
+            if row:
+                price    = float(row[0] or 0)
+                currency = str(row[1] or "FCFA")
 
         db_mod.db_insert_vente({
             "id":         _uuid.uuid4().hex,
