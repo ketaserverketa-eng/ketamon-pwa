@@ -7145,7 +7145,7 @@ def _build_routeros_relay_script(base_url, token):
     def send_line(payload_var="p"):
         return (
             f"  :do {{ /tool fetch url=\"{snapshot_url}\" http-method=post "
-            f"http-header-field=\"Content-Type: text/plain\" http-data=${payload_var} keep-result=no; }} on-error={{}}"
+            f"http-header-field=\"Content-Type: text/plain\" http-data=${payload_var} keep-result=no duration=20s; }} on-error={{}}"
         )
 
     return "\n".join([
@@ -7168,9 +7168,6 @@ def _build_routeros_relay_script(base_url, token):
         "    :return $out;",
         "  };",
         "  :local NL \"\\n\";",
-        "  :for ktmCmd from=1 to=3 do={",
-        f"    :do {{ /tool fetch url=\"{next_url}\" dst-path=\"ketamon-relay-next.rsc\" keep-result=yes; :delay 1s; /import file-name=\"ketamon-relay-next.rsc\"; /file remove [find name=\"ketamon-relay-next.rsc\"]; }} on-error={{}}",
-        "  }",
         "  :local p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
         "  :do { :set p ($p . \"R=/ketamon/relay-status|source=safe-snapshot-v4|hotspot-users-found=\" . [$ktmEsc [:len [/ip hotspot user find]]] . $NL); } on-error={};",
         "  :do { :set p ($p . \"R=/system/identity|name=\" . [$ktmEsc [/system identity get name]] . $NL); } on-error={};",
@@ -7208,13 +7205,13 @@ def _build_routeros_relay_script(base_url, token):
         "        :set p ($p . \"R=/ip/hotspot/user|.id=\" . [$ktmEsc $uid] . \"|name=\" . [$ktmEsc $name] . \"|profile=\" . [$ktmEsc $profile] . \"|disabled=\" . [$ktmEsc $disabled] . \"|limit-uptime=\" . [$ktmEsc $limitUptime] . \"|bytes-in=\" . [$ktmEsc $bytesIn] . \"|bytes-out=\" . [$ktmEsc $bytesOut] . \"|mac-address=\" . [$ktmEsc $mac] . \"|server=\" . [$ktmEsc $server] . \"|comment=\" . [$ktmEsc $comment] . $NL);",
         "        :set c ($c + 1);",
         "        :set total ($total + 1);",
-        f"        :if ($c >= 100) do={{ :do {{ /tool fetch url=\"{snapshot_url}\" http-method=post http-header-field=\"Content-Type: text/plain\" http-data=$p keep-result=no; }} on-error={{}}; :set p (\"KETAMON_SNAPSHOT_V1\" . $NL); :set c 0; }}",
+        f"        :if ($c >= 100) do={{ :do {{ /tool fetch url=\"{snapshot_url}\" http-method=post http-header-field=\"Content-Type: text/plain\" http-data=$p keep-result=no duration=20s; }} on-error={{}}; :set p (\"KETAMON_SNAPSHOT_V1\" . $NL); :set c 0; }}",
         "      }",
         "    }",
-        f"    :if ($c > 0) do={{ :do {{ /tool fetch url=\"{snapshot_url}\" http-method=post http-header-field=\"Content-Type: text/plain\" http-data=$p keep-result=no; }} on-error={{}}; }}",
+        f"    :if ($c > 0) do={{ :do {{ /tool fetch url=\"{snapshot_url}\" http-method=post http-header-field=\"Content-Type: text/plain\" http-data=$p keep-result=no duration=20s; }} on-error={{}}; }}",
         "  } on-error={};",
         "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
-        "  :do { :local c 0; :foreach i in=[/ip hotspot host print as-value] do={ :if ($c < 500) do={ :set p ($p . \"R=/ip/hotspot/host|.id=\" . [$ktmEsc ($i->\".id\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|to-address=\" . [$ktmEsc ($i->\"to-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|authorized=\" . [$ktmEsc ($i->\"authorized\")] . $NL); :set c ($c + 1); } } } on-error={};",
+        "  :do { :local c 0; :foreach i in=[/ip hotspot host print as-value] do={ :if ($c < 100) do={ :set p ($p . \"R=/ip/hotspot/host|.id=\" . [$ktmEsc ($i->\".id\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|to-address=\" . [$ktmEsc ($i->\"to-address\")] . \"|server=\" . [$ktmEsc ($i->\"server\")] . \"|authorized=\" . [$ktmEsc ($i->\"authorized\")] . $NL); :set c ($c + 1); } } } on-error={};",
         send_line(),
         "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
         "  :do { :foreach i in=[/interface print as-value] do={ :set p ($p . \"R=/interface|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|type=\" . [$ktmEsc ($i->\"type\")] . \"|running=\" . [$ktmEsc ($i->\"running\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|actual-mtu=\" . [$ktmEsc ($i->\"actual-mtu\")] . \"|mtu=\" . [$ktmEsc ($i->\"mtu\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|rx-byte=\" . [$ktmEsc ($i->\"rx-byte\")] . \"|tx-byte=\" . [$ktmEsc ($i->\"tx-byte\")] . \"|rx-packet=\" . [$ktmEsc ($i->\"rx-packet\")] . \"|tx-packet=\" . [$ktmEsc ($i->\"tx-packet\")] . $NL); } } on-error={};",
@@ -7223,14 +7220,14 @@ def _build_routeros_relay_script(base_url, token):
         "  :do { :local c 0; :foreach i in=[/ip dhcp-server lease print as-value] do={ :if ($c < 500) do={ :set p ($p . \"R=/ip/dhcp-server/lease|.id=\" . [$ktmEsc ($i->\".id\")] . \"|address=\" . [$ktmEsc ($i->\"address\")] . \"|mac-address=\" . [$ktmEsc ($i->\"mac-address\")] . \"|host-name=\" . [$ktmEsc ($i->\"host-name\")] . \"|status=\" . [$ktmEsc ($i->\"status\")] . \"|dynamic=\" . [$ktmEsc ($i->\"dynamic\")] . \"|comment=\" . [$ktmEsc ($i->\"comment\")] . $NL); :set c ($c + 1); } } } on-error={};",
         send_line(),
         "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
-        "  :do { :local c 0; :foreach i in=[/log print as-value] do={ :if ($c < 120) do={ :set p ($p . \"R=/log|.id=\" . [$ktmEsc ($i->\".id\")] . \"|time=\" . [$ktmEsc ($i->\"time\")] . \"|topics=\" . [$ktmEsc ($i->\"topics\")] . \"|message=\" . [$ktmEsc ($i->\"message\")] . $NL); :set c ($c + 1); } } } on-error={};",
+        "  :do { :local c 0; :foreach i in=[/log print as-value] do={ :if ($c < 20) do={ :set p ($p . \"R=/log|.id=\" . [$ktmEsc ($i->\".id\")] . \"|time=\" . [$ktmEsc ($i->\"time\")] . \"|topics=\" . [$ktmEsc ($i->\"topics\")] . \"|message=\" . [$ktmEsc ($i->\"message\")] . $NL); :set c ($c + 1); } } } on-error={};",
         send_line(),
         "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
         "  :do { :foreach i in=[/system scheduler print as-value] do={ :set p ($p . \"R=/system/scheduler|.id=\" . [$ktmEsc ($i->\".id\")] . \"|name=\" . [$ktmEsc ($i->\"name\")] . \"|interval=\" . [$ktmEsc ($i->\"interval\")] . \"|disabled=\" . [$ktmEsc ($i->\"disabled\")] . \"|next-run=\" . [$ktmEsc ($i->\"next-run\")] . \"|on-event=\" . [$ktmEsc ($i->\"on-event\")] . $NL); } } on-error={};",
         send_line(),
-        f"  :do {{ /tool fetch url=\"{ping_url}\" keep-result=no; }} on-error={{}}",
-        "  :for ktmCmd from=1 to=5 do={",
-        f"    :do {{ /tool fetch url=\"{next_url}\" dst-path=\"ketamon-relay-next.rsc\" keep-result=yes; :delay 1s; /import file-name=\"ketamon-relay-next.rsc\"; /file remove [find name=\"ketamon-relay-next.rsc\"]; }} on-error={{}}",
+        f"  :do {{ /tool fetch url=\"{ping_url}\" keep-result=no duration=10s; }} on-error={{}}",
+        "  :for ktmCmd from=1 to=2 do={",
+        f"    :do {{ /tool fetch url=\"{next_url}\" dst-path=\"ketamon-relay-next.rsc\" keep-result=yes duration=20s; :delay 1s; /import file-name=\"ketamon-relay-next.rsc\"; /file remove [find name=\"ketamon-relay-next.rsc\"]; }} on-error={{}}",
         "  }",
         "}",
         "/system scheduler add name=\"ketamon-relay-poll\" interval=30s on-event=\"/system script run ketamon-relay-poll\" disabled=no",
