@@ -2245,7 +2245,7 @@ def _maybe_queue_relay_auto_upgrade(router, token, counts):
         relay_status_meta = snapshots.get("/ketamon/relay-status", {}) if isinstance(snapshots, dict) else {}
         relay_status_data = relay_status_meta.get("data", []) if isinstance(relay_status_meta, dict) else []
         current_source = str((relay_status_data[0] if relay_status_data else {}).get("source") or "")
-        needs_version_upgrade = current_source not in ("safe-snapshot-v4",)
+        needs_version_upgrade = current_source not in ("safe-snapshot-v4", "safe-snapshot-v5", "safe-snapshot-v6")
     except Exception:
         pass
     # Déclencher si : snapshot incomplet OU version obsolète
@@ -3918,15 +3918,30 @@ def _relay_snapshot_state(router_id, resource, ttl_seconds=RELAY_ACTIVE_SNAPSHOT
         return False, "", None
     try:
         snapshots = db_mod.db_get_router_relay_snapshot(router_id)
-        meta = snapshots.get(resource) if isinstance(snapshots, dict) else None
+        if not isinstance(snapshots, dict):
+            snapshots = {}
+        meta = snapshots.get(resource)
         updated_at = str((meta or {}).get("updated_at") or "")
-        if not updated_at:
-            return False, "", None
-        updated_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-        if updated_dt.tzinfo is not None:
-            updated_dt = updated_dt.replace(tzinfo=None)
-        age = max(0, int((datetime.now() - updated_dt).total_seconds()))
-        return age <= int(ttl_seconds or 120), updated_at, age
+        age = None
+        if updated_at:
+            updated_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            if updated_dt.tzinfo is not None:
+                updated_dt = updated_dt.replace(tzinfo=None)
+            age = max(0, int((datetime.now() - updated_dt).total_seconds()))
+            if age <= int(ttl_seconds or 120):
+                return True, updated_at, age
+        # La ressource spécifique est obsolète ou absente.
+        # Si /ketamon/relay-status est frais, le relay tourne mais la ressource est vide (ex: 0 sessions actives).
+        relay_meta = snapshots.get("/ketamon/relay-status")
+        relay_updated_at = str((relay_meta or {}).get("updated_at") or "")
+        if relay_updated_at:
+            relay_dt = datetime.fromisoformat(relay_updated_at.replace("Z", "+00:00"))
+            if relay_dt.tzinfo is not None:
+                relay_dt = relay_dt.replace(tzinfo=None)
+            relay_age = max(0, int((datetime.now() - relay_dt).total_seconds()))
+            if relay_age <= int(ttl_seconds or 120):
+                return True, updated_at, age
+        return False, updated_at, age
     except Exception:
         return False, "", None
 
@@ -7334,7 +7349,7 @@ def _build_routeros_relay_script(base_url, token):
         )
 
     return "\n".join([
-        "# KetaMon Cloud Relay - safe snapshots v5 (mutex + active-first)",
+        "# KetaMon Cloud Relay - safe snapshots v6 (mutex + active-first + count-sentinel)",
         "/system script remove [find name=\"ketamon-relay-poll\"]",
         "/system scheduler remove [find name=\"ketamon-relay-poll\"]",
         "/system scheduler remove [find name=\"ketamon-relay-watchdog\"]",
@@ -7358,8 +7373,10 @@ def _build_routeros_relay_script(base_url, token):
         "  };",
         "  :local NL \"\\n\";",
         "  :local p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
-        "  :do { :set p ($p . \"R=/ketamon/relay-status|source=safe-snapshot-v5|hotspot-users-found=\" . [$ktmEsc [:len [/ip hotspot user find]]] . $NL); } on-error={};",
-        "  :do { :foreach aid in=[/ip hotspot active find] do={ :local user [/ip hotspot active get $aid user]; :local addr [/ip hotspot active get $aid address]; :local mac [/ip hotspot active get $aid mac-address]; :if ([:len $mac] = 0) do={ :local hid [/ip hotspot host find where address=$addr]; :if ([:len $hid] > 0) do={ :set mac [/ip hotspot host get [:pick $hid 0] mac-address]; } }; :set p ($p . \"R=/ip/hotspot/active|.id=\" . [$ktmEsc $aid] . \"|user=\" . [$ktmEsc $user] . \"|address=\" . [$ktmEsc $addr] . \"|mac-address=\" . [$ktmEsc $mac] . \"|uptime=\" . [$ktmEsc [/ip hotspot active get $aid uptime]] . \"|session-time-left=\" . [$ktmEsc [/ip hotspot active get $aid session-time-left]] . \"|bytes-in=\" . [$ktmEsc [/ip hotspot active get $aid bytes-in]] . \"|bytes-out=\" . [$ktmEsc [/ip hotspot active get $aid bytes-out]] . \"|server=\" . [$ktmEsc [/ip hotspot active get $aid server]] . $NL); } } on-error={};",
+        "  :do { :set p ($p . \"R=/ketamon/relay-status|source=safe-snapshot-v6|hotspot-users-found=\" . [$ktmEsc [:len [/ip hotspot user find]]] . $NL); } on-error={};",
+        "  :local activeCount 0;",
+        "  :do { :foreach aid in=[/ip hotspot active find] do={ :local user [/ip hotspot active get $aid user]; :local addr [/ip hotspot active get $aid address]; :local mac [/ip hotspot active get $aid mac-address]; :if ([:len $mac] = 0) do={ :local hid [/ip hotspot host find where address=$addr]; :if ([:len $hid] > 0) do={ :set mac [/ip hotspot host get [:pick $hid 0] mac-address]; } }; :set p ($p . \"R=/ip/hotspot/active|.id=\" . [$ktmEsc $aid] . \"|user=\" . [$ktmEsc $user] . \"|address=\" . [$ktmEsc $addr] . \"|mac-address=\" . [$ktmEsc $mac] . \"|uptime=\" . [$ktmEsc [/ip hotspot active get $aid uptime]] . \"|session-time-left=\" . [$ktmEsc [/ip hotspot active get $aid session-time-left]] . \"|bytes-in=\" . [$ktmEsc [/ip hotspot active get $aid bytes-in]] . \"|bytes-out=\" . [$ktmEsc [/ip hotspot active get $aid bytes-out]] . \"|server=\" . [$ktmEsc [/ip hotspot active get $aid server]] . $NL); :set activeCount ($activeCount + 1); } } on-error={};",
+        "  :set p ($p . \"R=/ip/hotspot/active|_count=\" . $activeCount . $NL);",
         send_line(),
         "  :set p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
         "  :do { :set p ($p . \"R=/system/identity|name=\" . [$ktmEsc [/system identity get name]] . $NL); } on-error={};",
