@@ -1122,6 +1122,17 @@ def init_db():
         pass
     conn.commit()
 
+    # Migration : first_used_at + expire_at dans ticket_pricing (expiration absolue côté serveur)
+    for _sql in (
+        "ALTER TABLE ticket_pricing ADD COLUMN first_used_at TEXT DEFAULT NULL",
+        "ALTER TABLE ticket_pricing ADD COLUMN expire_at TEXT DEFAULT NULL",
+    ):
+        try:
+            conn.execute(_sql)
+        except Exception:
+            pass
+    conn.commit()
+
     # Plans par défaut
     existing = conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0]
     if existing == 0:
@@ -2079,6 +2090,21 @@ def db_backfill_ventes_from_ticket_pricing(router_id: str) -> int:
     )
     conn.commit()
     return len(ventes)
+
+
+def db_set_ticket_expiry(router_id: str, username: str, first_used_at: str, expire_at: str):
+    """Sauvegarde first_used_at et expire_at dans ticket_pricing pour un ticket.
+    Persistance côté serveur de l'expiration absolue, indépendante du commentaire MikroTik."""
+    router_id = str(router_id or "").strip()
+    username  = str(username  or "").strip()
+    if not router_id or not username:
+        return
+    conn = get_conn()
+    conn.execute(
+        "UPDATE ticket_pricing SET first_used_at=?, expire_at=? WHERE router_id=? AND user=?",
+        (str(first_used_at or ""), str(expire_at or ""), router_id, username),
+    )
+    conn.commit()
 
 
 def db_delete_ticket_pricing(router_id: str, users) -> int:

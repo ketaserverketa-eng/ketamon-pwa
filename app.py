@@ -1896,10 +1896,26 @@ def _build_first_used_map(router_id):
     if not router_id:
         return first_used_map
     try:
+        # Source primaire : ticket_pricing.first_used_at (fiable même pour tickets gratuits)
+        conn = db_mod.get_conn()
+        tp_rows = conn.execute(
+            "SELECT user, first_used_at FROM ticket_pricing"
+            " WHERE router_id=? AND first_used_at IS NOT NULL AND first_used_at != ''",
+            (router_id,)
+        ).fetchall()
+        for row in tp_rows:
+            uname = str(row[0] or "").strip()
+            fua   = str(row[1] or "").strip()
+            if uname and fua:
+                first_used_map[uname] = fua[:16]
+    except Exception:
+        pass
+    try:
+        # Fallback : ventes (anciens tickets sans first_used_at en DB)
         all_v = db_mod.db_get_ventes(router_id)
         for v in reversed(all_v):
             uname = str(v.get("user") or "").strip()
-            if uname:
+            if uname and uname not in first_used_map:
                 first_used_map[uname] = f"{v.get('date', '')} {v.get('heure', '')[:5]}"
     except Exception:
         pass
@@ -1914,7 +1930,8 @@ def _ticket_db_meta(router_id, username):
     try:
         conn = db_mod.get_conn()
         row = conn.execute("""
-            SELECT tp.user, tp.profil, tp.reseau, hp.time_limit, hp.expire_mode
+            SELECT tp.user, tp.profil, tp.reseau, tp.first_used_at, tp.expire_at,
+                   hp.time_limit, hp.expire_mode
             FROM ticket_pricing tp
             LEFT JOIN hotspot_profile_metadata hp
               ON hp.router_id=tp.router_id AND hp.profile_name=tp.profil
@@ -2003,12 +2020,24 @@ def _cleanup_expired_active_from_database(api, router_id, active_rows, first_use
         meta = _ticket_db_meta(router_id, username)
         if not meta:
             continue
-        limit_seconds = parse_routeros_duration(coerce_ticket_time_limit_router(_ticket_meta_time_limit(meta), empty="0", prefer_legacy_routeros=False) or "0")
-        first_dt = _effective_first_used_datetime(first_used_map.get(username), active, now=now)
-        if not first_dt or not limit_seconds or limit_seconds <= 0:
-            continue
-        if now < first_dt + timedelta(seconds=limit_seconds):
-            continue
+        # Source primaire : expire_at sauvegardé en DB (expiration absolue serveur)
+        expire_at_str = str(meta.get("expire_at") or "").strip()
+        if expire_at_str:
+            try:
+                expire_check = datetime.fromisoformat(expire_at_str)
+                if now < expire_check:
+                    continue  # Pas encore expiré
+                # Expiré selon DB → couper
+            except Exception:
+                expire_at_str = ""
+        if not expire_at_str:
+            # Fallback : calcul depuis first_used + limit_seconds (anciens tickets sans expire_at)
+            limit_seconds = parse_routeros_duration(coerce_ticket_time_limit_router(_ticket_meta_time_limit(meta), empty="0", prefer_legacy_routeros=False) or "0")
+            first_dt = _effective_first_used_datetime(first_used_map.get(username), active, now=now)
+            if not first_dt or not limit_seconds or limit_seconds <= 0:
+                continue
+            if now < first_dt + timedelta(seconds=limit_seconds):
+                continue
         address = str((active or {}).get("address") or "").strip()
         mac = str((active or {}).get("mac-address") or "").strip()
         try:
@@ -2673,9 +2702,14 @@ def _repair_active_ticket_epochs(api, router_id, active_rows=None, users_map=Non
         if limit_seconds is None or limit_seconds <= 0:
             continue
 
+        # Expiration absolue déjà définie et dans le futur → VERROUILLÉE, ne jamais recalculer
+        if current_expire_dt and current_expire_dt > server_now:
+            continue
+
         first_used_dt = _effective_first_used_datetime(first_used_map.get(username), active_row, now=server_now)
         if first_used_dt:
             expire_dt = first_used_dt + timedelta(seconds=limit_seconds)
+            actual_first_used = first_used_dt
         else:
             if not active_row:
                 continue
@@ -2684,6 +2718,7 @@ def _repair_active_ticket_epochs(api, router_id, active_rows=None, users_map=Non
             if not session_start:
                 continue
             expire_dt = session_start + timedelta(seconds=limit_seconds)
+            actual_first_used = session_start
 
         if current_expire_dt:
             drift = abs(int((current_expire_dt - expire_dt).total_seconds()))
@@ -2715,6 +2750,16 @@ def _repair_active_ticket_epochs(api, router_id, active_rows=None, users_map=Non
             if active_row is not None:
                 active_row["user_comment"] = new_comment
             patched += 1
+            # Sauvegarder en DB lors du PREMIER écriture de l'epoch (expiration absolue persistante)
+            if not current_expire_dt:
+                try:
+                    db_mod.db_set_ticket_expiry(
+                        router_id, username,
+                        first_used_at=actual_first_used.strftime("%Y-%m-%d %H:%M:%S"),
+                        expire_at=expire_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                except Exception:
+                    pass
         except Exception:
             continue
 
