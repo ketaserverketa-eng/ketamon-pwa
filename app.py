@@ -2274,7 +2274,7 @@ def _maybe_queue_relay_auto_upgrade(router, token, counts):
         relay_status_meta = snapshots.get("/ketamon/relay-status", {}) if isinstance(snapshots, dict) else {}
         relay_status_data = relay_status_meta.get("data", []) if isinstance(relay_status_meta, dict) else []
         current_source = str((relay_status_data[0] if relay_status_data else {}).get("source") or "")
-        needs_version_upgrade = current_source not in ("safe-snapshot-v4", "safe-snapshot-v5", "safe-snapshot-v6")
+        needs_version_upgrade = current_source not in ("safe-snapshot-v7",)
     except Exception:
         pass
     # Déclencher si : snapshot incomplet OU version obsolète
@@ -3948,8 +3948,8 @@ def _relay_database_dashboard_data(router):
 
 
 RELAY_ACTIVE_SNAPSHOT_TTL_SECONDS = safe_int(
-    os.environ.get("KETAMON_RELAY_ACTIVE_TTL", "120"),
-    default=120,
+    os.environ.get("KETAMON_RELAY_ACTIVE_TTL", "300"),
+    default=300,
     min_val=30,
     max_val=3600,
 )
@@ -7394,10 +7394,11 @@ def _build_routeros_relay_script(base_url, token):
         )
 
     return "\n".join([
-        "# KetaMon Cloud Relay - safe snapshots v6 (mutex + active-first + count-sentinel)",
+        "# KetaMon Cloud Relay - safe snapshots v7 (mutex + active-first + count-sentinel + keepalive)",
         "/system script remove [find name=\"ketamon-relay-poll\"]",
         "/system scheduler remove [find name=\"ketamon-relay-poll\"]",
         "/system scheduler remove [find name=\"ketamon-relay-watchdog\"]",
+        "/system scheduler remove [find name=\"ketamon-relay-keepalive\"]",
         "/system script add name=\"ketamon-relay-poll\" policy=ftp,reboot,read,write,policy,test,password,sniff,sensitive,romon source={",
         "  :global ktmBusy;",
         "  :if ($ktmBusy = \"1\") do={ :error \"relay busy\"; };",
@@ -7418,7 +7419,7 @@ def _build_routeros_relay_script(base_url, token):
         "  };",
         "  :local NL \"\\n\";",
         "  :local p (\"KETAMON_SNAPSHOT_V1\" . $NL);",
-        "  :do { :set p ($p . \"R=/ketamon/relay-status|source=safe-snapshot-v6|hotspot-users-found=\" . [$ktmEsc [:len [/ip hotspot user find]]] . $NL); } on-error={};",
+        "  :do { :set p ($p . \"R=/ketamon/relay-status|source=safe-snapshot-v7|hotspot-users-found=\" . [$ktmEsc [:len [/ip hotspot user find]]] . $NL); } on-error={};",
         "  :local activeCount 0;",
         "  :do { :foreach aid in=[/ip hotspot active find] do={ :local user [/ip hotspot active get $aid user]; :local addr [/ip hotspot active get $aid address]; :local mac [/ip hotspot active get $aid mac-address]; :if ([:len $mac] = 0) do={ :local hid [/ip hotspot host find where address=$addr]; :if ([:len $hid] > 0) do={ :set mac [/ip hotspot host get [:pick $hid 0] mac-address]; } }; :set p ($p . \"R=/ip/hotspot/active|.id=\" . [$ktmEsc $aid] . \"|user=\" . [$ktmEsc $user] . \"|address=\" . [$ktmEsc $addr] . \"|mac-address=\" . [$ktmEsc $mac] . \"|uptime=\" . [$ktmEsc [/ip hotspot active get $aid uptime]] . \"|session-time-left=\" . [$ktmEsc [/ip hotspot active get $aid session-time-left]] . \"|bytes-in=\" . [$ktmEsc [/ip hotspot active get $aid bytes-in]] . \"|bytes-out=\" . [$ktmEsc [/ip hotspot active get $aid bytes-out]] . \"|server=\" . [$ktmEsc [/ip hotspot active get $aid server]] . $NL); :set activeCount ($activeCount + 1); } } on-error={};",
         "  :set p ($p . \"R=/ip/hotspot/active|_count=\" . $activeCount . $NL);",
@@ -7485,6 +7486,7 @@ def _build_routeros_relay_script(base_url, token):
         "}",
         "/system scheduler add name=\"ketamon-relay-poll\" interval=30s on-event=\"/system script run ketamon-relay-poll\" disabled=no",
         "/system scheduler add name=\"ketamon-relay-watchdog\" interval=2m on-event=\":do { /system script run ketamon-relay-poll; } on-error={}\" disabled=no",
+        f"/system scheduler add name=\"ketamon-relay-keepalive\" interval=1m on-event=\":do {{ /tool fetch url=\\\"{ping_url}\\\" keep-result=no duration=5s; }} on-error={{}}\" disabled=no",
         # Script de boot : réinstalle le relay automatiquement si les schedulers disparaissent (reset config, firmware update, etc.)
         ":do { /system script remove [find name=\"ketamon-relay-boot\"]; } on-error={}",
         ":do { /system scheduler remove [find name=\"ketamon-relay-boot\"]; } on-error={}",
