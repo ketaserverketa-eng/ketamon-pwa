@@ -34,48 +34,6 @@ STANDALONE_MODE = "127.0.0.1" in KS_API or "localhost" in KS_API
 KS_ENABLED = False
 PROFILE_META_PREFIX = "ketamon-profile:"
 
-# ─── Config AdMob locale ─────────────────────────────────────────────────────
-AD_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "data", "ad_config.json")
-AD_VIEWS_FILE  = os.path.join(os.path.dirname(__file__), "data", "ad_views.json")
-
-_ad_config_cache: dict = {"data": {}, "ts": 0.0}
-_AD_CONFIG_TTL = 60  # secondes
-
-def load_ad_config() -> dict:
-    now = time.time()
-    if now - _ad_config_cache["ts"] < _AD_CONFIG_TTL:
-        return _ad_config_cache["data"]
-    try:
-        with open(AD_CONFIG_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-    _ad_config_cache["data"] = data
-    _ad_config_cache["ts"] = now
-    return data
-
-def save_ad_config(data: dict) -> None:
-    try:
-        with open(AD_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        _ad_config_cache["data"] = data
-        _ad_config_cache["ts"] = time.time()
-    except Exception:
-        pass
-
-def load_ad_views() -> dict:
-    try:
-        with open(AD_VIEWS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_ad_views(data: dict) -> None:
-    try:
-        with open(AD_VIEWS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
 KETAMON_TICKET_COMMENT_MARKER = " ##KETAMON## exp="
 KETAMON_TICKET_COMMENT_MARKERS = (
     KETAMON_TICKET_COMMENT_MARKER,
@@ -94,26 +52,6 @@ _TICKET_GENERATION_STATUS = {}
 _TICKET_GENERATION_GUARD = threading.Lock()
 _relay_public_url_cache = ""  # mis à jour à chaque requête relay ; lu par les threads de fond
 
-def _ks_ping_once(timeout=1):
-    try:
-        r = http_req.get(KS_API if KS_API.endswith('/') else KS_API + '/', timeout=timeout)
-        return r.status_code < 500
-    except Exception:
-        return False
-
-def _ks_background_ping(interval=15):
-    import time
-    global KS_ENABLED
-    while True:
-        KS_ENABLED = _ks_ping_once(timeout=2)
-        time.sleep(interval)
-
-if not STANDALONE_MODE:
-    try:
-        t = threading.Thread(target=_ks_background_ping, args=(15,), daemon=True)
-        t.start()
-    except Exception:
-        KS_ENABLED = _ks_ping_once()
 
 def ks_post(path, data, token=None):
     """POST vers KetaServer API. Retourne (dict, None) ou (None, erreur_str)."""
@@ -133,51 +71,6 @@ def ks_post(path, data, token=None):
         KS_ENABLED = False
         return None, str(e)
 
-def ks_get(path, token, params=None):
-    """GET vers KetaServer API avec Bearer token."""
-    global KS_ENABLED
-    if not KS_ENABLED:
-        return None, "KetaServer indisponible"
-    try:
-        headers = {"Authorization": f"Bearer {token}"}
-        r = http_req.get(f"{KS_API}{path}", headers=headers, params=params or {}, timeout=8)
-        try:
-            return r.json(), None
-        except Exception:
-            return None, f"KetaServer repondu code {r.status_code}"
-    except Exception as e:
-        KS_ENABLED = False
-        return None, str(e)
-
-def ks_delete(path, token):
-    """DELETE vers KetaServer API."""
-    global KS_ENABLED
-    if not KS_ENABLED:
-        return None, "KetaServer indisponible"
-    try:
-        r = http_req.delete(f"{KS_API}{path}", headers={"Authorization": f"Bearer {token}"}, timeout=8)
-        try:
-            return r.json(), None
-        except Exception:
-            return None, f"KetaServer repondu code {r.status_code}"
-    except Exception as e:
-        KS_ENABLED = False
-        return None, str(e)
-
-def ks_patch(path, token, data=None):
-    """PATCH vers KetaServer API."""
-    global KS_ENABLED
-    if not KS_ENABLED:
-        return None, "KetaServer indisponible"
-    try:
-        r = http_req.patch(f"{KS_API}{path}", json=data or {}, headers={"Authorization": f"Bearer {token}"}, timeout=8)
-        try:
-            return r.json(), None
-        except Exception:
-            return None, f"KetaServer repondu code {r.status_code}"
-    except Exception as e:
-        KS_ENABLED = False
-        return None, str(e)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, root_path=APP_DIR, template_folder="templates", static_folder="static")
@@ -285,39 +178,6 @@ def _ensure_csrf_and_protect():
                 return jsonify({"ok": False, "msg": "Token de sécurité invalide"}), 400
             abort(400)
 
-
-@app.before_request
-def _subscription_access_guard():
-    if not session.get("logged_in"):
-        return
-    if session.get("role") in {"concepteur", "admin"}:
-        return
-
-    path = request.path or "/"
-    if path.startswith("/static/"):
-        return
-    if path in {
-        "/login", "/logout", "/abonnement", "/abonnement/souscrire",
-        "/privacy", "/health", "/sw.js", "/static/manifest.json",
-    }:
-        return
-
-    protected_prefixes = (
-        "/hotspot", "/reseau", "/impression-rapide", "/bons",
-        "/report", "/traffic", "/dhcp", "/systeme", "/parametres",
-        "/api/hotspot", "/api/vouchers", "/api/tickets",
-    )
-    if path != "/" and not path.startswith(protected_prefixes):
-        return
-
-    if subscription_is_active_for_current_user():
-        return
-
-    msg = "Abonnement expire. Renouvelez votre abonnement pour continuer a gerer le Hotspot."
-    if path.startswith("/api/") or request.is_json or "application/json" in request.headers.get("Accept", ""):
-        return jsonify({"ok": False, "msg": msg, "subscription_required": True}), 402
-    flash(msg, "warning")
-    return redirect(url_for("abonnement"))
 
 # ── Headers de sécurité HTTP ──────────────────────────────────────────────────
 @app.after_request
@@ -467,147 +327,6 @@ def get_active_ticket_logo():
         "is_custom": False,
     }
 
-DEFAULT_PLANS = [
-    {"id": "mensuel",  "nom": "Mensuel",    "duree": 30,  "prix": 5000,  "devise": "FCFA", "actif": True},
-    {"id": "trimestr", "nom": "Trimestriel","duree": 90,  "prix": 12000, "devise": "FCFA", "actif": True},
-    {"id": "annuel",   "nom": "Annuel",     "duree": 365, "prix": 40000, "devise": "FCFA", "actif": True},
-]
-
-DEFAULT_PAY_CONFIG = {
-    "devise_base": "FCFA",
-    "taux_change": {
-        "USD": 606.0,   # 1 USD = 606 FCFA
-        "EUR": 655.0,   # 1 EUR = 655 FCFA
-        "FCFA": 1.0,
-        "XOF": 1.0,
-    },
-    "tolerance_pct": 0,
-    "methodes": [
-        {"id": "orange-money", "nom": "Orange Money", "numero": "",  "instructions": "Envoyez le montant exact au numéro ci-dessus. Mentionnez votre email en commentaire.", "actif": False},
-        {"id": "moov-money",   "nom": "Moov Money",   "numero": "",  "instructions": "Envoyez le montant exact au numéro ci-dessus. Mentionnez votre email en commentaire.", "actif": False},
-        {"id": "wave",         "nom": "Wave",          "numero": "",  "instructions": "Transfert Wave au numéro ci-dessus. Email en commentaire.", "actif": False},
-        {"id": "mtn-money",    "nom": "MTN Money",     "numero": "",  "instructions": "Envoyez le montant exact. Email en commentaire.", "actif": False},
-    ],
-}
-
-# ── Wrappers SQLite (remplacent les JSON pour thread-safety 1000+ users) ──────
-
-def get_plans():              return db_mod.db_get_plans()
-def get_plans_actifs():       return db_mod.db_get_plans(actif_only=True)
-def get_pay_config():         return db_mod.db_get_pay_config()
-def save_pay_config(cfg):     db_mod.db_save_pay_config(cfg)
-def get_user_subscription(u): return db_mod.db_get_active_sub(u)
-
-
-def get_trial_days():
-    cfg = get_pay_config()
-    return safe_int(cfg.get("trial_days", 45), default=45, min_val=0, max_val=3650)
-
-
-def _subscription_user_id_from_session():
-    if session.get("role") in {"concepteur", "admin"}:
-        return ""
-    return str(session.get("user_id") or "").strip()
-
-
-def ensure_trial_subscription_for_user(user_id=None, username=None):
-    user_id = str(user_id or _subscription_user_id_from_session() or "").strip()
-    if not user_id:
-        return None
-
-    active = db_mod.db_get_active_sub(user_id)
-    if active:
-        return active
-
-    existing = db_mod.db_get_subscriptions(user_id=user_id)
-    if existing:
-        return None
-
-    days = get_trial_days()
-    if days <= 0:
-        return None
-
-    now = datetime.utcnow()
-    expire_at = now + timedelta(days=days)
-    trial = {
-        "id": str(uuid.uuid4()),
-        "user_id": user_id,
-        "username": username or session.get("username", user_id),
-        "plan_id": "trial-auto",
-        "plan_nom": f"Essai gratuit {days} jours",
-        "prix_plan": 0,
-        "devise_plan": "FCFA",
-        "prix_plan_base": 0,
-        "montant_paye": 0,
-        "devise_paye": "FCFA",
-        "montant_base": 0,
-        "devise_base": "FCFA",
-        "duree_jours": days,
-        "methode": "essai",
-        "reference": "",
-        "fraude_flags": [],
-        "fraude_detail": "OK",
-        "statut": "actif",
-        "demande_le": now.isoformat(),
-        "active_le": now.isoformat(),
-        "expire_le": expire_at.isoformat(),
-    }
-    db_mod.db_insert_subscription(trial)
-    return db_mod.db_get_active_sub(user_id)
-
-
-def subscription_is_active_for_current_user():
-    user_id = _subscription_user_id_from_session()
-    if not user_id:
-        return True
-    return ensure_trial_subscription_for_user(user_id) is not None
-
-def to_base(montant, devise, cfg):
-    taux = cfg.get("taux_change", {})
-    return float(montant or 0) * float(taux.get(devise, 1.0))
-
-def verifier_paiement_antifraude(plan, montant_paye, devise_paye, reference, methode, cfg):
-    """Retourne (ok, flags, detail). Vérifie fraude avant insertion."""
-    flags = []
-    try:
-        m = float(montant_paye)
-    except (ValueError, TypeError):
-        m = 0.0
-
-    if m <= 0:
-        flags.append("MONTANT_ZERO")
-    ref = str(reference or "").strip()
-    if not ref:
-        flags.append("REFERENCE_VIDE")
-    # Doublon vérifié directement dans SQLite (index sur reference)
-    if ref and db_mod.db_reference_exists(ref):
-        flags.append("REFERENCE_DOUBLON")
-    methodes_actives = {mt["id"] for mt in cfg.get("methodes", []) if mt.get("actif")}
-    if methode not in methodes_actives:
-        flags.append("METHODE_INVALIDE_OU_INACTIVE")
-    if m > 0:
-        prix_base = to_base(plan["prix"], plan["devise"], cfg)
-        paye_base = to_base(m, devise_paye, cfg)
-        tolerance = float(cfg.get("tolerance_pct", 0)) / 100.0
-        if paye_base < prix_base * (1 - tolerance):
-            flags.append(f"MONTANT_INSUFFISANT({paye_base:.0f}<{prix_base:.0f} {cfg.get('devise_base','FCFA')})")
-        if paye_base > prix_base * 10:
-            flags.append("MONTANT_SUSPECT_ELEVE")
-
-    _FLAG_MSGS = {
-        "MONTANT_ZERO":              "Le montant payé doit être supérieur à zéro.",
-        "REFERENCE_VIDE":            "La référence de paiement est obligatoire.",
-        "REFERENCE_DOUBLON":         "Cette référence de paiement est déjà utilisée.",
-        "METHODE_INVALIDE_OU_INACTIVE": "La méthode de paiement sélectionnée n'est pas disponible.",
-        "MONTANT_SUSPECT_ELEVE":     "Le montant payé est anormalement élevé.",
-    }
-    def _humanize(f):
-        for key, msg in _FLAG_MSGS.items():
-            if f.startswith(key):
-                return msg
-        return "Paiement non valide."
-    detail = _humanize(flags[0]) if flags else "OK"
-    return len(flags) == 0, flags, detail
 
 # ─── Persistence helpers ────────────────────────────────────────────────────
 
@@ -7871,27 +7590,6 @@ def api_resources():
         })
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
-
-# ─── Concepteur : Tableau de bord analytique ─────────────────────────────────
-
-def concepteur_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not session.get("logged_in"):
-            return redirect(url_for("login"))
-        if session.get("role") != "concepteur":
-            flash("Acces reserve au concepteur.", "danger")
-            return redirect(url_for("index"))
-        return f(*args, **kwargs)
-    return decorated
-
-
-def legacy_platform_boundary_response(json_mode=False):
-    message = "Fonction desactivee dans le mode legacy. Utilisez le backend FastAPI SaaS officiel."
-    if json_mode:
-        return jsonify({"ok": False, "message": message}), 403
-    flash(message, "warning")
-    return redirect(url_for("concepteur_dashboard"))
 
 @app.route("/health")
 def health_check():
